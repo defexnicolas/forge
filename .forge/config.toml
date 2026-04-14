@@ -1,0 +1,47 @@
+default_agent = 'build'
+approval_profile = 'normal'
+
+[providers]
+[providers.default]
+name = 'lmstudio'
+
+[providers.openai_compatible]
+type = 'openai-compatible'
+base_url = 'https://api.openai.com/v1'
+api_key = ''
+api_key_env = 'OPENAI_API_KEY'
+default_model = 'gpt-5.4-mini'
+supports_tools = true
+
+[providers.lmstudio]
+type = 'openai-compatible'
+base_url = 'http://localhost:9099/v1'
+api_key = 'lm-studio'
+api_key_env = ''
+default_model = 'local-model'
+supports_tools = false
+
+[context]
+engine = 'yarn'
+budget_tokens = 12000
+auto_compact = true
+
+[skills]
+cli = 'npx'
+directory_url = 'https://skills.sh/'
+repositories = ['vercel-labs/agent-skills', 'vercel-labs/skills']
+agent = 'codex'
+install_scope = 'project'
+copy = true
+
+[plugins]
+enabled = true
+claude_compatible = true
+marketplaces = []
+
+[models]
+chat = 'local-model'
+editor = 'local-model'
+planner = 'local-model'
+reviewer = 'local-model'
+summarizer = 'local-model'

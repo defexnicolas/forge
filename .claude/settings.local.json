@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find . -not -path './.cache/*' -type f -name \"*.go\" -exec wc -l {} \\\\;)",
+      "Bash(awk '{print $2, $1}')",
+      "Bash(ls:*)",
+      "Bash(head -30 /c/Users/nicod/Downloads/letcode/internal/app/*.go)",
+      "Bash(go build:*)",
+      "Bash(wc -l ./internal/**/*.go)",
+      "Bash(grep -h \"^import\" /c/Users/nicod/Downloads/letcode/internal/session/*.go)",
+      "Bash(go test:*)",
+      "Bash(go vet:*)",
+      "Bash(grep -E \"\\\\.go$\")",
+      "Bash(grep \"\\\\.go$\")",
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(wc:*)",
+      "Bash(grep -l \"struct\\\\|interface\" /c/Users/nicod/Downloads/letcode/internal/*/*.go)",
+      "Bash(awk '{s+=$1} END {print \"Total lines in code:\", s}')",
+      "Bash(./forge.exe version:*)",
+      "Bash(./forge.exe tools:*)",
+      "Bash(grep -n \"handleSlashCommand\\\\|handleCommand\" /c/Users/nicod/Downloads/letcode/internal/tui/*.go)",
+      "Bash(grep -n \"handleSlashCommand\\\\|/mode\\\\|SetMode\\\\|switch.*mode\" /c/Users/nicod/Downloads/letcode/internal/tui/*.go)",
+      "Bash(go version:*)",
+      "Bash(find C:\\\\Users\\\\nicod\\\\Downloads\\\\letcode\\\\internal:*)",
+      "Bash(go get:*)",
+      "Bash(find C:\\\\Users\\\\nicod\\\\Downloads\\\\letcode\\\\internal\\\\tui:*)"
+    ]
+  }
+}

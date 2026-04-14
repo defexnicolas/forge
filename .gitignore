@@ -1,0 +1,7 @@
+.cache/
+.forge/context/
+.forge/sessions/
+.forge/tasks/
+.forge/yarn/
+forge.exe
+forge
