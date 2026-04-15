@@ -49,7 +49,7 @@ func TestPlanModeDeniesEdits(t *testing.T) {
 		}
 	}
 	// But allows reads
-	for _, tool := range []string{"read_file", "search_text", "todo_write"} {
+	for _, tool := range []string{"read_file", "search_text", "plan_write", "plan_get", "todo_write", "spawn_subagents"} {
 		decision, _ := mode.Policy.Decision(tool)
 		if decision != ToolAllow {
 			t.Fatalf("plan mode should allow %s, got %s", tool, decision)
@@ -59,7 +59,7 @@ func TestPlanModeDeniesEdits(t *testing.T) {
 
 func TestExploreModeDeniesEverythingExceptReads(t *testing.T) {
 	mode, _ := GetMode("explore")
-	for _, tool := range []string{"edit_file", "write_file", "run_command", "spawn_subagent", "todo_write"} {
+	for _, tool := range []string{"edit_file", "write_file", "run_command", "spawn_subagent", "spawn_subagents", "todo_write"} {
 		decision, _ := mode.Policy.Decision(tool)
 		if decision != ToolDeny {
 			t.Fatalf("explore mode should deny %s, got %s", tool, decision)
@@ -89,7 +89,7 @@ func TestBuildModeAsksForEdits(t *testing.T) {
 
 func TestSetModeValid(t *testing.T) {
 	cwd := t.TempDir()
-	runtime := NewRuntime(cwd, config.Defaults(), tools.NewRegistry(), llm.NewRegistry())
+	runtime := newTestRuntime(t, cwd, config.Defaults(), tools.NewRegistry(), llm.NewRegistry())
 	if runtime.Mode != "build" {
 		t.Fatalf("default mode should be build, got %s", runtime.Mode)
 	}
@@ -108,7 +108,7 @@ func TestSetModeValid(t *testing.T) {
 
 func TestSetModeInvalid(t *testing.T) {
 	cwd := t.TempDir()
-	runtime := NewRuntime(cwd, config.Defaults(), tools.NewRegistry(), llm.NewRegistry())
+	runtime := newTestRuntime(t, cwd, config.Defaults(), tools.NewRegistry(), llm.NewRegistry())
 	if err := runtime.SetMode("nonexistent"); err == nil {
 		t.Fatal("expected error for invalid mode")
 	}

@@ -27,8 +27,11 @@ func NewSprintPolicy() SprintPolicy {
 		"search_files",
 		"git_status",
 		"git_diff",
+		"plan_write",
+		"plan_get",
 		"todo_write",
 		"spawn_subagent",
+		"spawn_subagents",
 		"task_create",
 		"task_list",
 		"task_get",
@@ -60,8 +63,10 @@ func NewPlanPolicy() SprintPolicy {
 	for _, name := range []string{
 		"read_file", "list_files", "search_text", "search_files",
 		"git_status", "git_diff",
-		"todo_write", "spawn_subagent",
+		"plan_write", "plan_get",
+		"todo_write", "spawn_subagent", "spawn_subagents",
 		"task_create", "task_list", "task_get", "task_update",
+		"ask_user",
 	} {
 		allowed[name] = true
 	}
@@ -73,6 +78,7 @@ func NewExplorePolicy() SprintPolicy {
 	for _, name := range []string{
 		"read_file", "list_files", "search_text", "search_files",
 		"git_status", "git_diff",
+		"plan_get",
 	} {
 		allowed[name] = true
 	}
@@ -84,7 +90,8 @@ func NewReviewPolicy() SprintPolicy {
 	for _, name := range []string{
 		"read_file", "list_files", "search_text", "search_files",
 		"git_status", "git_diff",
-		"todo_write", "spawn_subagent",
+		"plan_write", "plan_get",
+		"todo_write", "spawn_subagent", "spawn_subagents",
 	} {
 		allowed[name] = true
 	}

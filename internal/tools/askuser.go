@@ -7,10 +7,26 @@ import (
 
 type askUserTool struct{}
 
-func (askUserTool) Name() string        { return "ask_user" }
-func (askUserTool) Description() string { return "Ask the user a question and wait for their response." }
+func (askUserTool) Name() string { return "ask_user" }
+func (askUserTool) Description() string {
+	return "Ask the user a single focused question and wait for their response. " +
+		"Optionally supply up to 3 short suggested answers via `options`; the TUI will render them as picks and add a 'Write my own' row. " +
+		"Good suggestions are concrete and mutually exclusive (e.g. \"Yes\"/\"No\"/\"Only for public endpoints\")."
+}
 func (askUserTool) Schema() json.RawMessage {
-	return json.RawMessage(`{"type":"object","required":["question"],"properties":{"question":{"type":"string","description":"The question to ask the user."}}}`)
+	return json.RawMessage(`{
+		"type":"object",
+		"required":["question"],
+		"properties":{
+			"question":{"type":"string","description":"The question to ask the user."},
+			"options":{
+				"type":"array",
+				"items":{"type":"string"},
+				"maxItems":3,
+				"description":"Up to 3 short suggested answers. The TUI renders each as a selectable row and always adds a 'Write my own' row at the bottom."
+			}
+		}
+	}`)
 }
 func (askUserTool) Permission(Context, json.RawMessage) PermissionRequest {
 	return PermissionRequest{Decision: PermissionAllow}

@@ -22,4 +22,32 @@ func TestHelpAndAutocompleteUseCommandDescriptors(t *testing.T) {
 			t.Fatalf("autocomplete missing command %q in %v", cmd.Name, suggestions)
 		}
 	}
+	for _, sub := range []string{"panel", "full", "todos", "new", "refine"} {
+		if !strings.Contains(help, sub) {
+			t.Fatalf("help missing /plan subcommand %q in:\n%s", sub, help)
+		}
+	}
+}
+
+func TestPlanSubcommandAutocomplete(t *testing.T) {
+	all := Suggest("/plan ", t.TempDir())
+	for _, want := range []string{"/plan panel", "/plan full", "/plan todos", "/plan new", "/plan refine"} {
+		if !containsSuggestion(all, want) {
+			t.Fatalf("autocomplete missing %q in %v", want, all)
+		}
+	}
+
+	filtered := Suggest("/plan f", t.TempDir())
+	if len(filtered) != 1 || filtered[0] != "/plan full" {
+		t.Fatalf("filtered /plan autocomplete = %v, want [/plan full]", filtered)
+	}
+}
+
+func containsSuggestion(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
 }

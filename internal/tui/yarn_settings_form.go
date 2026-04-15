@@ -192,13 +192,16 @@ func normalizeYarnMode(value, fallback string, allowOff bool) string {
 	return fallback
 }
 
+// promptOverheadTokens estimates fixed per-request overhead: system prompt + tool defs + delimiters.
+const promptOverheadTokens = 2500
+
 func yarnOverflowWarning(cfg config.Config, theme Theme) string {
 	if cfg.Context.ModelContextTokens <= 0 {
 		return ""
 	}
-	used := cfg.Context.BudgetTokens + cfg.Context.ReserveOutputTokens
+	used := cfg.Context.BudgetTokens + cfg.Context.ReserveOutputTokens + promptOverheadTokens
 	if used <= cfg.Context.ModelContextTokens {
 		return ""
 	}
-	return "\n" + theme.Warning.Render(fmt.Sprintf("Warning: YARN budget + reserved output (%d) exceeds model context (%d).", used, cfg.Context.ModelContextTokens))
+	return "\n" + theme.Warning.Render(fmt.Sprintf("Warning: YARN budget + reserved output + ~%d overhead (%d total) exceeds model context (%d).", promptOverheadTokens, used, cfg.Context.ModelContextTokens))
 }

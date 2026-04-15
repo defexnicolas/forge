@@ -16,26 +16,28 @@ import (
 	"forge/internal/llm"
 	"forge/internal/mcp"
 	"forge/internal/plugins"
+	"forge/internal/projectstate"
 	"forge/internal/session"
 	"forge/internal/skills"
 	"forge/internal/tools"
 
-	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
 type Options struct {
-	CWD       string
-	Config    config.Config
-	Tools     *tools.Registry
-	Providers *llm.Registry
-	Session   *session.Store
-	Skills    *skills.Manager
-	Plugins   *plugins.Manager
-	MCP       *mcp.Manager
-	Hooks     *hooks.Runner
+	CWD          string
+	Config       config.Config
+	Tools        *tools.Registry
+	Providers    *llm.Registry
+	Session      *session.Store
+	Skills       *skills.Manager
+	Plugins      *plugins.Manager
+	MCP          *mcp.Manager
+	Hooks        *hooks.Runner
+	ProjectState *projectstate.Service
 }
 
 type App struct{ options Options }
@@ -43,7 +45,8 @@ type App struct{ options Options }
 func New(options Options) *App { return &App{options: options} }
 
 func (a *App) Run(ctx context.Context) error {
-	program := tea.NewProgram(newModel(a.options), tea.WithContext(ctx), tea.WithMouseCellMotion())
+	// No mouse capture — keeps terminal text selection / copy-paste working natively.
+	program := tea.NewProgram(newModel(a.options), tea.WithContext(ctx))
 	_, err := program.Run()
 	return err
 }
@@ -56,51 +59,90 @@ const (
 	formSkills
 	formTheme
 	formModel
+	formModelMulti
 	formConfirmExecute
+	formConfirmExplorerPlan
 	formYarnSettings
+	formYarnMenu
+	formApproval
+	formAskUser
+	formConfirmPlanReset
 )
 
 var lastAgentResponse string
 
+const viewportInputGapLines = 2
+const inputMinLines = 1
+const inputMaxLines = 6
+const pasteGuardDuration = 180 * time.Millisecond
+const pasteBurstThreshold = 20 * time.Millisecond
+
 type model struct {
-	options            Options
-	agentRuntime       *agent.Runtime
-	agentEvents        <-chan agent.Event
-	pendingApproval    *agent.ApprovalRequest
-	pendingAskUser     *agent.AskUserRequest
-	agentRunning       bool
-	streaming          bool
-	quitting           bool
-	thinkEnabled       bool
-	showPlan           bool
-	searching          bool
-	searchMode         searchMode
-	suggestions        []string
-	suggestionIdx      int
-	activeForm         formMode
-	providerForm       providerForm
-	skillsForm         skillsForm
-	themeForm          themeForm
-	modelForm          modelForm
-	confirmExecute     confirmForm
-	yarnSettingsForm   yarnSettingsForm
-	pendingExecuteLine string
-	pendingCommand     tea.Cmd
-	forceScrollBottom  bool
-	lastEscTime        time.Time
-	width              int
-	input              textinput.Model
-	viewport           viewport.Model
-	history            []string
-	theme              Theme
+	options                Options
+	agentRuntime           *agent.Runtime
+	agentEvents            <-chan agent.Event
+	pendingApproval        *agent.ApprovalRequest
+	pendingAskUser         *agent.AskUserRequest
+	agentRunning           bool
+	streaming              bool
+	quitting               bool
+	thinkEnabled           bool
+	showPlan               bool
+	searching              bool
+	searchMode             searchMode
+	suggestions            []string
+	suggestionIdx          int
+	activeForm             formMode
+	providerForm           providerForm
+	skillsForm             skillsForm
+	themeForm              themeForm
+	modelForm              modelForm
+	modelMultiForm         modelMultiForm
+	confirmExecute         confirmForm
+	confirmExplorerPlan    confirmForm
+	confirmPlanReset       confirmForm
+	pendingPlanLine        string
+	yarnSettingsForm       yarnSettingsForm
+	yarnMenuForm           yarnMenuForm
+	approvalForm           approvalForm
+	askUserForm            askUserForm
+	currentAssistant       *strings.Builder
+	modelProgress          *agent.ModelProgress
+	pendingExecuteLine     string
+	pendingExplorerHandoff string
+	lastBuildPreflight     string
+	pendingCommand         tea.Cmd
+	btwEvents              <-chan agent.Event
+	btwStreaming           bool
+	remoteServer           *remoteControlHandle
+	forceScrollBottom      bool
+	stickyBottom           bool
+	lastEscTime            time.Time
+	lastRuneInputAt        time.Time
+	pasteGuardUntil        time.Time
+	width                  int
+	height                 int
+	input                  textarea.Model
+	viewport               viewport.Model
+	history                []string
+	theme                  Theme
+	// Tool-call collapsing: after the first couple of tool uses in a turn,
+	// subsequent ones fold into a single "+N more tool uses" line so the
+	// viewport doesn't drown in read_file/search noise.
+	toolUsesInTurn       int
+	collapsedToolLineIdx int
+	lastToolCollapsed    bool
 }
 
 func newModel(options Options) model {
-	input := textinput.New()
+	input := textarea.New()
 	input.Placeholder = "Ask Forge... (/help for commands, @file to attach)"
 	input.Focus()
 	input.CharLimit = 4096
-	input.Width = 96
+	input.SetWidth(96)
+	input.SetHeight(inputMinLines)
+	input.ShowLineNumbers = false
+	input.Prompt = ""
 
 	vp := viewport.New(100, 24)
 	theme := DefaultTheme()
@@ -108,6 +150,7 @@ func newModel(options Options) model {
 	runtime := agent.NewRuntime(options.CWD, options.Config, options.Tools, options.Providers)
 	runtime.Builder.History = options.Session
 	runtime.Builder.Skills = options.Skills
+	runtime.Builder.ProjectState = options.ProjectState
 	runtime.Hooks = options.Hooks
 
 	sessionName := "new"
@@ -121,13 +164,17 @@ func newModel(options Options) model {
 	cwd := filepath.Base(options.CWD)
 
 	m := model{
-		options:      options,
-		agentRuntime: runtime,
-		input:        input,
-		viewport:     vp,
-		width:        100,
-		thinkEnabled: true,
-		theme:        theme,
+		options:              options,
+		agentRuntime:         runtime,
+		input:                input,
+		viewport:             vp,
+		width:                100,
+		height:               33,
+		thinkEnabled:         true,
+		theme:                theme,
+		currentAssistant:     &strings.Builder{},
+		collapsedToolLineIdx: -1,
+		stickyBottom:         true,
 		history: []string{
 			"",
 			theme.Accent.Render("  forge") + theme.Muted.Render(" | "+cwd+" | session:"+sessionName),
@@ -139,7 +186,7 @@ func newModel(options Options) model {
 	return m
 }
 
-func (m model) Init() tea.Cmd { return textinput.Blink }
+func (m model) Init() tea.Cmd { return textarea.Blink }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
@@ -152,7 +199,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
-		m.viewport.Height = max(8, msg.Height-7)
+		m.height = msg.Height
 		m.recalcLayout()
 		m.refresh()
 	case agentEventMsg:
@@ -164,7 +211,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			break
 		}
 		cmds = append(cmds, waitForAgentEvent(msg.events))
+	case btwEventMsg:
+		m.appendBtwEvent(msg.event)
+		m.refresh()
+		if msg.event.Type == agent.EventDone {
+			m.btwEvents = nil
+			break
+		}
+		cmds = append(cmds, waitForBtwEvent(msg.events))
+	case remoteInputMsg:
+		// A web client submitted a prompt or /command. Treat it exactly like
+		// keyboard input and keep pumping for the next one.
+		next := m.handleLine(msg.Text)
+		if m.remoteServer != nil {
+			cmds = append(cmds, pumpRemoteInputs(context.Background(), m.remoteServer.server.Inputs()))
+		}
+		if next != nil {
+			cmds = append(cmds, next)
+		}
+		m.refresh()
 	case tea.KeyMsg:
+		now := time.Now()
+		m.updatePasteGuard(msg, now)
 		// Clear suggestions on Enter or Esc; auto-suggest handles the rest.
 		if (msg.Type == tea.KeyEnter || msg.Type == tea.KeyEsc) && len(m.suggestions) > 0 {
 			m.suggestions = nil
@@ -226,28 +294,38 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case tea.KeyEnter:
+			if now.Before(m.pasteGuardUntil) {
+				m.pasteGuardUntil = now.Add(pasteGuardDuration)
+				break
+			}
 			line := strings.TrimSpace(m.input.Value())
 			m.input.SetValue("")
 			if line != "" {
+				m.stickyBottom = true
 				cmds = append(cmds, m.handleLine(line))
 				m.refresh()
 			}
+			return m, tea.Batch(cmds...)
 		case tea.KeyPgUp:
 			m.viewport.ViewUp()
+			m.stickyBottom = m.viewport.AtBottom()
 			return m, nil
 		case tea.KeyPgDown:
 			m.viewport.ViewDown()
+			m.stickyBottom = m.viewport.AtBottom()
 			return m, nil
 		case tea.KeyUp:
 			// Scroll up when input is empty, otherwise let textinput handle it.
 			if m.input.Value() == "" {
 				m.viewport.LineUp(3)
+				m.stickyBottom = m.viewport.AtBottom()
 				return m, nil
 			}
 		case tea.KeyDown:
 			// Scroll down when input is empty, otherwise let textinput handle it.
 			if m.input.Value() == "" {
 				m.viewport.LineDown(3)
+				m.stickyBottom = m.viewport.AtBottom()
 				return m, nil
 			}
 		}
@@ -256,8 +334,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
 	cmds = append(cmds, cmd)
-	m.viewport, cmd = m.viewport.Update(msg)
-	cmds = append(cmds, cmd)
+	// Don't forward KeyMsg to viewport — it grabs scroll keys and causes jitter while typing.
+	if _, isKey := msg.(tea.KeyMsg); !isKey {
+		m.viewport, cmd = m.viewport.Update(msg)
+		cmds = append(cmds, cmd)
+	}
 
 	// Auto-suggest as user types / or @.
 	val := m.input.Value()
@@ -271,74 +352,37 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	m.recalcLayout()
 	return m, tea.Batch(cmds...)
+}
+
+func (m *model) updatePasteGuard(msg tea.KeyMsg, now time.Time) {
+	if msg.Type == tea.KeyRunes {
+		if msg.Paste || len(msg.Runes) > 1 || (!m.lastRuneInputAt.IsZero() && now.Sub(m.lastRuneInputAt) <= pasteBurstThreshold) {
+			m.pasteGuardUntil = now.Add(pasteGuardDuration)
+		}
+		m.lastRuneInputAt = now
+		return
+	}
+	if msg.String() == "ctrl+v" {
+		m.pasteGuardUntil = now.Add(pasteGuardDuration)
+	}
 }
 
 func (m model) View() string {
 	t := m.theme
-	w := m.width
-	if w <= 0 {
-		w = 80
-	}
+	inputArea := m.inputAreaView()
+	statusLine := m.statusLineView()
 
-	// Input box with border.
-	inputBox := t.InputBorder.Width(w - 4).Render(m.input.View())
-
-	// Status bar.
-	mode := t.StatusValue.Render(m.agentRuntime.Mode)
-	modelName := m.agentRuntime.LastModelUsed
-	if modelName == "" {
-		modelName = m.options.Config.Models["chat"]
+	// Approval takes over the chat area (not an overlay below) — the user
+	// asked for a momentary full-screen replacement so the decision is
+	// unmissable.
+	if m.activeForm == formApproval {
+		return m.approvalForm.View() + "\n\n" + statusLine
 	}
-	if modelName == "" {
-		modelName = "default"
+	if m.activeForm == formAskUser {
+		return m.viewport.View() + "\n" + m.askUserForm.View() + "\n\n" + statusLine
 	}
-	cwd := filepath.Base(m.options.CWD)
-	provider := m.options.Config.Providers.Default.Name
-	status := t.Muted.Render("idle")
-	if m.pendingAskUser != nil {
-		status = t.ApprovalStyle.Render("? type your answer")
-	} else if m.pendingApproval != nil {
-		status = t.ApprovalStyle.Render("approval: /approve or /reject")
-	} else if m.streaming {
-		status = t.StatusActive.Render("streaming")
-	} else if m.agentRunning {
-		status = t.Warning.Render("thinking")
-	}
-
-	// Context token usage.
-	tokensUsed := m.agentRuntime.LastTokensUsed
-	tokensBudget := m.agentRuntime.LastTokensBudget
-	contextInfo := t.Muted.Render("ctx:--")
-	if tokensBudget > 0 {
-		pct := 0
-		if tokensBudget > 0 {
-			pct = (tokensUsed * 100) / tokensBudget
-		}
-		ctxStyle := t.Muted
-		if pct > 80 {
-			ctxStyle = t.Warning
-		}
-		if pct > 95 {
-			ctxStyle = t.ErrorStyle
-		}
-		contextInfo = ctxStyle.Render(fmt.Sprintf("ctx:%dk/%dk", tokensUsed/1000, tokensBudget/1000))
-	}
-
-	thinkLabel := t.Muted.Render("Think:OFF")
-	if m.thinkEnabled {
-		thinkLabel = t.StatusActive.Render("Think:ON")
-	}
-
-	sep := t.Muted.Render(" | ")
-	bar := " " + mode + sep +
-		t.StatusValue.Render(modelName) + sep +
-		thinkLabel + sep +
-		t.Accent.Render(provider) + sep +
-		status + sep +
-		contextInfo + sep +
-		t.Muted.Render(cwd)
-	statusLine := t.StatusBar.Render(bar)
 
 	// Form overlays.
 	if m.activeForm == formProvider {
@@ -353,37 +397,42 @@ func (m model) View() string {
 	if m.activeForm == formModel {
 		return m.viewport.View() + "\n" + m.modelForm.View() + "\n\n" + statusLine
 	}
+	if m.activeForm == formModelMulti {
+		return m.viewport.View() + "\n" + m.modelMultiForm.View() + "\n\n" + statusLine
+	}
 	if m.activeForm == formConfirmExecute {
 		return m.viewport.View() + "\n" + m.confirmExecute.View() + "\n\n" + statusLine
 	}
+	if m.activeForm == formConfirmPlanReset {
+		return m.viewport.View() + "\n" + m.confirmPlanReset.View() + "\n\n" + statusLine
+	}
+	if m.activeForm == formConfirmExplorerPlan {
+		return m.viewport.View() + "\n" + m.confirmExplorerPlan.View() + "\n\n" + statusLine
+	}
 	if m.activeForm == formYarnSettings {
 		return m.viewport.View() + "\n" + m.yarnSettingsForm.View() + "\n\n" + statusLine
+	}
+	if m.activeForm == formYarnMenu {
+		return m.viewport.View() + "\n" + m.yarnMenuForm.View() + "\n\n" + statusLine
 	}
 
 	// Plan panel on the right side.
 	chatArea := m.viewport.View()
 	if m.showPlan && m.agentRuntime.Tasks != nil {
 		list, err := m.agentRuntime.Tasks.List()
-		if err == nil && len(list) > 0 {
-			// Auto-hide if all tasks are completed.
-			allDone := true
-			for _, task := range list {
-				if task.Status != "completed" && task.Status != "done" {
-					allDone = false
-					break
-				}
+		// Hide the panel only when the plan is genuinely empty — previously we
+		// also hid it when nothing was "pending", which made the panel vanish
+		// after a few approvals even though there were in_progress tasks.
+		if err != nil || len(list) == 0 {
+			m.showPlan = false
+			m.recalcLayout()
+		} else {
+			vpHeight := m.viewport.Height
+			if vpHeight <= 0 {
+				vpHeight = 20
 			}
-			if allDone {
-				m.showPlan = false
-				m.recalcLayout()
-			} else {
-				vpHeight := m.viewport.Height
-				if vpHeight <= 0 {
-					vpHeight = 20
-				}
-				panel := RenderPlanPanel(list, vpHeight, t)
-				chatArea = lipgloss.JoinHorizontal(lipgloss.Top, chatArea, "  ", panel)
-			}
+			panel := RenderPlanPanel(list, vpHeight, t)
+			chatArea = lipgloss.JoinHorizontal(lipgloss.Top, chatArea, "  ", panel)
 		}
 	}
 
@@ -391,20 +440,199 @@ func (m model) View() string {
 		return chatArea + "\n" + m.searchMode.View(t) + "\n\n" + statusLine
 	}
 
-	// Render autocomplete suggestions below input.
+	// Render autocomplete suggestions below input — flow horizontally, wrapping by width.
 	if len(m.suggestions) > 0 {
-		var sugLines []string
-		for i, s := range m.suggestions {
-			marker := "  "
-			if i == m.suggestionIdx {
-				marker = t.IndicatorAgent.Render("> ")
-			}
-			sugLines = append(sugLines, marker+t.StatusValue.Render(s))
-		}
-		suggestionView := strings.Join(sugLines, "\n")
-		return chatArea + "\n" + inputBox + "\n" + suggestionView + "\n\n" + statusLine
+		return chatArea + inputArea + "\n" + m.suggestionView() + "\n\n" + statusLine
 	}
-	return chatArea + "\n" + inputBox + "\n\n" + statusLine
+	return chatArea + inputArea + "\n\n" + statusLine
+}
+
+func (m model) safeWidth() int {
+	if m.width > 0 {
+		return m.width
+	}
+	return 80
+}
+
+func (m model) inputBoxView() string {
+	return m.theme.InputBorder.Width(max(20, m.safeWidth()-4)).Render(m.input.View())
+}
+
+func (m model) inputAreaView() string {
+	if progress := m.modelProgressView(); progress != "" {
+		return "\n" + progress + "\n" + m.inputBoxView()
+	}
+	return viewportInputGap() + m.inputBoxView()
+}
+
+func (m model) modelProgressView() string {
+	if m.modelProgress == nil {
+		return ""
+	}
+	p := *m.modelProgress
+	if p.Done && !m.agentRunning {
+		return ""
+	}
+	phase := strings.TrimSpace(p.Phase)
+	if phase == "" {
+		phase = "thinking"
+	}
+	if p.Step <= 0 {
+		p.Step = 1
+	}
+	elapsed := p.Elapsed.Truncate(100 * time.Millisecond)
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	line := fmt.Sprintf("  * %s | step:%d | in:%s out:%s total:%s | %.1f tk/s | %s",
+		phase,
+		p.Step,
+		formatTokenCount(p.InputTokens),
+		formatTokenCount(p.OutputTokens),
+		formatTokenCount(p.TotalTokens),
+		p.TokensPerSecond,
+		elapsed,
+	)
+	maxWidth := max(20, m.safeWidth()-4)
+	if len(stripAnsi(line)) > maxWidth {
+		line = truncate(line, maxWidth)
+	}
+	return m.theme.Muted.Render(line)
+}
+
+func formatTokenCount(tokens int) string {
+	if tokens < 0 {
+		tokens = 0
+	}
+	if tokens < 1000 {
+		return fmt.Sprintf("%d", tokens)
+	}
+	return fmt.Sprintf("%.1fk", float64(tokens)/1000)
+}
+
+func (m model) statusLineView() string {
+	t := m.theme
+	modeName := strings.ToUpper(m.agentRuntime.Mode)
+	var mode string
+	switch m.agentRuntime.Mode {
+	case "plan":
+		mode = t.Warning.Render("[" + modeName + "]")
+	case "build":
+		mode = t.Success.Render("[" + modeName + "]")
+	case "explore":
+		mode = t.Accent.Render("[" + modeName + "]")
+	default:
+		mode = t.StatusValue.Render("[" + modeName + "]")
+	}
+	modelName := m.agentRuntime.LastModelUsed
+	if modelName == "" {
+		modelName = m.options.Config.Models["chat"]
+	}
+	if modelName == "" {
+		modelName = "default"
+	}
+	cwd := filepath.Base(m.options.CWD)
+	provider := m.options.Config.Providers.Default.Name
+	status := t.Muted.Render("idle")
+	if m.pendingAskUser != nil {
+		status = t.ApprovalStyle.Render("? type your answer")
+	} else if m.pendingApproval != nil {
+		status = t.ApprovalStyle.Render("awaiting approval")
+	} else if m.streaming {
+		status = t.StatusActive.Render("streaming")
+	} else if m.agentRunning {
+		status = t.Warning.Render("thinking")
+	}
+
+	tokensUsed := m.agentRuntime.LastTokensUsed
+	yarnBudget := m.agentRuntime.LastTokensBudget
+	modelWindow, _, _ := config.EffectiveBudgets(m.options.Config)
+	contextInfo := t.Muted.Render("ctx:--")
+	if modelWindow > 0 {
+		pct := (tokensUsed * 100) / modelWindow
+		ctxStyle := t.Muted
+		if pct > 80 {
+			ctxStyle = t.Warning
+		}
+		if pct > 95 {
+			ctxStyle = t.ErrorStyle
+		}
+		contextInfo = ctxStyle.Render(fmt.Sprintf("ctx:%dk/%dk", tokensUsed/1000, modelWindow/1000))
+		if yarnBudget > 0 {
+			contextInfo += t.Muted.Render(fmt.Sprintf(" yarn:%dk", yarnBudget/1000))
+		}
+	} else if yarnBudget > 0 {
+		pct := (tokensUsed * 100) / yarnBudget
+		ctxStyle := t.Muted
+		if pct > 80 {
+			ctxStyle = t.Warning
+		}
+		if pct > 95 {
+			ctxStyle = t.ErrorStyle
+		}
+		contextInfo = ctxStyle.Render(fmt.Sprintf("yarn:%dk/%dk", tokensUsed/1000, yarnBudget/1000))
+	}
+
+	thinkLabel := t.Muted.Render("Think:OFF")
+	if m.thinkEnabled {
+		thinkLabel = t.StatusActive.Render("Think:ON")
+	}
+	modelMultiLabel := t.Muted.Render("Multi:OFF")
+	if m.options.Config.ModelLoading.Enabled {
+		strategy := strings.ToUpper(strings.TrimSpace(m.options.Config.ModelLoading.Strategy))
+		if strategy == "" {
+			strategy = "ON"
+		}
+		modelMultiLabel = t.StatusActive.Render("Multi:" + strategy)
+	}
+
+	sep := t.Muted.Render(" | ")
+	bar := " " + mode + sep +
+		t.StatusValue.Render(modelName) + sep +
+		thinkLabel + sep +
+		modelMultiLabel + sep +
+		t.Accent.Render(provider) + sep +
+		status + sep +
+		contextInfo + sep +
+		t.Muted.Render(cwd)
+	return t.StatusBar.Render(bar)
+}
+
+func (m model) suggestionView() string {
+	maxLineWidth := m.safeWidth() - 4
+	if maxLineWidth < 20 {
+		maxLineWidth = 20
+	}
+	var lines []string
+	var cur strings.Builder
+	curLen := 0
+	for i, s := range m.suggestions {
+		marker := "  "
+		if i == m.suggestionIdx {
+			marker = m.theme.IndicatorAgent.Render("> ")
+		}
+		item := marker + m.theme.StatusValue.Render(s)
+		itemLen := len("  " + s) // approximate visible width
+		if curLen > 0 && curLen+itemLen+2 > maxLineWidth {
+			lines = append(lines, cur.String())
+			cur.Reset()
+			curLen = 0
+		}
+		if curLen > 0 {
+			cur.WriteString("  ")
+			curLen += 2
+		}
+		cur.WriteString(item)
+		curLen += itemLen
+	}
+	if cur.Len() > 0 {
+		lines = append(lines, cur.String())
+	}
+	return strings.Join(lines, "\n")
+}
+
+func viewportInputGap() string {
+	return strings.Repeat("\n", viewportInputGapLines)
 }
 
 func (m *model) handleLine(line string) tea.Cmd {
@@ -414,6 +642,8 @@ func (m *model) handleLine(line string) tea.Cmd {
 	if m.options.Session != nil {
 		_ = m.options.Session.LogUser(line)
 	}
+	// Reset per-turn assistant accumulator for chat.md transcript.
+	m.currentAssistant.Reset()
 	if strings.HasPrefix(line, "/") {
 		result := m.handleCommand(line)
 		cmd := m.pendingCommand
@@ -449,8 +679,38 @@ func (m *model) handleLine(line string) tea.Cmd {
 		}
 	}
 	m.history = append(m.history, t.SeparatorLine(m.width-4))
-	m.history = append(m.history, t.IndicatorAgent.Render("* ")+t.AgentPrefix.Render("forge ["+m.agentRuntime.Mode+"]"))
+	m.history = append(m.history, t.IndicatorAgent.Render("* ")+t.AgentPrefix.Render("forge"))
 	m.history = append(m.history, "")
+	m.modelProgress = nil
+	if m.agentRuntime.Mode == "build" {
+		if preflight := m.runBuildPreflight(line); strings.TrimSpace(preflight) != "" {
+			m.agentRuntime.PendingBuildPreflight = preflight
+			m.lastBuildPreflight = preflight
+			m.history = append(m.history, "    "+t.Muted.Render("Build preflight complete."))
+		}
+	}
+	// In plan mode, wrap every user message with the interview prompt so the
+	// model runs the ask_user → plan_write → todo_write flow reliably — not
+	// just on /plan new. When a prior plan exists, pop a confirm first so the
+	// user decides explicitly between a fresh plan and refining the existing
+	// one (previously we silently refined, which appended to the old todos).
+	if m.agentRuntime.Mode == "plan" {
+		hasPlan := false
+		if m.agentRuntime.Plans != nil {
+			if _, ok, _ := m.agentRuntime.Plans.Current(); ok {
+				hasPlan = true
+			}
+		}
+		if hasPlan {
+			m.pendingPlanLine = line
+			m.activeForm = formConfirmPlanReset
+			m.confirmPlanReset = newConfirmFormWithDefault("A prior plan exists. Clear it and start fresh?", m.theme, false)
+			return nil
+		}
+		m.agentEvents = m.agentRuntime.Run(context.Background(), planInterviewPrompt(line, true))
+		m.agentRunning = true
+		return waitForAgentEvent(m.agentEvents)
+	}
 	m.agentEvents = m.agentRuntime.Run(context.Background(), line)
 	m.agentRunning = true
 	return waitForAgentEvent(m.agentEvents)
@@ -484,6 +744,21 @@ func (m *model) handleCommand(line string) string {
 		m.activeForm = formModel
 		m.modelForm = newModelForm(m.options.CWD, m.options.Config, m.options.Providers, m.theme)
 		return "Opening model selector..."
+	case "/model-multi":
+		if len(fields) >= 2 {
+			switch fields[1] {
+			case "off":
+				m.options.Config.ModelLoading.Enabled = false
+				m.persistConfig()
+				m.syncRuntimeConfig()
+				return m.theme.Success.Render("Model multi: OFF")
+			default:
+				return "Usage: /model-multi [off]"
+			}
+		}
+		m.activeForm = formModelMulti
+		m.modelMultiForm = newModelMultiForm(m.options.CWD, m.options.Config, m.options.Providers, m.theme)
+		return "Opening model multi selector..."
 	case "/agents":
 		return m.describeAgents()
 	case "/agent":
@@ -492,12 +767,7 @@ func (m *model) handleCommand(line string) string {
 		}
 		return m.runSubagentCommand(fields[1], strings.Join(fields[2:], " "))
 	case "/plan":
-		m.showPlan = !m.showPlan
-		m.recalcLayout()
-		if m.showPlan {
-			return m.theme.Success.Render("Plan panel: ON")
-		}
-		return m.theme.Muted.Render("Plan panel: OFF")
+		return m.handlePlanCommand(fields)
 	case "/tools":
 		return m.describeTools()
 	case "/status":
@@ -572,6 +842,8 @@ func (m *model) handleCommand(line string) string {
 			return m.options.Hooks.Describe()
 		}
 		return "No hooks loaded."
+	case "/log":
+		return m.describeLog()
 	case "/think":
 		if len(fields) >= 2 {
 			switch fields[1] {
@@ -596,7 +868,11 @@ func (m *model) handleCommand(line string) string {
 		if len(fields) < 2 {
 			return m.describeMode()
 		}
-		return m.setMode(fields[1])
+		goal := ""
+		if len(fields) > 2 {
+			goal = strings.Join(fields[2:], " ")
+		}
+		return m.setMode(fields[1], goal)
 	case "/copy":
 		return m.copyToClipboard()
 	case "/diff":
@@ -609,6 +885,15 @@ func (m *model) handleCommand(line string) string {
 		return m.undoLast()
 	case "/context":
 		return m.handleContextCommand(fields)
+	case "/analyze":
+		return m.handleAnalyzeCommand(fields)
+	case "/btw":
+		if len(fields) < 2 {
+			return "Usage: /btw <question>"
+		}
+		return m.handleBtwCommand(strings.Join(fields[1:], " "))
+	case "/remote-control", "/remote":
+		return m.handleRemoteCommand(fields)
 	default:
 		return "Unknown command. Try /help."
 	}
@@ -618,9 +903,13 @@ func (m model) helpText() string {
 	t := m.theme
 	rows := make([][]string, 0, len(tuiCommands))
 	for _, cmd := range tuiCommands {
-		rows = append(rows, []string{cmd.Usage, cmd.Description})
+		subcommands := ""
+		if len(cmd.Subcommands) > 0 {
+			subcommands = strings.Join(cmd.Subcommands, ", ")
+		}
+		rows = append(rows, []string{cmd.Usage, cmd.Description, subcommands})
 	}
-	return t.FormatTable([]string{"Command", "Description"}, rows)
+	return t.FormatTable([]string{"Command", "Description", "Subcommands"}, rows)
 }
 
 func (m model) copyToClipboard() string {
@@ -650,26 +939,40 @@ func (m *model) cycleMode() {
 		if name == current {
 			next := modes[(i+1)%len(modes)]
 			_ = m.agentRuntime.SetMode(next)
-			m.history = append(m.history, m.theme.Success.Render("  Mode: "+next))
+			// Mode is reflected in the status bar — don't pollute the viewport.
 			return
 		}
 	}
 }
 
 func (m *model) refresh() {
+	m.recalcLayout()
 	content := m.history
 	if m.searchMode.query != "" {
-		filtered, matches := FilterHistory(content, m.searchMode.query)
+		filtered, positions := FilterHistory(content, m.searchMode.query, m.searchMode.currentIdx)
 		content = filtered
-		m.searchMode.matches = matches
+		if m.searchMode.currentIdx >= len(positions) {
+			m.searchMode.currentIdx = 0
+		}
+		m.searchMode.positions = positions
 	}
-	// Check if viewport is already at the bottom before updating content.
-	wasAtBottom := m.viewport.AtBottom()
-	m.viewport.SetContent(strings.Join(content, "\n"))
-	// Auto-scroll to bottom when: already at bottom, agent active, or forced.
-	if wasAtBottom || m.agentRunning || m.streaming || m.forceScrollBottom {
+	// Reserved trailing padding so the last rendered line can never sit flush
+	// against the bottom edge of the viewport and appear crowded by the input.
+	rendered := strings.Join(content, "\n") + strings.Repeat("\n", viewportInputGapLines)
+	// Inherit sticky state from previous position: if the viewport was already
+	// at the bottom, keep it pinned.
+	if m.viewport.AtBottom() {
+		m.stickyBottom = true
+	}
+	m.viewport.SetContent(rendered)
+	if m.forceScrollBottom {
 		m.viewport.GotoBottom()
+		m.stickyBottom = true
 		m.forceScrollBottom = false
+		return
+	}
+	if m.stickyBottom {
+		m.viewport.GotoBottom()
 	}
 }
 
@@ -712,14 +1015,87 @@ func looksLikeExecute(line string) bool {
 func (m *model) recalcLayout() {
 	w := m.width
 	if w <= 0 {
-		return
+		w = 80
 	}
-	m.input.Width = max(20, w-8)
+	m.input.SetWidth(max(20, w-8))
+	// Grow textarea with content, capped at inputMaxLines. Must happen before
+	// lowerChromeHeight() so the chrome math reflects current input size.
+	desired := m.computeInputHeight()
+	if m.input.Height() != desired {
+		m.input.SetHeight(desired)
+	}
 	vpWidth := max(20, w-2)
 	if m.showPlan {
 		vpWidth = max(20, w-planPanelWidth-4)
 	}
 	m.viewport.Width = vpWidth
+
+	if m.height <= 0 {
+		return
+	}
+	available := m.height - m.lowerChromeHeight()
+	if available < 1 {
+		available = 1
+	}
+	m.viewport.Height = available
+}
+
+// computeInputHeight returns the textarea height that fits the current content,
+// clamped to [inputMinLines, inputMaxLines]. Past the cap, the textarea
+// scrolls internally.
+func (m model) computeInputHeight() int {
+	lines := m.input.LineCount()
+	if lines < inputMinLines {
+		lines = inputMinLines
+	}
+	if lines > inputMaxLines {
+		lines = inputMaxLines
+	}
+	return lines
+}
+
+func (m model) lowerChromeHeight() int {
+	statusHeight := lipgloss.Height(m.statusLineView())
+	if m.activeForm == formApproval {
+		return 2 + statusHeight
+	}
+	if view := m.activeFormView(); view != "" {
+		return 1 + lipgloss.Height(view) + 2 + statusHeight
+	}
+	if m.searching {
+		return 1 + lipgloss.Height(m.searchMode.View(m.theme)) + 2 + statusHeight
+	}
+
+	height := lipgloss.Height(m.inputAreaView())
+	if len(m.suggestions) > 0 {
+		height += 1 + lipgloss.Height(m.suggestionView())
+	}
+	return height + 2 + statusHeight
+}
+
+func (m model) activeFormView() string {
+	switch m.activeForm {
+	case formProvider:
+		return m.providerForm.View()
+	case formSkills:
+		return m.skillsForm.View()
+	case formTheme:
+		return m.themeForm.View()
+	case formModel:
+		return m.modelForm.View()
+	case formModelMulti:
+		return m.modelMultiForm.View()
+	case formConfirmExecute:
+		return m.confirmExecute.View()
+	case formConfirmExplorerPlan:
+		return m.confirmExplorerPlan.View()
+	case formYarnSettings:
+		return m.yarnSettingsForm.View()
+	case formYarnMenu:
+		return m.yarnMenuForm.View()
+	default:
+		return ""
+	}
 }
 
 // dumpHistory writes the conversation history to a text file so it can be reviewed after exit.

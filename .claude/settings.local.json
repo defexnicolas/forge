@@ -23,7 +23,17 @@
       "Bash(go version:*)",
       "Bash(find C:\\\\Users\\\\nicod\\\\Downloads\\\\letcode\\\\internal:*)",
       "Bash(go get:*)",
-      "Bash(find C:\\\\Users\\\\nicod\\\\Downloads\\\\letcode\\\\internal\\\\tui:*)"
+      "Bash(find C:\\\\Users\\\\nicod\\\\Downloads\\\\letcode\\\\internal\\\\tui:*)",
+      "Bash(xargs grep:*)",
+      "Bash(grep:*)",
+      "Bash(where forge:*)",
+      "Bash(go env:*)",
+      "Bash(go doc:*)",
+      "WebFetch(domain:lmstudio.ai)",
+      "WebSearch",
+      "Bash(find C:\\\\Users\\\\nicod\\\\Downloads\\\\letcode:*)",
+      "Bash(find:*)",
+      "Bash(git stash *)"
     ]
   }
 }

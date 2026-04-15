@@ -49,15 +49,37 @@ type ChatResponse struct {
 	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 }
 
+type TokenUsage struct {
+	PromptTokens     int `json:"prompt_tokens,omitempty"`
+	CompletionTokens int `json:"completion_tokens,omitempty"`
+	TotalTokens      int `json:"total_tokens,omitempty"`
+}
+
 type ChatEvent struct {
 	Type      string
 	Text      string
 	ToolCalls []ToolCall
+	Usage     *TokenUsage
 	Error     error
 }
 
 type ModelInfo struct {
-	ID string `json:"id"`
+	ID                  string `json:"id"`
+	State               string `json:"state,omitempty"`
+	MaxContextLength    int    `json:"max_context_length,omitempty"`
+	LoadedContextLength int    `json:"loaded_context_length,omitempty"`
+	Arch                string `json:"arch,omitempty"`
+	Quantization        string `json:"quantization,omitempty"`
+}
+
+type LoadConfig struct {
+	ContextLength  int
+	FlashAttention bool
+	// ParallelSlots tells the backend (LM Studio) how many concurrent
+	// generation slots to reserve for this model. 0 means leave the backend
+	// default; >=2 enables parallel decoding so the agent can fan out work
+	// (e.g. parallel tool calls, /btw, subagents) without queueing.
+	ParallelSlots int
 }
 
 type Provider interface {
@@ -65,6 +87,8 @@ type Provider interface {
 	Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error)
 	Stream(ctx context.Context, req ChatRequest) (<-chan ChatEvent, error)
 	ListModels(ctx context.Context) ([]ModelInfo, error)
+	ProbeModel(ctx context.Context, modelID string) (*ModelInfo, error)
+	LoadModel(ctx context.Context, modelID string, cfg LoadConfig) error
 }
 
 type Registry struct {
@@ -100,3 +124,4 @@ func (r *Registry) Names() []string {
 }
 
 var ErrProviderNotConfigured = errors.New("provider is not configured")
+var ErrNotSupported = errors.New("operation not supported by this provider")

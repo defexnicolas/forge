@@ -6,17 +6,21 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"forge/internal/config"
+	"forge/internal/db"
 	"forge/internal/hooks"
 	"forge/internal/llm"
 	"forge/internal/mcp"
 	"forge/internal/plugins"
+	"forge/internal/projectstate"
 	"forge/internal/session"
 	"forge/internal/skills"
 	"forge/internal/tools"
 	"forge/internal/tui"
 
+	"github.com/pelletier/go-toml/v2"
 	"github.com/spf13/cobra"
 )
 
@@ -79,6 +83,7 @@ func NewRootCommand() *cobra.Command {
 			providers := llm.NewRegistry()
 			providers.Register(llm.NewOpenAICompatible("openai_compatible", cfg.Providers.OpenAICompatible))
 			providers.Register(llm.NewOpenAICompatible("lmstudio", cfg.Providers.LMStudio))
+			probeActiveContext(cwd, &cfg, providers)
 			sessionStore, err := openSession(cwd, resume)
 			if err != nil {
 				return err
@@ -107,12 +112,27 @@ func NewRootCommand() *cobra.Command {
 				}
 			}
 
+			var projectSvc *projectstate.Service
+			if sqlDB, err := db.Open(cwd); err == nil {
+				projectSvc = projectstate.NewService(sqlDB)
+				go func() {
+					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer cancel()
+					if _, err := projectSvc.EnsureSnapshot(ctx, cwd); err != nil {
+						fmt.Fprintf(os.Stderr, "projectstate: %s\n", err)
+					}
+				}()
+			} else {
+				fmt.Fprintf(os.Stderr, "projectstate db: %s\n", err)
+			}
+
 			app := tui.New(tui.Options{
-				CWD:       cwd,
-				Config:    cfg,
-				Tools:     registry,
-				Providers: providers,
-				Session:   sessionStore,
+				CWD:          cwd,
+				Config:       cfg,
+				Tools:        registry,
+				Providers:    providers,
+				Session:      sessionStore,
+				ProjectState: projectSvc,
 				Skills: skills.NewManager(cwd, skills.Options{
 					CLI:          cfg.Skills.CLI,
 					DirectoryURL: cfg.Skills.DirectoryURL,
@@ -139,6 +159,45 @@ func NewRootCommand() *cobra.Command {
 	cmd.AddCommand(newPluginCommand())
 
 	return cmd
+}
+
+// probeActiveContext hits the default provider's /models endpoint to discover
+// the actual loaded context window (e.g. YaRN-extended 262k on LM Studio) and
+// stashes it into cfg.Context.Detected. Best-effort: failures are silent, we
+// just fall back to the static profile caps.
+func probeActiveContext(cwd string, cfg *config.Config, providers *llm.Registry) {
+	name := cfg.Providers.Default.Name
+	if name == "" {
+		return
+	}
+	provider, ok := providers.Get(name)
+	if !ok {
+		return
+	}
+	modelID := cfg.Models["chat"]
+	if modelID == "" {
+		modelID = cfg.Providers.LMStudio.DefaultModel
+	}
+	// Reuse a cached detection if it already matches the active model.
+	if cfg.Context.Detected != nil && cfg.Context.Detected.ModelID == modelID && cfg.Context.Detected.LoadedContextLength > 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	info, err := provider.ProbeModel(ctx, modelID)
+	if err != nil || info == nil || info.LoadedContextLength <= 0 {
+		return
+	}
+	cfg.Context.Detected = &config.DetectedContext{
+		ModelID:             info.ID,
+		LoadedContextLength: info.LoadedContextLength,
+		MaxContextLength:    info.MaxContextLength,
+		ProbedAt:            time.Now().UTC(),
+	}
+	// Persist so restarts skip the probe and /yarn inspect can show it.
+	if data, err := toml.Marshal(cfg); err == nil {
+		_ = os.WriteFile(filepath.Join(cwd, ".forge", "config.toml"), data, 0o644)
+	}
 }
 
 func openSession(cwd, resume string) (*session.Store, error) {

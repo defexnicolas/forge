@@ -9,17 +9,44 @@ import (
 
 // Suggest returns autocomplete suggestions for the current input.
 func Suggest(input, cwd string) []string {
-	input = strings.TrimSpace(input)
-	if input == "" {
+	if strings.TrimSpace(input) == "" {
 		return nil
 	}
+	input = strings.TrimLeft(input, " \t\r\n")
 
 	// Slash command completion.
 	if strings.HasPrefix(input, "/") {
+		// Subcommand completion when a space is present.
+		if spaceIdx := strings.Index(input, " "); spaceIdx >= 0 {
+			head := input[:spaceIdx]
+			rest := strings.TrimLeft(input[spaceIdx+1:], " ")
+			subs := subcommandsFor(head)
+			if len(subs) == 0 {
+				return nil
+			}
+			var matches []string
+			for _, sub := range subs {
+				full := head + " " + sub
+				if strings.HasPrefix(sub, rest) && full != input {
+					matches = append(matches, full)
+				}
+			}
+			return matches
+		}
 		var matches []string
 		for _, cmd := range slashCommandNames() {
 			if strings.HasPrefix(cmd, input) && cmd != input {
 				matches = append(matches, cmd)
+			}
+		}
+		// If the input is an exact command name, surface its subcommands as
+		// the next completion step so the user discovers them without having
+		// to type a trailing space first.
+		if len(matches) == 0 {
+			if subs := subcommandsFor(input); len(subs) > 0 {
+				for _, sub := range subs {
+					matches = append(matches, input+" "+sub)
+				}
 			}
 		}
 		return matches

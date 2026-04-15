@@ -7,6 +7,7 @@ import (
 
 func TestCreateListUpdateGet(t *testing.T) {
 	store := New(t.TempDir())
+	t.Cleanup(func() { store.Close() })
 	task, err := store.Create("write tests", "important")
 	if err != nil {
 		t.Fatal(err)
@@ -39,6 +40,7 @@ func TestCreateListUpdateGet(t *testing.T) {
 
 func TestReplacePlan(t *testing.T) {
 	store := New(t.TempDir())
+	t.Cleanup(func() { store.Close() })
 	plan, err := store.ReplacePlan([]string{"first", "", "second"})
 	if err != nil {
 		t.Fatal(err)

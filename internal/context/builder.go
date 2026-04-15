@@ -10,6 +10,7 @@ import (
 
 	"forge/internal/config"
 	"forge/internal/lsp"
+	"forge/internal/projectstate"
 	"forge/internal/skills"
 	"forge/internal/tools"
 	"forge/internal/yarn"
@@ -18,14 +19,15 @@ import (
 var mentionPattern = regexp.MustCompile(`@([A-Za-z0-9_./\\:-]+)`)
 
 type Builder struct {
-	CWD     string
-	Config  config.Config
-	Tools   *tools.Registry
-	Yarn    *yarn.Store
-	Tray    *Tray
-	History HistorySource
-	Skills  *skills.Manager
-	LSP     lsp.Client
+	CWD          string
+	Config       config.Config
+	Tools        *tools.Registry
+	Yarn         *yarn.Store
+	Tray         *Tray
+	History      HistorySource
+	Skills       *skills.Manager
+	LSP          lsp.Client
+	ProjectState *projectstate.Service
 }
 
 type HistorySource interface {
@@ -74,6 +76,20 @@ func (b *Builder) BuildWithOptions(userMessage string, opts BuildOptions) Snapsh
 		ReadOnlyToolNames: ReadOnlyToolNames(),
 	}
 
+	// Inject cached project snapshot if available. Persisted across sessions
+	// so the model has structural context without re-walking the tree.
+	if b.ProjectState != nil {
+		if snap, ok := b.ProjectState.Current(); ok {
+			snapshot.Items = append(snapshot.Items, Item{
+				Kind:    "project_state",
+				Path:    snap.RepoRoot,
+				Content: snap.Summary(),
+				Source:  "projectstate",
+				Mode:    "always",
+			})
+		}
+	}
+
 	// Load installed skills into context.
 	if b.Skills != nil {
 		for _, detail := range b.Skills.LoadAllInstalled() {
@@ -89,7 +105,8 @@ func (b *Builder) BuildWithOptions(userMessage string, opts BuildOptions) Snapsh
 		}
 	}
 
-	snapshot.TokensBudget = b.Config.Context.BudgetTokens
+	_, effectiveBudget, _ := config.EffectiveBudgets(b.Config)
+	snapshot.TokensBudget = effectiveBudget
 	if strings.EqualFold(b.Config.Context.Engine, "yarn") {
 		return b.enforceTokenBudget(b.buildYarn(userMessage, snapshot, opts))
 	}
@@ -139,7 +156,7 @@ func (b *Builder) buildYarn(userMessage string, snapshot Snapshot, opts BuildOpt
 		}
 	}
 
-	budgetBytes := b.Config.Context.BudgetTokens * 4
+	budgetBytes := snapshot.TokensBudget * 4
 	maxNodes := b.Config.Context.Yarn.MaxNodes
 	if maxNodes <= 0 {
 		maxNodes = 8
@@ -449,7 +466,7 @@ func workspacePath(cwd, rel string) (string, error) {
 
 // LastTokenInfo returns a short string showing last known token usage.
 func (b *Builder) LastTokenInfo() string {
-	budget := b.Config.Context.BudgetTokens
+	_, budget, _ := config.EffectiveBudgets(b.Config)
 	if budget <= 0 {
 		return "n/a"
 	}
@@ -464,6 +481,8 @@ func ReadOnlyToolNames() []string {
 		"search_files",
 		"git_status",
 		"git_diff",
+		"plan_write",
+		"plan_get",
 		"todo_write",
 	}
 }

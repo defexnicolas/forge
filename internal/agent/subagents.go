@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	contextbuilder "forge/internal/context"
 	"forge/internal/llm"
@@ -27,6 +28,20 @@ type SubagentRequest struct {
 	Context json.RawMessage `json:"context,omitempty"`
 }
 
+type SubagentBatchRequest struct {
+	Tasks          []SubagentRequest `json:"tasks"`
+	MaxConcurrency int               `json:"max_concurrency"`
+}
+
+type SubagentBatchItem struct {
+	Index   int          `json:"index"`
+	Agent   string       `json:"agent"`
+	Status  string       `json:"status"`
+	Summary string       `json:"summary"`
+	Error   string       `json:"error,omitempty"`
+	Result  tools.Result `json:"result,omitempty"`
+}
+
 type SubagentRegistry struct {
 	agents map[string]Subagent
 }
@@ -36,7 +51,7 @@ func DefaultSubagents() SubagentRegistry {
 		{
 			Name:         "explorer",
 			Description:  "Read-only worker for finding relevant files, symbols, and repository facts.",
-			ModelRole:    "planner",
+			ModelRole:    "explorer",
 			ContextMode:  "yarn",
 			AllowedTools: []string{"read_file", "list_files", "search_text", "search_files", "git_status", "git_diff"},
 		},
@@ -135,11 +150,24 @@ func (r *Runtime) RunSubagent(ctx context.Context, request SubagentRequest) (too
 	if !ok {
 		return tools.Result{}, fmt.Errorf("provider %q is not registered", providerName)
 	}
-	model := r.Config.Models[worker.ModelRole]
-	if model == "" {
-		model = r.Config.Models["chat"]
+	// Decide which model this subagent runs on. On single-slot backends
+	// (LM Studio with strategy="single") a worker-role swap would evict the
+	// model the current turn just loaded, stalling every GEN slot. Reuse the
+	// current mode's model in that case. Only when the user explicitly opts
+	// into parallel model loading do we honor the worker's declared role.
+	effectiveRole := worker.ModelRole
+	strategy := strings.ToLower(strings.TrimSpace(r.Config.ModelLoading.Strategy))
+	if strategy != "parallel" {
+		effectiveRole = r.modelRoleForMode()
 	}
-	snapshot := r.Builder.Build(prompt)
+	if err := r.EnsureRoleModelLoaded(ctx, provider, effectiveRole); err != nil {
+		return tools.Result{}, err
+	}
+	model := r.roleModel(effectiveRole)
+	if model == "" {
+		model = r.roleModel("chat")
+	}
+	snapshot := r.buildTaskSnapshot(prompt, worker.ModelRole)
 	messages := []llm.Message{
 		{Role: "system", Content: subagentSystemPrompt(worker, snapshot)},
 		{Role: "user", Content: "Context snapshot:\n" + snapshot.Render() + "\n\nTask:\n" + prompt},
@@ -186,6 +214,106 @@ func (r *Runtime) RunSubagent(ctx context.Context, request SubagentRequest) (too
 		Title:   "Subagent " + worker.Name,
 		Summary: "subagent stopped after step limit",
 		Content: []tools.ContentBlock{{Type: "text", Text: strings.Join(trace, "\n\n")}},
+	}, nil
+}
+
+func (r *Runtime) RunSubagents(ctx context.Context, request SubagentBatchRequest) (tools.Result, error) {
+	if len(request.Tasks) == 0 {
+		return tools.Result{}, fmt.Errorf("subagent tasks are required")
+	}
+	maxConcurrency := request.MaxConcurrency
+	if maxConcurrency <= 0 {
+		maxConcurrency = 3
+	}
+	if maxConcurrency > 8 {
+		maxConcurrency = 8
+	}
+	if maxConcurrency > len(request.Tasks) {
+		maxConcurrency = len(request.Tasks)
+	}
+	// ModelLoading.Strategy governs model load/switch behavior (single vs parallel
+	// loaded models), NOT inference concurrency. A "single" strategy still allows
+	// multiple concurrent requests against the one loaded model.
+
+	items := make([]SubagentBatchItem, len(request.Tasks))
+	sem := make(chan struct{}, maxConcurrency)
+	var wg sync.WaitGroup
+	for i, task := range request.Tasks {
+		i, task := i, task
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				items[i] = SubagentBatchItem{Index: i, Agent: strings.TrimSpace(task.Agent), Status: "error", Error: ctx.Err().Error()}
+				return
+			}
+
+			agentName := strings.TrimSpace(task.Agent)
+			if agentName == "" {
+				agentName = "explorer"
+			}
+			worker, ok := r.Subagents.Get(agentName)
+			if !ok {
+				items[i] = SubagentBatchItem{Index: i, Agent: agentName, Status: "error", Error: "unknown subagent: " + agentName}
+				return
+			}
+			if hasMutatingTools(worker.AllowedTools) {
+				items[i] = SubagentBatchItem{Index: i, Agent: agentName, Status: "error", Error: "parallel subagents do not allow mutating tools"}
+				return
+			}
+			result, err := r.RunSubagent(ctx, task)
+			if err != nil {
+				items[i] = SubagentBatchItem{Index: i, Agent: agentName, Status: "error", Error: err.Error()}
+				return
+			}
+			items[i] = SubagentBatchItem{
+				Index:   i,
+				Agent:   agentName,
+				Status:  "completed",
+				Summary: result.Summary,
+				Result:  result,
+			}
+		}()
+	}
+	wg.Wait()
+
+	completed, failed := 0, 0
+	var b strings.Builder
+	for _, item := range items {
+		if item.Status == "completed" {
+			completed++
+		} else {
+			failed++
+		}
+		fmt.Fprintf(&b, "[%d] %s %s", item.Index, item.Agent, item.Status)
+		if item.Summary != "" {
+			fmt.Fprintf(&b, ": %s", item.Summary)
+		}
+		if item.Error != "" {
+			fmt.Fprintf(&b, ": %s", item.Error)
+		}
+		b.WriteByte('\n')
+		if len(item.Result.Content) > 0 {
+			for _, block := range item.Result.Content {
+				if strings.TrimSpace(block.Text) != "" {
+					b.WriteString(strings.TrimSpace(block.Text))
+					b.WriteString("\n")
+				}
+			}
+		}
+		b.WriteByte('\n')
+	}
+	payload, _ := json.Marshal(items)
+	return tools.Result{
+		Title:   "Subagents",
+		Summary: fmt.Sprintf("%d subagent task(s): %d completed, %d failed", len(items), completed, failed),
+		Content: []tools.ContentBlock{
+			{Type: "text", Text: strings.TrimSpace(b.String())},
+			{Type: "json", Text: string(payload)},
+		},
 	}, nil
 }
 
@@ -255,4 +383,14 @@ func oneLine(text string, limit int) string {
 		return text[:limit] + "..."
 	}
 	return text
+}
+
+func hasMutatingTools(names []string) bool {
+	for _, name := range names {
+		switch name {
+		case "edit_file", "write_file", "apply_patch":
+			return true
+		}
+	}
+	return false
 }

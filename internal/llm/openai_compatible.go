@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -186,6 +188,7 @@ func (p *OpenAICompatible) readSSE(body io.Reader, events chan<- ChatEvent) {
 		}
 
 		var chunk struct {
+			Usage   *TokenUsage `json:"usage,omitempty"`
 			Choices []struct {
 				Delta struct {
 					Content   string          `json:"content"`
@@ -195,6 +198,9 @@ func (p *OpenAICompatible) readSSE(body io.Reader, events chan<- ChatEvent) {
 		}
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			continue // skip malformed chunks
+		}
+		if chunk.Usage != nil {
+			events <- ChatEvent{Type: "usage", Usage: chunk.Usage}
 		}
 		if len(chunk.Choices) == 0 {
 			continue
@@ -223,7 +229,7 @@ func (p *OpenAICompatible) readSSE(body io.Reader, events chan<- ChatEvent) {
 
 // toolCallDelta represents the incremental chunks for tool calls in SSE.
 type toolCallDelta struct {
-	Index    int `json:"index"`
+	Index    int    `json:"index"`
 	ID       string `json:"id,omitempty"`
 	Type     string `json:"type,omitempty"`
 	Function struct {
@@ -284,6 +290,219 @@ func (p *OpenAICompatible) ListModels(ctx context.Context) ([]ModelInfo, error) 
 
 func (p *OpenAICompatible) endpoint(path string) string {
 	return strings.TrimRight(p.cfg.BaseURL, "/") + path
+}
+
+// ProbeModel queries the provider for metadata about the given model.
+// For LM Studio, it prefers the enhanced /api/v0/models endpoint which exposes
+// loaded_context_length and max_context_length. Falls back to /v1/models for
+// plain OpenAI-compatible providers.
+//
+// If modelID is empty or the generic "local-model", it returns the first
+// loaded model (LM Studio reports state="loaded" for the active model).
+func (p *OpenAICompatible) ProbeModel(ctx context.Context, modelID string) (*ModelInfo, error) {
+	if p.cfg.BaseURL == "" {
+		return nil, ErrProviderNotConfigured
+	}
+	// Try standard /v1/models first — recent LM Studio versions already
+	// expose state / loaded_context_length / max_context_length there, and
+	// it avoids a guaranteed 404 roundtrip for providers that only speak /v1.
+	models, err := p.ListModels(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !modelsHaveContextMetadata(models) {
+		// Older LM Studio builds only expose the enhanced fields on the
+		// native /api/v0/models endpoint. Try it opportunistically.
+		if enhanced, eerr := p.listModelsEnhanced(ctx); eerr == nil && len(enhanced) > 0 {
+			models = enhanced
+		}
+	}
+	if len(models) == 0 {
+		return nil, fmt.Errorf("provider %s returned no models", p.name)
+	}
+	generic := modelID == "" || modelID == "local-model"
+	// First pass: exact ID match.
+	if !generic {
+		for i := range models {
+			if models[i].ID == modelID {
+				return &models[i], nil
+			}
+		}
+	}
+	// Second pass: first loaded model.
+	for i := range models {
+		if models[i].State == "loaded" {
+			return &models[i], nil
+		}
+	}
+	// Fallback: first entry.
+	return &models[0], nil
+}
+
+// LoadModel asks LM Studio to load the given model with custom context length
+// (and flash attention). Tries the REST endpoint first, falls back to the
+// `lms` CLI when REST isn't available (older LM Studio builds or builds that
+// don't expose the load endpoint). Returns ErrNotSupported for providers that
+// don't look like LM Studio (no /api/v0 prefix derivable).
+func (p *OpenAICompatible) LoadModel(ctx context.Context, modelID string, loadCfg LoadConfig) error {
+	if p.cfg.BaseURL == "" {
+		return ErrProviderNotConfigured
+	}
+	if modelID == "" {
+		return fmt.Errorf("model id is required")
+	}
+	base := strings.TrimRight(p.cfg.BaseURL, "/")
+	if !strings.HasSuffix(base, "/v1") {
+		return ErrNotSupported
+	}
+
+	httpErr := p.loadModelHTTP(ctx, base, modelID, loadCfg)
+	if httpErr == nil {
+		return nil
+	}
+	cliErr := p.loadModelCLI(ctx, modelID, loadCfg)
+	if cliErr == nil {
+		return nil
+	}
+	return fmt.Errorf("load failed via HTTP (%v) and via lms CLI (%v)", httpErr, cliErr)
+}
+
+func (p *OpenAICompatible) loadModelHTTP(ctx context.Context, base, modelID string, loadCfg LoadConfig) error {
+	// LM Studio's documented native load endpoint is /api/v1/models/load.
+	// We try it first, then fall back to /api/v0/models/load for older builds.
+	stripped := strings.TrimSuffix(base, "/v1")
+	paths := []string{"/api/v1/models/load", "/api/v0/models/load"}
+	body := map[string]any{
+		"model":            modelID,
+		"echo_load_config": true,
+	}
+	if loadCfg.ContextLength > 0 {
+		body["context_length"] = loadCfg.ContextLength
+	}
+	if loadCfg.FlashAttention {
+		body["flash_attention"] = true
+	}
+	// LM Studio has used several field names for parallel generation slots
+	// across versions. Send all three — unknown fields are ignored — so
+	// "max_parallel_sequences=2" produces the 2+ GEN slots the user wants.
+	if loadCfg.ParallelSlots > 0 {
+		body["max_parallel_sequences"] = loadCfg.ParallelSlots
+		body["parallel_requests"] = loadCfg.ParallelSlots
+		body["n_parallel"] = loadCfg.ParallelSlots
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+
+	var lastErr error
+	for _, path := range paths {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, stripped+path, bytes.NewReader(payload))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		if apiKey := p.apiKey(); apiKey != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+		}
+		client := &http.Client{Timeout: 5 * time.Minute}
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode == 404 {
+			lastErr = fmt.Errorf("%s: 404", path)
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return fmt.Errorf("%s %s: %s", path, resp.Status, strings.TrimSpace(string(respBody)))
+		}
+		// Validate echoed config so silent no-ops surface as errors.
+		if loadCfg.ContextLength > 0 {
+			var echo struct {
+				LoadConfig struct {
+					ContextLength int `json:"context_length"`
+				} `json:"load_config"`
+			}
+			if jerr := json.Unmarshal(respBody, &echo); jerr == nil && echo.LoadConfig.ContextLength > 0 {
+				if echo.LoadConfig.ContextLength != loadCfg.ContextLength {
+					return fmt.Errorf("LM Studio applied context_length=%d (requested %d) — model may not support that window",
+						echo.LoadConfig.ContextLength, loadCfg.ContextLength)
+				}
+			}
+		}
+		return nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no load endpoint reachable")
+	}
+	return lastErr
+}
+
+func (p *OpenAICompatible) loadModelCLI(ctx context.Context, modelID string, loadCfg LoadConfig) error {
+	bin := os.Getenv("FORGE_LMS_BIN")
+	if bin == "" {
+		bin = "lms"
+	}
+	args := []string{"load", modelID}
+	if loadCfg.ContextLength > 0 {
+		args = append(args, "--context-length", strconv.Itoa(loadCfg.ContextLength))
+	}
+	args = append(args, "--gpu", "max")
+	cliCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(cliCtx, bin, args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s %s: %v (%s)", bin, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func modelsHaveContextMetadata(models []ModelInfo) bool {
+	for _, m := range models {
+		if m.LoadedContextLength > 0 || m.MaxContextLength > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// listModelsEnhanced hits LM Studio's /api/v0/models (OpenAI-compatible with
+// extended metadata). Derives the URL from BaseURL by replacing a trailing /v1
+// segment with /api/v0. Returns error or empty slice when unavailable.
+func (p *OpenAICompatible) listModelsEnhanced(ctx context.Context) ([]ModelInfo, error) {
+	base := strings.TrimRight(p.cfg.BaseURL, "/")
+	if !strings.HasSuffix(base, "/v1") {
+		return nil, fmt.Errorf("enhanced endpoint not applicable")
+	}
+	enhanced := strings.TrimSuffix(base, "/v1") + "/api/v0/models"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, enhanced, nil)
+	if err != nil {
+		return nil, err
+	}
+	if apiKey := p.apiKey(); apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	resp, err := p.client.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("enhanced probe %s: %s", p.name, resp.Status)
+	}
+	var decoded struct {
+		Data []ModelInfo `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		return nil, err
+	}
+	return decoded.Data, nil
 }
 
 func (p *OpenAICompatible) apiKey() string {

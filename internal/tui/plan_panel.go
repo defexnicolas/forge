@@ -50,7 +50,7 @@ func RenderPlanPanel(taskList []tasks.Task, height int, theme Theme) string {
 		BorderForeground(lipgloss.Color("245")).
 		Width(planPanelWidth)
 
-	header := theme.Accent.Render(" Plan")
+	header := theme.Accent.Render(" Checklist")
 	return header + "\n" + box.Render(content)
 }
 

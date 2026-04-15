@@ -10,6 +10,7 @@ import (
 
 	"forge/internal/agent"
 	"forge/internal/permissions"
+	"forge/internal/plans"
 	"forge/internal/session"
 	"forge/internal/skills"
 	"forge/internal/tasks"
@@ -28,8 +29,12 @@ func (m *model) handleModelCommand(fields []string) string {
 				return "Usage: /model set <model-name>"
 			}
 			m.options.Config.Models["chat"] = fields[2]
-			m.agentRuntime.Config.Models["chat"] = fields[2]
-			return t.Success.Render("Model set to: " + fields[2])
+			m.agentRuntime.SetChatModel(fields[2])
+			msg := t.Success.Render("Model set to: " + fields[2])
+			if m.agentRuntime.ActiveParserName != "" {
+				msg += t.Muted.Render(fmt.Sprintf(" (family=%s parser=%s)", m.agentRuntime.ActiveModelFamily, m.agentRuntime.ActiveParserName))
+			}
+			return msg
 		}
 	}
 	rows := [][]string{
@@ -139,6 +144,8 @@ func (m model) describeStatus() string {
 		{"mode", m.agentRuntime.Mode},
 		{"provider", m.options.Config.Providers.Default.Name},
 		{"model", currentModelName(m)},
+		{"model_loading", fmt.Sprintf("%t/%s", m.options.Config.ModelLoading.Enabled, m.options.Config.ModelLoading.Strategy)},
+		{"model_roles", formatModelRoles(m.options.Config.Models)},
 		{"session", sessionID},
 		{"command_profile", commandProfileName(m.agentRuntime.Commands)},
 		{"context_engine", m.options.Config.Context.Engine},
@@ -149,6 +156,20 @@ func (m model) describeStatus() string {
 		{"agent", agentState},
 	}
 	return t.FormatTable([]string{"Setting", "Value"}, rows)
+}
+
+func formatModelRoles(models map[string]string) string {
+	if len(models) == 0 {
+		return ""
+	}
+	roles := []string{"explorer", "planner", "editor", "reviewer", "summarizer"}
+	var parts []string
+	for _, role := range roles {
+		if model := strings.TrimSpace(models[role]); model != "" {
+			parts = append(parts, role+"="+model)
+		}
+	}
+	return strings.Join(parts, ", ")
 }
 
 func (m model) describeConfig() string {
@@ -166,8 +187,14 @@ func (m model) describeConfig() string {
 		{"providers.lmstudio.api_key", keyState(cfg.Providers.LMStudio.APIKey, cfg.Providers.LMStudio.APIKeyEnv)},
 		{"providers.lmstudio.default_model", cfg.Providers.LMStudio.DefaultModel},
 		{"providers.lmstudio.supports_tools", fmt.Sprintf("%t", cfg.Providers.LMStudio.SupportsTools)},
+		{"model_loading.enabled", fmt.Sprintf("%t", cfg.ModelLoading.Enabled)},
+		{"model_loading.strategy", cfg.ModelLoading.Strategy},
 		{"context.engine", cfg.Context.Engine},
 		{"context.budget_tokens", fmt.Sprintf("%d", cfg.Context.BudgetTokens)},
+		{"context.task.budget_tokens", fmt.Sprintf("%d", cfg.Context.Task.BudgetTokens)},
+		{"context.task.max_nodes", fmt.Sprintf("%d", cfg.Context.Task.MaxNodes)},
+		{"context.task.max_file_bytes", fmt.Sprintf("%d", cfg.Context.Task.MaxFileBytes)},
+		{"context.task.history_events", fmt.Sprintf("%d", cfg.Context.Task.HistoryEvents)},
 		{"context.auto_compact", fmt.Sprintf("%t", cfg.Context.AutoCompact)},
 		{"context.model_context_tokens", fmt.Sprintf("%d", cfg.Context.ModelContextTokens)},
 		{"context.reserve_output_tokens", fmt.Sprintf("%d", cfg.Context.ReserveOutputTokens)},
@@ -206,7 +233,7 @@ func (m model) describeAgents() string {
 	return t.FormatTable([]string{"Agent", "Description", "Model", "Context"}, rows)
 }
 
-func (m model) runSubagentCommand(agentName, prompt string) string {
+func (m *model) runSubagentCommand(agentName, prompt string) string {
 	t := m.theme
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -224,7 +251,30 @@ func (m model) runSubagentCommand(agentName, prompt string) string {
 			fmt.Fprintf(&b, "\n%s", block.Text)
 		}
 	}
+	if strings.TrimSpace(agentName) == "explorer" {
+		m.pendingExplorerHandoff = subagentHandoffText(result)
+		m.activeForm = formConfirmExplorerPlan
+		m.confirmExplorerPlan = newConfirmForm("Pass explorer findings to Plan mode?", m.theme)
+		fmt.Fprintf(&b, "\n\n%s", t.Muted.Render("Explorer finished. Confirm to send these findings to Plan mode."))
+	}
 	return b.String()
+}
+
+func subagentHandoffText(result tools.Result) string {
+	var b strings.Builder
+	if result.Summary != "" {
+		fmt.Fprintf(&b, "Summary: %s\n", result.Summary)
+	}
+	for _, block := range result.Content {
+		if strings.TrimSpace(block.Text) != "" {
+			if b.Len() > 0 {
+				b.WriteByte('\n')
+			}
+			b.WriteString(strings.TrimSpace(block.Text))
+			b.WriteByte('\n')
+		}
+	}
+	return strings.TrimSpace(b.String())
 }
 
 func (m model) describePlan() string {
@@ -238,6 +288,106 @@ func (m model) describePlan() string {
 	return tasks.Format(list)
 }
 
+// planInterviewPrompt builds the turn prompt that drives plan-mode's
+// interview-first behavior. cleared=true means the user just ran /plan new so
+// any prior plan/todos were wiped; cleared=false means we entered plan mode
+// via /mode plan and any existing plan should be treated as a starting point.
+func planInterviewPrompt(goal string, cleared bool) string {
+	base := "Before calling plan_write or todo_write, interview the user with ask_user to clarify scope, constraints, and success criteria. " +
+		"Ask the most important open questions first (3-6 max), wait for the answers, and only then draft the plan. " +
+		"Each ask_user call MUST include an `options` array with 3 short, mutually-exclusive suggested answers " +
+		"(e.g. `{\"question\":\"...\",\"options\":[\"Yes\",\"No\",\"Only for X\"]}`). The TUI adds a 'Write my own' row automatically — do NOT include it yourself. " +
+		"After the interview, call plan_write with the full plan document and todo_write with the executable checklist in the same turn."
+	if strings.TrimSpace(goal) != "" {
+		suffix := "Do not assume."
+		if cleared {
+			suffix = "Do not assume — the prior plan and todos have been cleared."
+		}
+		return "NEW PLAN GOAL: " + goal + "\n\n" + base + " " + suffix
+	}
+	return "PLAN MODE ENTERED. " + base + " If a prior plan exists, first confirm whether the user wants to refine it or start fresh before interviewing."
+}
+
+func (m *model) handlePlanCommand(fields []string) string {
+	if len(fields) == 1 {
+		m.showPlan = !m.showPlan
+		m.recalcLayout()
+		if m.showPlan {
+			return m.theme.Success.Render("Plan panel: ON")
+		}
+		return m.theme.Muted.Render("Plan panel: OFF")
+	}
+	switch fields[1] {
+	case "panel", "toggle":
+		m.showPlan = !m.showPlan
+		m.recalcLayout()
+		if m.showPlan {
+			return m.theme.Success.Render("Plan panel: ON")
+		}
+		return m.theme.Muted.Render("Plan panel: OFF")
+	case "full", "show":
+		return m.describeFullPlan()
+	case "todos", "tasks":
+		return m.describePlan()
+	case "new":
+		if m.agentRunning {
+			return m.theme.Warning.Render("Agent is still running.")
+		}
+		if len(fields) < 3 {
+			return m.theme.Muted.Render("Usage: /plan new <goal>")
+		}
+		goal := strings.Join(fields[2:], " ")
+		if m.agentRuntime.Plans != nil {
+			if err := m.agentRuntime.Plans.Clear(); err != nil {
+				return m.theme.ErrorStyle.Render("Clear plan failed: " + err.Error())
+			}
+		}
+		if m.agentRuntime.Tasks != nil {
+			if _, err := m.agentRuntime.Tasks.ReplacePlan(nil); err != nil {
+				return m.theme.ErrorStyle.Render("Clear todos failed: " + err.Error())
+			}
+		}
+		_ = m.agentRuntime.SetMode("plan")
+		m.showPlan = true
+		m.recalcLayout()
+		m.agentEvents = m.agentRuntime.Run(context.Background(), planInterviewPrompt(goal, true))
+		m.agentRunning = true
+		m.pendingCommand = waitForAgentEvent(m.agentEvents)
+		return "Starting plan interview..."
+	case "refine":
+		if m.agentRunning {
+			return m.theme.Warning.Render("Agent is still running.")
+		}
+		_ = m.agentRuntime.SetMode("plan")
+		m.showPlan = true
+		m.recalcLayout()
+		prompt := "Refine the existing plan document for the user's current goal, then derive the executable checklist. Read existing plan/checklist first if present."
+		if len(fields) > 2 {
+			prompt = strings.Join(fields[2:], " ")
+		}
+		m.agentEvents = m.agentRuntime.Run(context.Background(), prompt)
+		m.agentRunning = true
+		m.pendingCommand = waitForAgentEvent(m.agentEvents)
+		return "Refining plan..."
+	default:
+		return "Usage: /plan [panel|full|todos|new <goal>|refine <goal>]"
+	}
+}
+
+func (m model) describeFullPlan() string {
+	if m.agentRuntime.Plans == nil {
+		return "Plan store unavailable."
+	}
+	doc, ok, err := m.agentRuntime.Plans.Current()
+	if err != nil {
+		return "Plan read failed: " + err.Error()
+	}
+	if !ok {
+		return "No plan yet."
+	}
+	return plans.Format(doc)
+}
+
 func (m model) describeSession() string {
 	if m.options.Session == nil {
 		return "Session store unavailable."
@@ -246,7 +396,19 @@ func (m model) describeSession() string {
 	if err != nil {
 		return "Session tail failed: " + err.Error()
 	}
-	return "session: " + m.options.Session.ID() + "\npath: " + m.options.Session.Dir() + "\n\n" + session.Summarize(events) + "\n\n" + session.FormatTail(events)
+	return "session: " + m.options.Session.ID() +
+		"\npath: " + m.options.Session.Dir() +
+		"\nlive_log: " + m.options.Session.LiveLogPath() +
+		"\n\n" + session.Summarize(events) + "\n\n" + session.FormatTail(events)
+}
+
+func (m model) describeLog() string {
+	if m.options.Session == nil {
+		return "Session store unavailable."
+	}
+	path := m.options.Session.LiveLogPath()
+	return "live log: " + path + "\n\n" +
+		m.theme.Muted.Render("PowerShell: Get-Content -LiteralPath '"+path+"' -Wait")
 }
 
 func (m model) describeSessions() string {
@@ -517,11 +679,31 @@ func (m model) describeMode() string {
 	return t.FormatTable([]string{" ", "Mode", "Description"}, rows)
 }
 
-func (m *model) setMode(name string) string {
+func (m *model) setMode(name, goal string) string {
 	if err := m.agentRuntime.SetMode(name); err != nil {
 		return err.Error()
 	}
-	return m.theme.Success.Render("Mode changed to: " + name)
+	// Entering plan mode with an explicit goal kicks off the interview
+	// immediately — same behavior as /plan new. Without a goal we stay silent
+	// and let the next user message drive the turn; the plan-mode handoff
+	// carries the "interview first" steering so the model still asks before
+	// writing a plan.
+	if name == "plan" {
+		m.showPlan = true
+		m.recalcLayout()
+		if strings.TrimSpace(goal) == "" {
+			return m.theme.Muted.Render("Plan mode entered. Send a message describing what you want planned; forge will interview you before drafting.")
+		}
+		if m.agentRunning {
+			return m.theme.Warning.Render("Plan mode entered — agent still running, interview will not auto-start.")
+		}
+		m.agentEvents = m.agentRuntime.Run(context.Background(), planInterviewPrompt(goal, false))
+		m.agentRunning = true
+		m.pendingCommand = waitForAgentEvent(m.agentEvents)
+		return m.theme.Success.Render("Entering plan mode — starting interview...")
+	}
+	// Mode shown in status bar; no inline message.
+	return ""
 }
 
 func (m model) describeDiff() string {

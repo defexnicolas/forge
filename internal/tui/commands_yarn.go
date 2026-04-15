@@ -48,9 +48,13 @@ func (m *model) handleYarnCommand(fields []string) string {
 				return "Usage: /yarn inspect <node-id>"
 			}
 			return m.yarnInspect(fields[2])
+		case "probe":
+			return m.yarnProbe()
 		}
 	}
-	return m.describeYarn()
+	m.activeForm = formYarnMenu
+	m.yarnMenuForm = newYarnMenuForm(m.theme)
+	return "Opening YARN menu..."
 }
 
 func (m model) describeYarn() string {
@@ -72,13 +76,22 @@ func (m model) describeYarn() string {
 		}
 		rows = append(rows, []string{node.ID, label, links, node.UpdatedAt.Format("15:04:05")})
 	}
-	header := fmt.Sprintf("engine=%s  profile=%s  budget=%d  max_nodes=%d  path=%s  nodes=%d",
+	window, budget, reserve := config.EffectiveBudgets(m.options.Config)
+	detected := "none"
+	if d := m.options.Config.Context.Detected; d != nil && d.LoadedContextLength > 0 {
+		age := time.Since(d.ProbedAt).Round(time.Second)
+		detected = fmt.Sprintf("%d (model=%s, probed %s ago)", d.LoadedContextLength, d.ModelID, age)
+	}
+	header := fmt.Sprintf("engine=%s  profile=%s  budget=%d  reserve=%d  window=%d  max_nodes=%d  path=%s  nodes=%d\ndetected: %s",
 		m.options.Config.Context.Engine,
 		m.options.Config.Context.Yarn.Profile,
-		m.options.Config.Context.BudgetTokens,
+		budget,
+		reserve,
+		window,
 		m.options.Config.Context.Yarn.MaxNodes,
 		store.Path(),
 		len(nodes),
+		detected,
 	)
 	if len(rows) == 0 {
 		return header + "\n" + t.Muted.Render("No YARN nodes yet.")
@@ -345,6 +358,39 @@ func (m model) compactSession() string {
 		return "YARN compact write failed: " + err.Error()
 	}
 	return m.theme.Success.Render("Compacted session into YARN") + fallback
+}
+
+func (m *model) yarnProbe() string {
+	t := m.theme
+	providerName := m.options.Config.Providers.Default.Name
+	if providerName == "" {
+		providerName = "lmstudio"
+	}
+	provider, ok := m.options.Providers.Get(providerName)
+	if !ok {
+		return t.ErrorStyle.Render("Provider " + providerName + " not registered.")
+	}
+	modelID := m.options.Config.Models["chat"]
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	info, err := provider.ProbeModel(ctx, modelID)
+	if err != nil {
+		return t.ErrorStyle.Render("Probe failed: " + err.Error())
+	}
+	if info == nil || info.LoadedContextLength <= 0 {
+		return t.Warning.Render("Provider did not report loaded_context_length — profile caps in effect.")
+	}
+	m.options.Config.Context.Detected = &config.DetectedContext{
+		ModelID:             info.ID,
+		LoadedContextLength: info.LoadedContextLength,
+		MaxContextLength:    info.MaxContextLength,
+		ProbedAt:            time.Now().UTC(),
+	}
+	m.persistConfig()
+	m.syncRuntimeConfig()
+	_, budget, reserve := config.EffectiveBudgets(m.options.Config)
+	return t.Success.Render(fmt.Sprintf("Probed %s: loaded=%d max=%d", info.ID, info.LoadedContextLength, info.MaxContextLength)) +
+		fmt.Sprintf("\nEffective YARN budget=%d reserve=%d", budget, reserve)
 }
 
 func (m *model) syncRuntimeConfig() {

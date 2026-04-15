@@ -157,15 +157,62 @@ func (s *Store) Dir() string {
 	return s.dir
 }
 
+func (s *Store) LiveLogPath() string {
+	return filepath.Join(s.dir, "live.log")
+}
+
 func (s *Store) LogUser(text string) error {
-	return s.append(Event{Time: time.Now().UTC(), Type: "user", Text: text})
+	_ = s.appendChatMD("## You\n\n" + strings.TrimRight(text, "\n") + "\n\n")
+	liveErr := s.appendLiveLog("You", text)
+	err := s.append(Event{Time: time.Now().UTC(), Type: "user", Text: text})
+	if err != nil {
+		return err
+	}
+	return liveErr
+}
+
+// AppendChatTurn writes a clean Q&A pair (the assistant reply) to chat.md,
+// alongside the JSONL event log. The TUI calls this at end of turn with the
+// accumulated assistant text. Empty replies are skipped.
+func (s *Store) AppendChatTurn(assistantText string) error {
+	text := strings.TrimSpace(assistantText)
+	if text == "" {
+		return nil
+	}
+	chatErr := s.appendChatMD("## Forge\n\n" + text + "\n\n---\n\n")
+	liveErr := s.appendLiveLog("Forge", text)
+	if chatErr != nil {
+		return chatErr
+	}
+	return liveErr
+}
+
+func (s *Store) appendChatMD(content string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := filepath.Join(s.dir, "chat.md")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteString(content)
+	return err
 }
 
 func (s *Store) LogCommand(text, result string) error {
-	return s.append(Event{Time: time.Now().UTC(), Type: "command", Text: text, Summary: result})
+	liveErr := s.appendLiveLog("Command "+text, result)
+	err := s.append(Event{Time: time.Now().UTC(), Type: "command", Text: text, Summary: result})
+	if err != nil {
+		return err
+	}
+	return liveErr
 }
 
 func (s *Store) LogAgentEvent(event agent.Event) error {
+	if event.Type == agent.EventModelProgress {
+		return nil
+	}
 	record := Event{
 		Time:     time.Now().UTC(),
 		Type:     event.Type,
@@ -183,7 +230,105 @@ func (s *Store) LogAgentEvent(event agent.Event) error {
 	if event.Error != nil {
 		record.Error = event.Error.Error()
 	}
-	return s.append(record)
+	liveErr := s.appendLiveLogForAgentEvent(event)
+	err := s.append(record)
+	if err != nil {
+		return err
+	}
+	return liveErr
+}
+
+func (s *Store) appendLiveLogForAgentEvent(event agent.Event) error {
+	switch event.Type {
+	case agent.EventAssistantDelta, agent.EventAssistantText, agent.EventModelProgress, agent.EventClearStreaming, agent.EventDone:
+		return nil
+	case agent.EventToolCall:
+		input := strings.TrimSpace(string(event.Input))
+		if input == "" {
+			input = "{}"
+		}
+		return s.appendLiveLog("Tool call "+event.ToolName, input)
+	case agent.EventToolResult:
+		var b strings.Builder
+		if event.Text != "" {
+			b.WriteString(event.Text)
+		} else if event.Result != nil && event.Result.Summary != "" {
+			b.WriteString(event.Result.Summary)
+		}
+		if event.Result != nil {
+			for _, block := range event.Result.Content {
+				if strings.TrimSpace(block.Text) == "" {
+					continue
+				}
+				if b.Len() > 0 {
+					b.WriteString("\n\n")
+				}
+				b.WriteString(block.Text)
+			}
+			for _, artifact := range event.Result.Artifacts {
+				if artifact.Path == "" {
+					continue
+				}
+				if b.Len() > 0 {
+					b.WriteString("\n")
+				}
+				b.WriteString("artifact: ")
+				b.WriteString(artifact.Path)
+			}
+		}
+		return s.appendLiveLog("Tool result "+event.ToolName, b.String())
+	case agent.EventError:
+		if event.Error == nil {
+			return nil
+		}
+		return s.appendLiveLog("Error", event.Error.Error())
+	case agent.EventAskUser:
+		if event.AskUser == nil {
+			return nil
+		}
+		return s.appendLiveLog("Question", event.AskUser.Question)
+	case agent.EventApproval:
+		if event.Approval == nil {
+			return s.appendLiveLog("Approval", "approval required")
+		}
+		text := event.Approval.Summary
+		if event.Approval.Diff != "" {
+			text += "\n\n" + event.Approval.Diff
+		}
+		return s.appendLiveLog("Approval "+event.Approval.ToolName, text)
+	default:
+		value := event.Text
+		if value == "" && event.Error != nil {
+			value = event.Error.Error()
+		}
+		if strings.TrimSpace(value) == "" {
+			return nil
+		}
+		return s.appendLiveLog(event.Type, value)
+	}
+}
+
+func (s *Store) appendLiveLog(section, content string) error {
+	content = strings.TrimRight(stripANSI(content), "\n")
+	if strings.TrimSpace(content) == "" {
+		return nil
+	}
+	section = strings.TrimSpace(stripANSI(section))
+	if section == "" {
+		section = "Log"
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	file, err := os.OpenFile(s.LiveLogPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	_, err = fmt.Fprintf(file, "## %s\n%s\n\n", section, content)
+	return err
 }
 
 func (s *Store) Tail(limit int) ([]Event, error) {
@@ -322,4 +467,24 @@ func oneLine(text string) string {
 		return text[:240] + "..."
 	}
 	return text
+}
+
+func stripANSI(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if s[i] == '\x1b' && i+1 < len(s) && s[i+1] == '[' {
+			j := i + 2
+			for j < len(s) && !((s[j] >= 'A' && s[j] <= 'Z') || (s[j] >= 'a' && s[j] <= 'z')) {
+				j++
+			}
+			if j < len(s) {
+				j++
+			}
+			i = j
+			continue
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
 }

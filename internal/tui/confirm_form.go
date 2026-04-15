@@ -14,9 +14,17 @@ type confirmForm struct {
 }
 
 func newConfirmForm(message string, theme Theme) confirmForm {
+	return newConfirmFormWithDefault(message, theme, true)
+}
+
+func newConfirmFormWithDefault(message string, theme Theme, defaultYes bool) confirmForm {
+	selected := 0
+	if !defaultYes {
+		selected = 1
+	}
 	return confirmForm{
 		message:  message,
-		selected: 0, // default to Yes
+		selected: selected,
 		theme:    theme,
 	}
 }

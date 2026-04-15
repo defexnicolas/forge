@@ -6,6 +6,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"forge/internal/agent"
+	"forge/internal/tools"
 )
 
 func TestStoreLogsAndTailsEvents(t *testing.T) {
@@ -76,5 +79,50 @@ func TestListAndOpenLatest(t *testing.T) {
 	}
 	if !strings.Contains(reopened.ContextText(4), "Session summary:") {
 		t.Fatalf("expected summary in context text, got %q", reopened.ContextText(4))
+	}
+}
+
+func TestStoreWritesLiveLog(t *testing.T) {
+	cwd := t.TempDir()
+	store, err := New(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.LogUser("debug this"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LogCommand("/test", "\x1b[31mok\x1b[0m"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LogAgentEvent(agent.Event{
+		Type:     agent.EventToolResult,
+		ToolName: "run_command",
+		Text:     "go test ./...",
+		Result: &tools.Result{
+			Summary: "go test ./...",
+			Content: []tools.ContentBlock{
+				{Type: "text", Text: "package output\nFAIL example"},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendChatTurn("final answer"); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(store.LiveLogPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := string(data)
+	for _, want := range []string{"## You", "debug this", "## Command /test", "ok", "## Tool result run_command", "package output", "FAIL example", "## Forge", "final answer"} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("live log missing %q in:\n%s", want, log)
+		}
+	}
+	if strings.Contains(log, "\x1b[") {
+		t.Fatalf("live log contains ANSI escapes:\n%q", log)
 	}
 }

@@ -4,20 +4,82 @@ import "testing"
 
 func TestDefaultsUseRecommendedYarnProfile(t *testing.T) {
 	cfg := Defaults()
+	if cfg.Models["explorer"] != "local-model" {
+		t.Fatalf("models.explorer = %q, want local-model", cfg.Models["explorer"])
+	}
+	if cfg.ModelLoading.Strategy != "single" {
+		t.Fatalf("model_loading.strategy = %q, want single", cfg.ModelLoading.Strategy)
+	}
+	if cfg.ModelLoading.Enabled {
+		t.Fatal("model_loading.enabled should default to false")
+	}
 	if cfg.Context.Yarn.Profile != "9B" {
 		t.Fatalf("profile = %q, want 9B", cfg.Context.Yarn.Profile)
 	}
-	if cfg.Context.ModelContextTokens != 8192 {
-		t.Fatalf("model_context_tokens = %d, want 8192", cfg.Context.ModelContextTokens)
+	if cfg.Context.ModelContextTokens != 16384 {
+		t.Fatalf("model_context_tokens = %d, want 16384", cfg.Context.ModelContextTokens)
 	}
-	if cfg.Context.BudgetTokens != 4500 {
-		t.Fatalf("budget_tokens = %d, want 4500", cfg.Context.BudgetTokens)
+	if cfg.Context.BudgetTokens != 8000 {
+		t.Fatalf("budget_tokens = %d, want 8000", cfg.Context.BudgetTokens)
 	}
 	if cfg.Context.ReserveOutputTokens != 2000 {
 		t.Fatalf("reserve_output_tokens = %d, want 2000", cfg.Context.ReserveOutputTokens)
 	}
-	if cfg.Context.Yarn.MaxNodes != 8 || cfg.Context.Yarn.MaxFileBytes != 12000 || cfg.Context.Yarn.HistoryEvents != 12 {
+	if cfg.Context.Yarn.MaxNodes != 12 || cfg.Context.Yarn.MaxFileBytes != 14000 || cfg.Context.Yarn.HistoryEvents != 14 {
 		t.Fatalf("unexpected yarn defaults: %#v", cfg.Context.Yarn)
+	}
+	if cfg.Context.Task.BudgetTokens != 4000 ||
+		cfg.Context.Task.MaxNodes != 6 ||
+		cfg.Context.Task.MaxFileBytes != 8000 ||
+		cfg.Context.Task.HistoryEvents != 4 {
+		t.Fatalf("unexpected task context defaults: %#v", cfg.Context.Task)
+	}
+}
+
+func TestNormalizeBackfillsMultiModelDefaults(t *testing.T) {
+	cfg := Config{Models: map[string]string{"chat": "qwen"}}
+	Normalize(&cfg)
+	if cfg.Models["chat"] != "qwen" {
+		t.Fatalf("models.chat = %q, want qwen", cfg.Models["chat"])
+	}
+	if cfg.Models["explorer"] == "" || cfg.Models["planner"] == "" || cfg.Models["editor"] == "" {
+		t.Fatalf("expected multi model roles to be backfilled, got %#v", cfg.Models)
+	}
+	if cfg.ModelLoading.Strategy != "single" {
+		t.Fatalf("strategy = %q, want single", cfg.ModelLoading.Strategy)
+	}
+	if cfg.Context.Task.BudgetTokens != 4000 || cfg.Context.Task.MaxNodes != 6 {
+		t.Fatalf("expected task context defaults, got %#v", cfg.Context.Task)
+	}
+}
+
+func TestConfigForTaskRoleUsesSmallContext(t *testing.T) {
+	cfg := Defaults()
+	cfg.Context.BudgetTokens = 12000
+	cfg.Context.Yarn.MaxNodes = 20
+	cfg.Context.Yarn.MaxFileBytes = 50000
+	cfg.Context.Yarn.HistoryEvents = 30
+	cfg.Context.Task = TaskContextConfig{
+		BudgetTokens:  1234,
+		MaxNodes:      3,
+		MaxFileBytes:  4567,
+		HistoryEvents: 2,
+	}
+	SetDetectedForRole(&cfg, "explorer", &DetectedContext{ModelID: "explore-model", LoadedContextLength: 32000})
+	cfg.Models["explorer"] = "explore-model"
+
+	taskCfg := ConfigForTaskRole(cfg, "explorer", "explore-model")
+	if taskCfg.Models["chat"] != "explore-model" {
+		t.Fatalf("task chat model = %q", taskCfg.Models["chat"])
+	}
+	if taskCfg.Context.BudgetTokens != 1234 ||
+		taskCfg.Context.Yarn.MaxNodes != 3 ||
+		taskCfg.Context.Yarn.MaxFileBytes != 4567 ||
+		taskCfg.Context.Yarn.HistoryEvents != 2 {
+		t.Fatalf("unexpected task context config: %#v", taskCfg.Context)
+	}
+	if taskCfg.Context.Detected != nil {
+		t.Fatalf("task context should not inherit detected large window: %#v", taskCfg.Context.Detected)
 	}
 }
 
@@ -30,9 +92,9 @@ func TestApplyYarnProfiles(t *testing.T) {
 		file    int
 		history int
 	}{
-		{"2B", 2200, 1200, 4, 6000, 6},
-		{"9B", 4500, 2000, 8, 12000, 12},
-		{"26B", 10000, 3500, 18, 22000, 24},
+		{"2B", 5000, 1500, 8, 10000, 10},
+		{"9B", 8000, 2000, 12, 14000, 14},
+		{"26B", 20000, 3500, 22, 24000, 26},
 	}
 	for _, tc := range cases {
 		cfg := Defaults()
