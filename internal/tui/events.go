@@ -478,19 +478,28 @@ func (m model) renderMarkdownMaybe(text string) string {
 	return rendered
 }
 
-// renderThinkingBox wraps the thinking text in an ASCII frame rendered with
-// the muted theme. Kept separate from formatAssistantBlock so Tier 1.3 can
-// replace the ASCII frame with a lipgloss border without disturbing the
-// top-level pipeline.
+// renderThinkingBox wraps the thinking text in a muted lipgloss thick-border
+// box preceded by a "thinking" label. Width-aware so long reasoning chains
+// don't overflow the viewport — the content is wrapped at viewportWidth-10
+// (accounting for 4-space outer indent + border + padding).
 func (m model) renderThinkingBox(thinking string) string {
 	t := m.theme
-	var b strings.Builder
-	b.WriteString(t.Muted.Render("+-- thinking ----------------") + "\n")
-	for _, line := range strings.Split(strings.TrimSpace(thinking), "\n") {
-		b.WriteString(t.Muted.Render("| "+line) + "\n")
+	content := strings.TrimSpace(thinking)
+	if content == "" {
+		return ""
 	}
-	b.WriteString(t.Muted.Render("+----------------------------"))
-	return b.String()
+	wrapWidth := m.viewport.Width - 10
+	if wrapWidth < 30 {
+		wrapWidth = 30
+	}
+	var wrapped []string
+	for _, line := range strings.Split(content, "\n") {
+		wrapped = append(wrapped, wrapPlainLine(line, wrapWidth)...)
+	}
+	body := strings.Join(wrapped, "\n")
+	box := t.ThinkingBorder.Width(wrapWidth + 2).Render(body)
+	label := t.Muted.Italic(true).Render("thinking ↓")
+	return label + "\n" + box
 }
 
 func truncate(s string, limit int) string {

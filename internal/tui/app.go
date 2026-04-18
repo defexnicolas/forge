@@ -320,6 +320,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.searchMode.input.Focus()
 			m.input.Blur()
 			return m, nil
+		case tea.KeyCtrlT:
+			// Toggle thinking visibility live. Applies to the next rendered
+			// assistant block — historical turns keep their original box/no-box.
+			m.thinkEnabled = !m.thinkEnabled
+			m.refresh()
+			return m, nil
 		case tea.KeyEsc:
 			// First ESC: dismiss suggestions/forms. Double ESC (within 500ms): quit.
 			if len(m.suggestions) > 0 {
