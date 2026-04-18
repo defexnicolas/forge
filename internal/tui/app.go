@@ -124,6 +124,13 @@ type model struct {
 	// Rebuilt lazily when prefixDirty is true.
 	prefixRendered string
 	prefixDirty    bool
+	// fullRenderCache memoizes the fully-joined m.history from the most recent
+	// refresh() call, keyed by a cheap fingerprint (length + hash of last
+	// lines). Layout-only refreshes (WindowSizeMsg spam during resize, and
+	// any refresh triggered without a history mutation) skip the full
+	// strings.Join and reuse the cached string.
+	fullRenderCache   string
+	fullRenderFingerprint uint64
 	pendingCommand tea.Cmd
 	btwEvents              <-chan agent.Event
 	btwStreaming           bool
@@ -1062,7 +1069,8 @@ func (m *model) cycleMode() {
 func (m *model) refresh() {
 	m.recalcLayout()
 	content := m.history
-	if m.searchMode.query != "" {
+	searchActive := m.searchMode.query != ""
+	if searchActive {
 		filtered, positions := FilterHistory(content, m.searchMode.query, m.searchMode.currentIdx)
 		content = filtered
 		if m.searchMode.currentIdx >= len(positions) {
@@ -1072,7 +1080,24 @@ func (m *model) refresh() {
 	}
 	// Reserved trailing padding so the last rendered line can never sit flush
 	// against the bottom edge of the viewport and appear crowded by the input.
-	rendered := strings.Join(content, "\n") + strings.Repeat("\n", viewportInputGapLines)
+	var joined string
+	if !searchActive {
+		fp := historyFingerprint(content)
+		if fp == m.fullRenderFingerprint && m.fullRenderCache != "" {
+			joined = m.fullRenderCache
+		} else {
+			joined = strings.Join(content, "\n")
+			m.fullRenderCache = joined
+			m.fullRenderFingerprint = fp
+		}
+	} else {
+		joined = strings.Join(content, "\n")
+		// Search results invalidate the full cache — next unfiltered refresh
+		// will rebuild.
+		m.fullRenderCache = ""
+		m.fullRenderFingerprint = 0
+	}
+	rendered := joined + strings.Repeat("\n", viewportInputGapLines)
 	// The full rebuild already covers whatever the streaming prefix cache
 	// pointed to, so invalidate it — the next refreshStreaming will rebuild.
 	m.prefixDirty = true
@@ -1315,4 +1340,35 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// historyFingerprint produces a cheap 64-bit key for a history slice. FNV-1a
+// over length plus the length and first 16 bytes of the last 8 lines. Two
+// different histories can collide, but in practice the combination of line
+// count and tail content is stable enough to catch layout-only refreshes
+// without re-joining.
+func historyFingerprint(history []string) uint64 {
+	const offset64 uint64 = 14695981039346656037
+	const prime64 uint64 = 1099511628211
+	h := offset64
+	h ^= uint64(len(history))
+	h *= prime64
+	start := len(history) - 8
+	if start < 0 {
+		start = 0
+	}
+	for i := start; i < len(history); i++ {
+		line := history[i]
+		h ^= uint64(len(line))
+		h *= prime64
+		limit := len(line)
+		if limit > 16 {
+			limit = 16
+		}
+		for j := 0; j < limit; j++ {
+			h ^= uint64(line[j])
+			h *= prime64
+		}
+	}
+	return h
 }
