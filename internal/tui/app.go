@@ -153,6 +153,10 @@ type model struct {
 	// explore→plan handoff can include the question that produced the
 	// findings.
 	turnUserInput string
+	// markdown renders the assistant's final text through Glamour so fenced
+	// code blocks, lists, and emphasis come out syntax-highlighted. Never
+	// applied to deltas — streaming stays plain to preserve tk/s throughput.
+	markdown *markdownRenderer
 }
 
 type turnToolEntry struct {
@@ -203,6 +207,7 @@ func newModel(options Options) model {
 		collapsedToolLineIdx: -1,
 		streamingStartIdx:    -1,
 		stickyBottom:         true,
+		markdown:             newMarkdownRenderer(100, theme.Name),
 		history: []string{
 			"",
 			theme.Accent.Render("  forge") + theme.Muted.Render(" | "+cwd+" | session:"+sessionName),
@@ -229,6 +234,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.recalcLayout()
+		if m.markdown != nil {
+			m.markdown.Resize(m.viewport.Width, m.theme.Name)
+		}
 		m.refresh()
 	case agentEventMsg:
 		switch msg.event.Type {

@@ -33,7 +33,11 @@
       "WebSearch",
       "Bash(find C:\\\\Users\\\\nicod\\\\Downloads\\\\letcode:*)",
       "Bash(find:*)",
-      "Bash(git stash *)"
+      "Bash(git stash *)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:opencode.ai)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
     ]
   }
 }

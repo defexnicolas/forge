@@ -91,7 +91,7 @@ func (m *model) appendAgentEvent(event agent.Event) {
 		m.lastToolCollapsed = false
 		if text := strings.TrimSpace(event.Text); text != "" {
 			m.currentAssistant.WriteString(text)
-			text = m.formatThinking(text)
+			text = m.formatAssistantBlock(text)
 			indented := ""
 			for _, line := range strings.Split(text, "\n") {
 				indented += "    " + line + "\n"
@@ -420,47 +420,61 @@ func (m *model) shouldOfferPlanExecution() bool {
 	return false
 }
 
-func (m model) formatThinking(text string) string {
-	t := m.theme
-	thinkOpen := "<think>"
-	thinkClose := "</think>"
-	start := strings.Index(text, thinkOpen)
-	if start < 0 {
+// formatAssistantBlock prepares the final assistant response for display.
+// Extracts <think>...</think> into a styled box, routes the non-thinking
+// prose through Glamour markdown rendering (fenced code, lists, bold, etc.),
+// and returns the joined result for 4-space indentation by the caller.
+//
+// Only called at turn end on EventAssistantText — NOT on streaming deltas,
+// so the Glamour cost never affects streaming throughput.
+func (m model) formatAssistantBlock(text string) string {
+	split := splitThinking(text)
+	if !split.hasThink {
+		return m.renderMarkdownMaybe(text)
+	}
+	var parts []string
+	if split.before != "" {
+		parts = append(parts, m.renderMarkdownMaybe(split.before))
+	}
+	if m.thinkEnabled && strings.TrimSpace(split.thinking) != "" {
+		parts = append(parts, m.renderThinkingBox(split.thinking))
+	}
+	if split.after != "" {
+		parts = append(parts, m.renderMarkdownMaybe(split.after))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, "\n")
+}
+
+// renderMarkdownMaybe routes text through Glamour when the heuristic detects
+// markdown formatting cues. Plain prose bypasses the renderer to avoid the
+// word-wrap reflow Glamour applies even to unformatted text.
+func (m model) renderMarkdownMaybe(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" || m.markdown == nil || !hasMarkdown(text) {
 		return text
 	}
-	end := strings.Index(text, thinkClose)
-	if end < 0 {
-		if m.thinkEnabled {
-			return text
-		}
-		return strings.TrimSpace(text[:start])
+	rendered := strings.TrimSpace(m.markdown.Render(text))
+	if rendered == "" {
+		return text
 	}
-	thinking := text[start+len(thinkOpen) : end]
-	after := strings.TrimSpace(text[end+len(thinkClose):])
-	before := strings.TrimSpace(text[:start])
+	return rendered
+}
 
-	if !m.thinkEnabled {
-		result := before
-		if after != "" {
-			if result != "" {
-				result += "\n"
-			}
-			result += after
-		}
-		return result
-	}
+// renderThinkingBox wraps the thinking text in an ASCII frame rendered with
+// the muted theme. Kept separate from formatAssistantBlock so Tier 1.3 can
+// replace the ASCII frame with a lipgloss border without disturbing the
+// top-level pipeline.
+func (m model) renderThinkingBox(thinking string) string {
+	t := m.theme
 	var b strings.Builder
-	if before != "" {
-		b.WriteString(before + "\n")
-	}
 	b.WriteString(t.Muted.Render("+-- thinking ----------------") + "\n")
 	for _, line := range strings.Split(strings.TrimSpace(thinking), "\n") {
 		b.WriteString(t.Muted.Render("| "+line) + "\n")
 	}
 	b.WriteString(t.Muted.Render("+----------------------------"))
-	if after != "" {
-		b.WriteString("\n" + after)
-	}
 	return b.String()
 }
 
