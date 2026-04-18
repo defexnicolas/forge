@@ -43,12 +43,17 @@ type Theme struct {
 	ThinkingBorder lipgloss.Style
 }
 
-// ThemeNames returns available theme preset names.
+// ThemeNames returns available theme preset names, with JSON-loaded themes
+// appended after the built-ins.
 func ThemeNames() []string {
-	return []string{"default", "light", "ocean", "mono"}
+	names := []string{"default", "light", "ocean", "mono"}
+	names = append(names, customThemeNames()...)
+	return names
 }
 
-// GetTheme returns a theme preset by name.
+// GetTheme returns a theme preset by name. Built-ins win over JSON themes
+// with the same name so a misspelled custom override can't silently hide
+// the default.
 func GetTheme(name string) Theme {
 	switch name {
 	case "light":
@@ -57,9 +62,13 @@ func GetTheme(name string) Theme {
 		return OceanTheme()
 	case "mono":
 		return MonoTheme()
-	default:
+	case "default", "":
 		return DefaultTheme()
 	}
+	if t, ok := getCustomTheme(name); ok {
+		return t
+	}
+	return DefaultTheme()
 }
 
 func DefaultTheme() Theme {

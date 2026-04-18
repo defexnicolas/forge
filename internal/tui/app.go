@@ -188,6 +188,10 @@ func newModel(options Options) model {
 	input.ShowLineNumbers = false
 	input.Prompt = ""
 
+	// Discover user-authored JSON themes in .forge/themes/. Safe to call
+	// with a missing directory — the loader silently skips.
+	_ = LoadCustomThemes(filepath.Join(options.CWD, ".forge", "themes"))
+
 	vp := viewport.New(100, 24)
 	theme := DefaultTheme()
 
