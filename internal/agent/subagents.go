@@ -251,6 +251,43 @@ func (r *Runtime) RunSubagents(ctx context.Context, request SubagentBatchRequest
 	// loaded models), NOT inference concurrency. A "single" strategy still allows
 	// multiple concurrent requests against the one loaded model.
 
+	// Generate a batch id once so every progress event ties back to the same
+	// lane group in the TUI. Pointer address is enough — unique per call.
+	batchID := fmt.Sprintf("batch-%p", &request)
+	total := len(request.Tasks)
+	events := r.currentEvents()
+	emit := func(idx int, agent, status, summary, errText string) {
+		if events == nil {
+			return
+		}
+		// Non-blocking send: the TUI pump is the receiver and we don't want
+		// a stalled consumer to deadlock the batch goroutines. On drop the
+		// lane view simply won't update — the final result is still captured.
+		prog := &SubagentProgress{
+			BatchID: batchID,
+			Index:   idx,
+			Total:   total,
+			Agent:   agent,
+			Status:  status,
+			Summary: summary,
+			Error:   errText,
+		}
+		select {
+		case events <- Event{Type: EventSubagentProgress, SubagentProgress: prog}:
+		default:
+		}
+	}
+
+	// Seed all tasks as pending so the TUI can draw the full batch skeleton
+	// immediately, even before goroutines acquire the semaphore.
+	for i, task := range request.Tasks {
+		name := strings.TrimSpace(task.Agent)
+		if name == "" {
+			name = "explorer"
+		}
+		emit(i, name, "pending", "", "")
+	}
+
 	items := make([]SubagentBatchItem, len(request.Tasks))
 	sem := make(chan struct{}, maxConcurrency)
 	var wg sync.WaitGroup
@@ -264,6 +301,7 @@ func (r *Runtime) RunSubagents(ctx context.Context, request SubagentBatchRequest
 				defer func() { <-sem }()
 			case <-ctx.Done():
 				items[i] = SubagentBatchItem{Index: i, Agent: strings.TrimSpace(task.Agent), Status: "error", Error: ctx.Err().Error()}
+				emit(i, strings.TrimSpace(task.Agent), "error", "", ctx.Err().Error())
 				return
 			}
 
@@ -274,15 +312,19 @@ func (r *Runtime) RunSubagents(ctx context.Context, request SubagentBatchRequest
 			worker, ok := r.Subagents.Get(agentName)
 			if !ok {
 				items[i] = SubagentBatchItem{Index: i, Agent: agentName, Status: "error", Error: "unknown subagent: " + agentName}
+				emit(i, agentName, "error", "", "unknown subagent: "+agentName)
 				return
 			}
 			if hasMutatingTools(worker.AllowedTools) {
 				items[i] = SubagentBatchItem{Index: i, Agent: agentName, Status: "error", Error: "parallel subagents do not allow mutating tools"}
+				emit(i, agentName, "error", "", "parallel subagents do not allow mutating tools")
 				return
 			}
+			emit(i, agentName, "running", "", "")
 			result, err := r.RunSubagent(ctx, task)
 			if err != nil {
 				items[i] = SubagentBatchItem{Index: i, Agent: agentName, Status: "error", Error: err.Error()}
+				emit(i, agentName, "error", "", err.Error())
 				return
 			}
 			items[i] = SubagentBatchItem{
@@ -292,6 +334,7 @@ func (r *Runtime) RunSubagents(ctx context.Context, request SubagentBatchRequest
 				Summary: result.Summary,
 				Result:  result,
 			}
+			emit(i, agentName, "completed", result.Summary, "")
 		}()
 	}
 	wg.Wait()

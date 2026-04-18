@@ -111,10 +111,17 @@ func (m *model) appendAgentEvent(event agent.Event) {
 		m.streamingRaw.Reset()
 		lastAgentResponse = ""
 		m.prefixDirty = true
+	case agent.EventSubagentProgress:
+		m.handleSubagentProgress(event.SubagentProgress)
 	case agent.EventToolCall:
 		m.streaming = false
 		m.streamingStartIdx = -1
 		m.modelProgress = nil
+		// A new tool call arrives after a finished batch — drop the stale
+		// lane group so a future batch spawns a fresh block at the right spot.
+		if event.ToolName != "spawn_subagents" {
+			m.laneGroup = nil
+		}
 		input := strings.TrimSpace(string(event.Input))
 		if input == "" {
 			input = "{}"
@@ -268,6 +275,44 @@ func (m *model) appendAgentEvent(event agent.Event) {
 		}
 		m.forceScrollBottom = true
 	}
+}
+
+// handleSubagentProgress splices (on first seen batch) or rewrites (on
+// updates) the inline lane block that tracks parallel spawn_subagents
+// activity. The block lives at m.laneGroup.StartIdx..+LineCount in history;
+// its lines are replaced in place so the user sees lanes evolve from
+// pending → running → completed rather than a new block per tick.
+func (m *model) handleSubagentProgress(progress *agent.SubagentProgress) {
+	if progress == nil {
+		return
+	}
+	if m.laneGroup == nil || m.laneGroup.BatchID != progress.BatchID {
+		m.laneGroup = &laneGroup{BatchID: progress.BatchID, StartIdx: len(m.history)}
+	}
+	m.laneGroup.applyProgress(progress)
+	lines := renderLanes(m.laneGroup, m.theme, m.viewport.Width)
+	if len(lines) == 0 {
+		return
+	}
+	// Replace the existing block in place, or append if this is the first
+	// render for the group.
+	start := m.laneGroup.StartIdx
+	if start > len(m.history) {
+		start = len(m.history)
+		m.laneGroup.StartIdx = start
+	}
+	end := start + m.laneGroup.LineCount
+	if end > len(m.history) {
+		end = len(m.history)
+	}
+	tail := append([]string{}, m.history[end:]...)
+	m.history = append(m.history[:start], lines...)
+	m.history = append(m.history, tail...)
+	m.laneGroup.LineCount = len(lines)
+	// Any later EventClearStreaming/EventAssistantText may have shifted the
+	// prefix — safest to invalidate the streaming cache so refreshStreaming
+	// rebuilds from the mutated history.
+	m.prefixDirty = true
 }
 
 // summarizeToolInput extracts the one-or-two high-signal fields from a

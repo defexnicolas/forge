@@ -157,6 +157,12 @@ type model struct {
 	// code blocks, lists, and emphasis come out syntax-highlighted. Never
 	// applied to deltas — streaming stays plain to preserve tk/s throughput.
 	markdown *markdownRenderer
+	// laneGroup tracks the live state of the current spawn_subagents batch.
+	// When an EventSubagentProgress arrives for a new batch id, a fresh
+	// group is spliced into m.history; subsequent events rewrite those
+	// lines in place so the user sees lane status evolve rather than a
+	// new block per tick.
+	laneGroup *laneGroup
 }
 
 type turnToolEntry struct {

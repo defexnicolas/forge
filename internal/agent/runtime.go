@@ -21,28 +21,44 @@ import (
 )
 
 const (
-	EventAssistantText  = "assistant_text"
-	EventAssistantDelta = "assistant_delta"
-	EventModelProgress  = "model_progress"
-	EventClearStreaming = "clear_streaming"
-	EventToolCall       = "tool_call"
-	EventToolResult     = "tool_result"
-	EventApproval       = "approval_required"
-	EventAskUser        = "ask_user"
-	EventError          = "error"
-	EventDone           = "done"
+	EventAssistantText     = "assistant_text"
+	EventAssistantDelta    = "assistant_delta"
+	EventModelProgress     = "model_progress"
+	EventClearStreaming    = "clear_streaming"
+	EventToolCall          = "tool_call"
+	EventToolResult        = "tool_result"
+	EventApproval          = "approval_required"
+	EventAskUser           = "ask_user"
+	EventSubagentProgress  = "subagent_progress"
+	EventError             = "error"
+	EventDone              = "done"
 )
 
+// SubagentProgress reports the lifecycle of one task within a spawn_subagents
+// batch. The TUI keys on (BatchID, Index) to update the corresponding lane
+// in the multi-lane view. Status values: "pending", "running", "completed",
+// "error".
+type SubagentProgress struct {
+	BatchID string
+	Index   int
+	Total   int
+	Agent   string
+	Status  string
+	Summary string
+	Error   string
+}
+
 type Event struct {
-	Type     string
-	Text     string
-	ToolName string
-	Input    json.RawMessage
-	Result   *tools.Result
-	Approval *ApprovalRequest
-	AskUser  *AskUserRequest
-	Progress *ModelProgress
-	Error    error
+	Type             string
+	Text             string
+	ToolName         string
+	Input            json.RawMessage
+	Result           *tools.Result
+	Approval         *ApprovalRequest
+	AskUser          *AskUserRequest
+	Progress         *ModelProgress
+	SubagentProgress *SubagentProgress
+	Error            error
 	// Side marks events emitted by a parallel `/btw` call. TUI renders these
 	// muted with a [btw] prefix and they do not participate in the tool loop.
 	Side bool
