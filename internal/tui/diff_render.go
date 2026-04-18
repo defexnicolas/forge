@@ -4,10 +4,56 @@ import (
 	"fmt"
 	"strings"
 
+	"forge/internal/tools"
+
 	"github.com/charmbracelet/lipgloss"
 )
 
 const maxDiffLines = 20
+
+// diffResultTools enumerates the tools whose Result.Content[0].Text is a
+// unified-diff string produced by internal/patch.Diff. These trigger
+// FormatPatchSummary in EventToolResult instead of the plain text summary.
+var diffResultTools = map[string]bool{
+	"edit_file":   true,
+	"write_file":  true,
+	"apply_patch": true,
+}
+
+// isDiffResultTool reports whether a tool's successful Result payload is a
+// unified diff suitable for the diff renderer.
+func isDiffResultTool(name string) bool { return diffResultTools[name] }
+
+// extractResultDiff returns the unified diff text stored in a mutating tool's
+// Result, or empty string if none is present. edit.go/write.go/apply_patch
+// put the diff in Content[0] with Type="text".
+func extractResultDiff(result *tools.Result) string {
+	if result == nil {
+		return ""
+	}
+	for _, block := range result.Content {
+		if block.Type == "text" && strings.TrimSpace(block.Text) != "" {
+			return block.Text
+		}
+	}
+	return ""
+}
+
+// diffFilePath picks the file label for FormatPatchSummary. Mutating tools
+// set Result.Summary to the relative path for single-file ops; apply_patch
+// sets it to "Applied unified diff", so fall back to ChangedFiles.
+func diffFilePath(result *tools.Result) string {
+	if result == nil {
+		return ""
+	}
+	if len(result.ChangedFiles) == 1 {
+		return result.ChangedFiles[0]
+	}
+	if len(result.ChangedFiles) > 1 {
+		return fmt.Sprintf("%d files", len(result.ChangedFiles))
+	}
+	return strings.TrimSpace(result.Summary)
+}
 
 // diff line styles with background colors
 var (

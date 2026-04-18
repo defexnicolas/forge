@@ -37,6 +37,10 @@ type Theme struct {
 	Accent      lipgloss.Style
 	Success     lipgloss.Style
 	Warning     lipgloss.Style
+
+	// ThinkingBorder wraps the <think>...</think> block. Tier 1.3 replaces
+	// the ASCII frame with a proper lipgloss border using this style.
+	ThinkingBorder lipgloss.Style
 }
 
 // ThemeNames returns available theme preset names.
@@ -145,6 +149,10 @@ func buildTheme(name string, cyan, green, yellow, red, purple, blue, dim, bright
 		Accent:      lipgloss.NewStyle().Foreground(cyan),
 		Success:     lipgloss.NewStyle().Foreground(green),
 		Warning:     lipgloss.NewStyle().Foreground(yellow),
+
+		ThinkingBorder: lipgloss.NewStyle().
+			Border(lipgloss.ThickBorder()).BorderForeground(dim).
+			Foreground(dim).Padding(0, 1),
 	}
 }
 

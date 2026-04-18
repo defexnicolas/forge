@@ -152,6 +152,21 @@ func (m *model) appendAgentEvent(event agent.Event) {
 			// Result is part of a folded pair — swallow it.
 			break
 		}
+		// Mutating tools carry a unified diff in Result.Content[0].Text (see
+		// internal/tools/edit.go). Render it with FormatPatchSummary so the
+		// viewport shows +/- colored lines + net change, not just the file
+		// path summary.
+		if isDiffResultTool(event.ToolName) && event.Result != nil {
+			if diffText := extractResultDiff(event.Result); diffText != "" {
+				added, removed := CountDiffChanges(diffText)
+				path := diffFilePath(event.Result)
+				block := t.FormatPatchSummary(path, added, removed, diffText)
+				for _, line := range strings.Split(block, "\n") {
+					m.history = append(m.history, line)
+				}
+				break
+			}
+		}
 		summary := event.Text
 		if summary == "" && event.Result != nil {
 			summary = event.Result.Summary
