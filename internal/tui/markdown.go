@@ -145,6 +145,56 @@ func markdownStyleFor(themeName string) string {
 	}
 }
 
+// formatStreamingText renders the raw streamed text for the viewport, applying
+// the <think> filter controlled by thinkEnabled. Unlike formatAssistantBlock
+// (which runs once at turn end through Glamour), this runs on every flush
+// tick — so it stays cheap and avoids ANSI-preserving markdown reflow.
+//
+// When thinkEnabled is true: thinking spans are shown inline with muted
+// italic styling and explicit markers so the reasoning is legible but
+// visually separated from the final answer.
+//
+// When thinkEnabled is false: completed <think>...</think> spans collapse
+// to a single "[thinking elided]" placeholder; an open <think> without
+// a close (still streaming) becomes "[thinking…]".
+func formatStreamingText(raw string, thinkEnabled bool, theme Theme) string {
+	const open = "<think>"
+	const close = "</think>"
+	if !strings.Contains(raw, open) {
+		return raw
+	}
+	var b strings.Builder
+	b.Grow(len(raw))
+	remaining := raw
+	for {
+		start := strings.Index(remaining, open)
+		if start < 0 {
+			b.WriteString(remaining)
+			break
+		}
+		b.WriteString(remaining[:start])
+		rest := remaining[start+len(open):]
+		end := strings.Index(rest, close)
+		if end < 0 {
+			// Still mid-stream inside <think> — no closing tag yet.
+			if thinkEnabled {
+				b.WriteString(theme.Muted.Italic(true).Render("« thinking: " + strings.TrimSpace(rest) + " »"))
+			} else {
+				b.WriteString(theme.Muted.Render("[thinking…]"))
+			}
+			return b.String()
+		}
+		thinking := strings.TrimSpace(rest[:end])
+		if thinkEnabled {
+			b.WriteString(theme.Muted.Italic(true).Render("« thinking: " + thinking + " »"))
+		} else {
+			b.WriteString(theme.Muted.Render("[thinking elided]"))
+		}
+		remaining = rest[end+len(close):]
+	}
+	return b.String()
+}
+
 func abs(x int) int {
 	if x < 0 {
 		return -x

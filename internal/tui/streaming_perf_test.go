@@ -61,9 +61,6 @@ func TestClearStreamingDropsPendingBuilder(t *testing.T) {
 	if m.streamingStartIdx != -1 {
 		t.Fatalf("streamingStartIdx = %d, want -1", m.streamingStartIdx)
 	}
-	if m.streamingBuilder.Len() != 0 {
-		t.Fatalf("streamingBuilder should be empty, got %d bytes", m.streamingBuilder.Len())
-	}
 	if m.streamingRaw.Len() != 0 {
 		t.Fatalf("streamingRaw should be empty, got %d bytes", m.streamingRaw.Len())
 	}

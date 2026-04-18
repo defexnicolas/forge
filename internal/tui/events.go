@@ -76,29 +76,20 @@ func (m *model) appendAgentEvent(event agent.Event) {
 	case agent.EventAssistantDelta:
 		if event.Text != "" {
 			m.currentAssistant.WriteString(event.Text)
-			indented := strings.ReplaceAll(event.Text, "\n", "\n    ")
-			if m.streaming {
-				// Hot path: append only to the builders. Writing to
-				// strings.Builder is amortized O(1); the previous
-				// `m.history[last] += indented` was O(len(turn)) per token
-				// which became the dominant cost at Ollama streaming speeds.
-				// The viewport picks up the materialized text from the
-				// periodic flush in Update (streamFlushMsg).
-				m.streamingBuilder.WriteString(indented)
-				m.streamingRaw.WriteString(event.Text)
-			} else {
+			if !m.streaming {
 				m.streaming = true
 				m.streamingStartIdx = len(m.history)
-				m.streamingBuilder.Reset()
 				m.streamingRaw.Reset()
-				m.streamingBuilder.WriteString("    ")
-				m.streamingBuilder.WriteString(indented)
-				m.streamingRaw.WriteString(event.Text)
 				m.history = append(m.history, "")
 				// The new streaming line sits at streamingStartIdx, so
 				// everything up to that index is a fresh, stable prefix.
 				m.prefixDirty = true
 			}
+			// Append the raw delta only. The indented + think-filtered form
+			// gets rebuilt from streamingRaw on every flushStreaming tick,
+			// which lets Ctrl+T re-render the same raw bytes through a
+			// different filter without having to replay the stream.
+			m.streamingRaw.WriteString(event.Text)
 		}
 	case agent.EventAssistantText:
 		m.streaming = false
@@ -125,7 +116,6 @@ func (m *model) appendAgentEvent(event agent.Event) {
 			m.history = m.history[:m.streamingStartIdx]
 		}
 		m.streamingStartIdx = -1
-		m.streamingBuilder.Reset()
 		m.streamingRaw.Reset()
 		lastAgentResponse = ""
 		m.prefixDirty = true

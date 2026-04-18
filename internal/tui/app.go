@@ -112,12 +112,17 @@ type model struct {
 	pendingExplorerHandoff string
 	lastBuildPreflight     string
 	streamingStartIdx      int
-	// streamingBuilder holds the full indented text of the assistant line
-	// currently being streamed. Replaces the O(n²) `m.history[last] += delta`
-	// concat — we append to the builder on every delta and materialize the
-	// single-string result into m.history at each flush tick.
-	streamingBuilder   strings.Builder
-	streamingRaw       strings.Builder
+	// streamingRaw holds the raw token stream of the assistant line currently
+	// being streamed. The indented/think-filtered form for the viewport is
+	// derived from this at every flush tick — keeping a single source of
+	// truth means a Ctrl+T toggle can re-render the same raw bytes through
+	// a different filter without replaying the stream.
+	//
+	// Pointer type, not value: bubbletea's Update receiver is `func (m model)`
+	// which copies the entire model struct on every tick. strings.Builder
+	// panics with "illegal use of non-zero Builder copied by value" after the
+	// first write if held by value, so both builders need to live on the heap.
+	streamingRaw       *strings.Builder
 	streamFlushPending bool
 	// prefixRendered caches strings.Join(m.history[:streamingStartIdx], "\n")
 	// so refreshStreaming can skip rejoining the entire history on every flush.
@@ -221,6 +226,7 @@ func newModel(options Options) model {
 		thinkEnabled:         true,
 		theme:                theme,
 		currentAssistant:     &strings.Builder{},
+		streamingRaw:         &strings.Builder{},
 		collapsedToolLineIdx: -1,
 		streamingStartIdx:    -1,
 		stickyBottom:         true,
@@ -338,9 +344,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.input.Blur()
 			return m, nil
 		case tea.KeyCtrlT:
-			// Toggle thinking visibility live. Applies to the next rendered
-			// assistant block — historical turns keep their original box/no-box.
+			// Toggle thinking visibility live. flushStreaming re-renders the
+			// current streaming block from streamingRaw through the new
+			// filter, so the toggle is visible immediately even mid-stream
+			// instead of applying only to future turns.
 			m.thinkEnabled = !m.thinkEnabled
+			m.flushStreaming()
 			m.refresh()
 			return m, nil
 		case tea.KeyEsc:
@@ -646,34 +655,24 @@ func (m model) statusLineView() string {
 
 	tokensUsed := m.agentRuntime.LastTokensUsed
 	yarnBudget := m.agentRuntime.LastTokensBudget
-	modelWindow, ctxBudget, _ := config.EffectiveBudgets(m.options.Config)
+	modelWindow, _, _ := config.EffectiveBudgets(m.options.Config)
 	contextInfo := t.Muted.Render("ctx:--")
-	// Color and reference cap pick the self-imposed budget over the raw model
-	// window when available — that's the threshold we actually manage to.
-	// Typical OpenCode per-turn injection lives in the 10–16k range (tool
-	// descriptions + skills XML); our budget default is 8k. When we're well
-	// under budget the "lean" check flips to a green marker so the moat is
-	// visible in the status bar, not just in theory.
-	referenceCap := modelWindow
-	if ctxBudget > 0 && ctxBudget < referenceCap {
-		referenceCap = ctxBudget
-	}
-	if referenceCap > 0 {
-		pct := (tokensUsed * 100) / referenceCap
+	// Denominator is the loaded model window — what the user actually cares
+	// about ("how much room do I have left before the model clamps?"). The
+	// self-imposed BudgetTokens cap used to show here, but that's a soft
+	// limit users set once in config and don't track turn-to-turn, so it
+	// only confused the display when /model-multi loads a profile that
+	// changes the window without touching the budget.
+	if modelWindow > 0 {
+		pct := (tokensUsed * 100) / modelWindow
 		ctxStyle := t.Muted
 		if pct > 80 {
 			ctxStyle = t.Warning
 		}
-		if pct > 100 {
+		if pct > 95 {
 			ctxStyle = t.ErrorStyle
 		}
-		contextInfo = ctxStyle.Render(fmt.Sprintf("ctx:%s/%dk", formatTokenCount(tokensUsed), referenceCap/1000))
-		leanThreshold := referenceCap * 60 / 100
-		if tokensUsed > 0 && tokensUsed <= leanThreshold {
-			contextInfo += " " + t.Success.Render("lean✓")
-		} else if pct > 100 {
-			contextInfo += " " + t.ErrorStyle.Render("over!")
-		}
+		contextInfo = ctxStyle.Render(fmt.Sprintf("ctx:%s/%dk", formatTokenCount(tokensUsed), modelWindow/1000))
 		if yarnBudget > 0 {
 			contextInfo += t.Muted.Render(fmt.Sprintf(" yarn:%dk", yarnBudget/1000))
 		}
@@ -1122,17 +1121,37 @@ func (m *model) refresh() {
 	}
 }
 
-// flushStreaming materializes the accumulated streamingBuilder into the
-// single history line reserved at streamingStartIdx. Called at ~30fps from
-// the streamFlushMsg tick and synchronously before any non-delta event that
-// mutates m.history, so downstream event handlers always observe up-to-date
-// history. Safe to call when not streaming — no-op.
+// flushStreaming rebuilds the streamed history line from streamingRaw,
+// running the <think> filter controlled by m.thinkEnabled and indenting
+// the result. Called at ~30fps from streamFlushMsg and synchronously before
+// any non-delta event that mutates m.history, so downstream event handlers
+// always observe up-to-date history. Safe to call when not streaming.
+//
+// The transform runs on every flush (not per-delta) so toggling Ctrl+T
+// re-renders the same raw bytes through the new filter immediately — no
+// retroactive state to reconcile.
 func (m *model) flushStreaming() {
 	if !m.streaming || m.streamingStartIdx < 0 || m.streamingStartIdx >= len(m.history) {
 		return
 	}
-	m.history[m.streamingStartIdx] = m.streamingBuilder.String()
-	lastAgentResponse = m.streamingRaw.String()
+	raw := m.streamingRaw.String()
+	lastAgentResponse = raw
+	rendered := formatStreamingText(raw, m.thinkEnabled, m.theme)
+	m.history[m.streamingStartIdx] = indentBlock(rendered, "    ")
+}
+
+// indentBlock prepends prefix to every line of s. Splits on "\n" and rejoins
+// rather than a ReplaceAll so ANSI escape sequences that happen to straddle
+// newlines aren't corrupted by mid-sequence whitespace insertion.
+func indentBlock(s, prefix string) string {
+	if s == "" {
+		return prefix
+	}
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		lines[i] = prefix + line
+	}
+	return strings.Join(lines, "\n")
 }
 
 // refreshStreaming paints the viewport during an active streaming response
