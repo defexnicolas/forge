@@ -623,18 +623,34 @@ func (m model) statusLineView() string {
 
 	tokensUsed := m.agentRuntime.LastTokensUsed
 	yarnBudget := m.agentRuntime.LastTokensBudget
-	modelWindow, _, _ := config.EffectiveBudgets(m.options.Config)
+	modelWindow, ctxBudget, _ := config.EffectiveBudgets(m.options.Config)
 	contextInfo := t.Muted.Render("ctx:--")
-	if modelWindow > 0 {
-		pct := (tokensUsed * 100) / modelWindow
+	// Color and reference cap pick the self-imposed budget over the raw model
+	// window when available — that's the threshold we actually manage to.
+	// Typical OpenCode per-turn injection lives in the 10–16k range (tool
+	// descriptions + skills XML); our budget default is 8k. When we're well
+	// under budget the "lean" check flips to a green marker so the moat is
+	// visible in the status bar, not just in theory.
+	referenceCap := modelWindow
+	if ctxBudget > 0 && ctxBudget < referenceCap {
+		referenceCap = ctxBudget
+	}
+	if referenceCap > 0 {
+		pct := (tokensUsed * 100) / referenceCap
 		ctxStyle := t.Muted
 		if pct > 80 {
 			ctxStyle = t.Warning
 		}
-		if pct > 95 {
+		if pct > 100 {
 			ctxStyle = t.ErrorStyle
 		}
-		contextInfo = ctxStyle.Render(fmt.Sprintf("ctx:%dk/%dk", tokensUsed/1000, modelWindow/1000))
+		contextInfo = ctxStyle.Render(fmt.Sprintf("ctx:%s/%dk", formatTokenCount(tokensUsed), referenceCap/1000))
+		leanThreshold := referenceCap * 60 / 100
+		if tokensUsed > 0 && tokensUsed <= leanThreshold {
+			contextInfo += " " + t.Success.Render("lean✓")
+		} else if pct > 100 {
+			contextInfo += " " + t.ErrorStyle.Render("over!")
+		}
 		if yarnBudget > 0 {
 			contextInfo += t.Muted.Render(fmt.Sprintf(" yarn:%dk", yarnBudget/1000))
 		}
@@ -647,7 +663,7 @@ func (m model) statusLineView() string {
 		if pct > 95 {
 			ctxStyle = t.ErrorStyle
 		}
-		contextInfo = ctxStyle.Render(fmt.Sprintf("yarn:%dk/%dk", tokensUsed/1000, yarnBudget/1000))
+		contextInfo = ctxStyle.Render(fmt.Sprintf("yarn:%s/%dk", formatTokenCount(tokensUsed), yarnBudget/1000))
 	}
 
 	thinkLabel := t.Muted.Render("Think:OFF")
