@@ -22,6 +22,16 @@ type Config struct {
 	Build           BuildConfig        `toml:"build"`
 	Explore         ExploreConfig      `toml:"explore"`
 	Plan            PlanConfig         `toml:"plan"`
+	TUI             TUIConfig          `toml:"tui"`
+}
+
+// TUIConfig holds terminal UI preferences. StreamFlushMs governs how
+// frequently streamed tokens are materialized into the viewport — the
+// default (33ms ≈ 30fps) is tuned against Ollama at 150+ tk/s so the event
+// loop doesn't saturate. Terminals with hardware-accelerated rendering
+// (iTerm2, WezTerm, Alacritty) can safely drop to 16ms ≈ 60fps.
+type TUIConfig struct {
+	StreamFlushMs int `toml:"stream_flush_ms"`
 }
 
 type BuildConfig struct {
@@ -239,6 +249,12 @@ func Defaults() Config {
 			// into model-multi.
 			Strategy:      "single",
 			ParallelSlots: 2,
+		},
+		TUI: TUIConfig{
+			// 33ms ≈ 30fps — conservative default that survives Ollama at
+			// 150+ tk/s without saturating the event loop. Override to 16ms
+			// on modern terminals for 60fps streaming.
+			StreamFlushMs: 33,
 		},
 		Build: BuildConfig{
 			Subagents: BuildSubagentsConfig{

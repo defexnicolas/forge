@@ -23,10 +23,16 @@ type agentEventMsg struct {
 // of 100+ collapse into ~30 renders/sec of work.
 type streamFlushMsg struct{}
 
-// streamFlushInterval trades off perceived smoothness against CPU cost.
-// 33ms ≈ 30fps — fast enough that characters still appear to "stream" but
-// slow enough that Ollama at 150+ tk/s doesn't saturate the event loop.
-const streamFlushInterval = 33 * time.Millisecond
+// defaultStreamFlushInterval trades off perceived smoothness against CPU
+// cost. 33ms ≈ 30fps — fast enough that characters still appear to "stream"
+// but slow enough that Ollama at 150+ tk/s doesn't saturate the event loop.
+// User override lives in config.TUI.StreamFlushMs; see resolveStreamFlushInterval.
+const defaultStreamFlushInterval = 33 * time.Millisecond
+
+// minStreamFlushInterval caps the fastest allowed flush so a user setting
+// 1ms in config can't freeze the TUI by scheduling ticks faster than the
+// event loop can drain them.
+const minStreamFlushInterval = 8 * time.Millisecond
 
 func waitForAgentEvent(events <-chan agent.Event) tea.Cmd {
 	return func() tea.Msg {
@@ -38,8 +44,20 @@ func waitForAgentEvent(events <-chan agent.Event) tea.Cmd {
 	}
 }
 
-func scheduleStreamFlush() tea.Cmd {
-	return tea.Tick(streamFlushInterval, func(time.Time) tea.Msg {
+func (m *model) streamFlushInterval() time.Duration {
+	ms := m.options.Config.TUI.StreamFlushMs
+	if ms <= 0 {
+		return defaultStreamFlushInterval
+	}
+	interval := time.Duration(ms) * time.Millisecond
+	if interval < minStreamFlushInterval {
+		return minStreamFlushInterval
+	}
+	return interval
+}
+
+func (m *model) scheduleStreamFlush() tea.Cmd {
+	return tea.Tick(m.streamFlushInterval(), func(time.Time) tea.Msg {
 		return streamFlushMsg{}
 	})
 }

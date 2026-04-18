@@ -265,7 +265,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.appendAgentEvent(msg.event)
 			if m.streaming && !m.streamFlushPending {
 				m.streamFlushPending = true
-				cmds = append(cmds, scheduleStreamFlush())
+				cmds = append(cmds, m.scheduleStreamFlush())
 			}
 		case agent.EventModelProgress:
 			// Progress is rendered in the footer (modelProgressView) which
@@ -299,7 +299,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.flushStreaming()
 			m.refreshStreaming()
 			m.streamFlushPending = true
-			cmds = append(cmds, scheduleStreamFlush())
+			cmds = append(cmds, m.scheduleStreamFlush())
 		}
 	case btwEventMsg:
 		m.appendBtwEvent(msg.event)
