@@ -20,6 +20,7 @@ func RegisterBuiltins(registry *Registry) {
 	registry.Register(taskListTool{}, "TaskList")
 	registry.Register(taskGetTool{}, "TaskGet")
 	registry.Register(taskUpdateTool{}, "TaskUpdate")
+	registry.Register(executeTaskTool{}, "ExecuteTask")
 	registry.Register(askUserTool{}, "AskUserQuestion")
 	registry.Register(powershellTool{})
 	registry.Register(runSkillTool{}, "Skill")

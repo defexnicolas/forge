@@ -2,11 +2,13 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
 	"forge/internal/agent"
+	"forge/internal/config"
 	"forge/internal/tools"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -220,7 +222,7 @@ func (m *model) handleFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 						_ = m.agentRuntime.Plans.Clear()
 					}
 					if m.agentRuntime.Tasks != nil {
-						_, _ = m.agentRuntime.Tasks.ReplacePlan(nil)
+						_ = m.agentRuntime.Tasks.Clear()
 					}
 					m.history = append(m.history, m.theme.Success.Render("Prior plan and todos cleared."))
 					cleared = true
@@ -366,33 +368,55 @@ func (m *model) runBuildWithPreflight(line string) tea.Cmd {
 }
 
 func (m *model) runBuildPreflight(line string) string {
+	return m.runModePreflight("build", line)
+}
+
+// runModePreflight dispatches the configured preflight subagents for the
+// current mode. Returns "" when preflight is disabled for the mode, when the
+// message is trivial chit-chat, or when no roles are configured. The caller
+// injects the result into the runtime's per-mode pending-handoff field.
+func (m *model) runModePreflight(mode, line string) string {
 	if m == nil || m.agentRuntime == nil {
 		return ""
 	}
-	cfg := m.agentRuntime.Config.Build.Subagents
+	cfg := modePreflightConfig(m.agentRuntime.Config, mode)
 	if !cfg.Enabled {
 		return ""
 	}
+	if looksLikeTrivia(line) {
+		return ""
+	}
+	if cached, ok := m.agentRuntime.PreflightCacheGet(mode, line); ok {
+		return cached
+	}
 	concurrency := cfg.Concurrency
 	if concurrency <= 0 {
-		concurrency = 3
+		concurrency = m.agentRuntime.Config.ModelLoading.ParallelSlots
+		if concurrency <= 0 {
+			concurrency = 2
+		}
+		if concurrency > 2 {
+			concurrency = 2
+		}
+	}
+	if slots := m.agentRuntime.Config.ModelLoading.ParallelSlots; slots > 0 && concurrency > slots {
+		concurrency = slots
 	}
 	roles := cfg.Roles
 	if len(roles) == 0 {
-		roles = []string{"explorer", "reviewer", "debug"}
+		return ""
 	}
-	prompts := map[string]string{
-		"explorer": "Before build execution, inspect the repository facts, likely files, and contracts needed for this request. Keep the answer concise and read-only. Request: " + line,
-		"reviewer": "Before build execution, inspect the current plan/checklist and repository state for risks, validation needs, and likely failure modes. Keep the answer concise and read-only. Request: " + line,
-		"debug":    "Before build execution, anticipate likely failure modes, edge cases, and regressions for this request. Point at the specific code/tests to watch. Read-only. Request: " + line,
-	}
+	prompts := preflightPrompts(mode, line)
+	sharedContext, _ := json.Marshal(map[string]string{
+		"text": m.agentRuntime.SharedTaskContext(line),
+	})
 	tasks := make([]agent.SubagentRequest, 0, len(roles))
 	for _, role := range roles {
 		prompt, ok := prompts[role]
 		if !ok {
-			prompt = "Before build execution, contribute a concise read-only analysis for: " + line
+			prompt = "Contribute a concise read-only analysis for: " + line
 		}
-		tasks = append(tasks, agent.SubagentRequest{Agent: role, Prompt: prompt})
+		tasks = append(tasks, agent.SubagentRequest{Agent: role, Prompt: prompt, Context: sharedContext})
 	}
 	req := agent.SubagentBatchRequest{
 		MaxConcurrency: concurrency,
@@ -404,7 +428,62 @@ func (m *model) runBuildPreflight(line string) string {
 	if err != nil {
 		return "Preflight failed: " + err.Error()
 	}
-	return formatPreflightResult(result)
+	formatted := formatPreflightResult(result)
+	m.agentRuntime.PreflightCacheSet(mode, line, formatted)
+	return formatted
+}
+
+func modePreflightConfig(cfg config.Config, mode string) config.BuildSubagentsConfig {
+	switch mode {
+	case "build":
+		return cfg.Build.Subagents
+	case "explore":
+		return cfg.Explore.Subagents
+	case "plan":
+		return cfg.Plan.Subagents
+	default:
+		return config.BuildSubagentsConfig{}
+	}
+}
+
+// preflightPrompts returns compact, structured prompts per role. Structured
+// output keeps each subagent response in the ~400–600 token range instead of
+// the freeform ~1–2k they used to emit, which directly shrinks the tier-C
+// handoff block in the main turn.
+func preflightPrompts(mode, line string) map[string]string {
+	switch mode {
+	case "build":
+		return map[string]string{
+			"explorer": "List the 3–8 files most likely to be read or touched for this request. Format each line as `path — one-line why`. No prose. Request: " + line,
+			"reviewer": "Return risks for the request as rows `[risk] | [file:line] | [mitigation]`. Max 5 rows, no prose. Request: " + line,
+			"debug":    "Return likely failure modes as rows `[mode] | [trigger] | [detect cmd]`. Max 5 rows, no prose. Request: " + line,
+		}
+	case "explore", "plan":
+		return map[string]string{
+			"explorer": "List the 3–8 files most likely relevant to this question. Format each line as `path — one-line why`. No prose. Question: " + line,
+			"reviewer": "Return risks if the user acts on this analysis as rows `[risk] | [file:line] | [mitigation]`. Max 5 rows. Question: " + line,
+			"debug":    "Return likely failure modes to watch as rows `[mode] | [trigger] | [detect cmd]`. Max 5 rows. Question: " + line,
+		}
+	default:
+		return map[string]string{}
+	}
+}
+
+// looksLikeTrivia bails out of preflight for short messages or common
+// conversational replies. Saves 2–4s of subagent latency on "thanks"/"ok"
+// follow-ups without sacrificing the fan-out for real questions.
+func looksLikeTrivia(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || len(trimmed) < 20 {
+		return true
+	}
+	lowered := strings.ToLower(trimmed)
+	for _, prefix := range []string{"thanks", "thank you", "ok", "okay", "si", "sí", "no", "ya", "listo", "dale", "gracias", "perfect", "nice", "cool", "great"} {
+		if lowered == prefix || strings.HasPrefix(lowered, prefix+" ") || strings.HasPrefix(lowered, prefix+",") || strings.HasPrefix(lowered, prefix+".") || strings.HasPrefix(lowered, prefix+"!") {
+			return true
+		}
+	}
+	return false
 }
 
 func formatPreflightResult(result tools.Result) string {
@@ -426,5 +505,9 @@ func formatPreflightResult(result tools.Result) string {
 		}
 		b.WriteString(text)
 	}
-	return strings.TrimSpace(b.String())
+	out := strings.TrimSpace(b.String())
+	if len(out) > 4000 {
+		out = out[:4000] + "\n[preflight truncated]"
+	}
+	return out
 }

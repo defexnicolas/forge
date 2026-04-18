@@ -6,22 +6,37 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"forge/internal/config"
 	"forge/internal/llm"
+	"forge/internal/plans"
 	"forge/internal/tools"
 )
 
 type batchFakeProvider struct {
-	mu       sync.Mutex
-	requests []llm.ChatRequest
-	loads    []string
+	mu        sync.Mutex
+	requests  []llm.ChatRequest
+	loads     []string
+	active    int
+	maxActive int
+	delay     time.Duration
 }
 
 func (f *batchFakeProvider) Name() string { return "fake" }
 func (f *batchFakeProvider) Chat(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
 	f.mu.Lock()
+	f.active++
+	if f.active > f.maxActive {
+		f.maxActive = f.active
+	}
 	f.requests = append(f.requests, req)
+	f.mu.Unlock()
+	if f.delay > 0 {
+		time.Sleep(f.delay)
+	}
+	f.mu.Lock()
+	f.active--
 	f.mu.Unlock()
 	content := "completed"
 	if len(req.Messages) > 1 {
@@ -51,6 +66,124 @@ func (f *batchFakeProvider) LoadModel(ctx context.Context, id string, cfg llm.Lo
 	defer f.mu.Unlock()
 	f.loads = append(f.loads, id)
 	return nil
+}
+
+func TestBuilderSubagentExists(t *testing.T) {
+	registry := DefaultSubagents()
+	builder, ok := registry.Get("builder")
+	if !ok {
+		t.Fatal("builder subagent should be registered")
+	}
+	if builder.ModelRole != "editor" {
+		t.Fatalf("builder.ModelRole = %q, want editor", builder.ModelRole)
+	}
+	wantTools := []string{"read_file", "edit_file", "write_file", "apply_patch", "run_command", "task_get", "task_update"}
+	for _, want := range wantTools {
+		found := false
+		for _, got := range builder.AllowedTools {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("builder.AllowedTools missing %q: %v", want, builder.AllowedTools)
+		}
+	}
+}
+
+func TestExecuteTaskPassesOnlyTaskAsContext(t *testing.T) {
+	cwd := t.TempDir()
+	cfg := config.Defaults()
+	cfg.Providers.Default.Name = "fake"
+	registry := tools.NewRegistry()
+	tools.RegisterBuiltins(registry)
+	provider := &batchFakeProvider{}
+	providers := llm.NewRegistry()
+	providers.Register(provider)
+	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+
+	// Save a plan document with details that MUST NOT leak to the builder,
+	// and a task whose title is what SHOULD appear in the builder prompt.
+	if _, err := runtime.Plans.Save(plans.Document{
+		Summary:  "DO_NOT_LEAK_THIS_PLAN_SUMMARY",
+		Approach: "DO_NOT_LEAK_THIS_APPROACH",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tasksList, err := runtime.Tasks.ReplacePlan([]string{"BUILDER_TASK_TITLE"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, _ := json.Marshal(map[string]any{
+		"task_id":        tasksList[0].ID,
+		"relevant_files": []string{"a.go", "b.go"},
+	})
+	result, _ := runtime.executeExecuteTask(context.Background(), input)
+	if result == nil {
+		t.Fatal("expected execute_task result")
+	}
+	if len(provider.requests) == 0 {
+		t.Fatal("expected subagent to have invoked the provider")
+	}
+	userMsg := provider.requests[0].Messages[1].Content
+	if !strings.Contains(userMsg, "BUILDER_TASK_TITLE") {
+		t.Fatalf("expected task title in builder prompt, got:\n%s", userMsg)
+	}
+	if strings.Contains(userMsg, "DO_NOT_LEAK_THIS_PLAN_SUMMARY") ||
+		strings.Contains(userMsg, "DO_NOT_LEAK_THIS_APPROACH") {
+		t.Fatalf("plan document leaked into builder prompt:\n%s", userMsg)
+	}
+	if !strings.Contains(userMsg, "a.go") || !strings.Contains(userMsg, "b.go") {
+		t.Fatalf("expected relevant_files in builder context, got:\n%s", userMsg)
+	}
+}
+
+func TestExecuteTaskRejectsMissingTaskID(t *testing.T) {
+	cwd := t.TempDir()
+	cfg := config.Defaults()
+	cfg.Providers.Default.Name = "fake"
+	registry := tools.NewRegistry()
+	tools.RegisterBuiltins(registry)
+	providers := llm.NewRegistry()
+	providers.Register(&batchFakeProvider{})
+	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+
+	input, _ := json.Marshal(map[string]string{"task_id": ""})
+	result, observation := runtime.executeExecuteTask(context.Background(), input)
+	if result == nil {
+		t.Fatal("expected error result")
+	}
+	if !strings.Contains(observation, "task_id is required") {
+		t.Fatalf("expected task_id required error, got %s", observation)
+	}
+}
+
+func TestBuilderBlockedFromParallelBatch(t *testing.T) {
+	// Parallel subagent dispatch must reject the builder: it owns mutating
+	// tools and they cannot safely fan out — approvals would serialize and
+	// concurrent patches race.
+	cwd := t.TempDir()
+	cfg := config.Defaults()
+	cfg.Providers.Default.Name = "fake"
+	registry := tools.NewRegistry()
+	tools.RegisterBuiltins(registry)
+	providers := llm.NewRegistry()
+	providers.Register(&batchFakeProvider{})
+	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+
+	result, err := runtime.RunSubagents(context.Background(), SubagentBatchRequest{
+		MaxConcurrency: 2,
+		Tasks: []SubagentRequest{
+			{Agent: "builder", Prompt: "edit a file"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result.Content[0].Text, "parallel subagents do not allow mutating tools") {
+		t.Fatalf("expected builder to be rejected in batch, got:\n%s", result.Content[0].Text)
+	}
 }
 
 func TestRuntimeSpawnSubagentTool(t *testing.T) {
@@ -99,6 +232,27 @@ func TestRunSubagentUsesTaskContextBudget(t *testing.T) {
 	}
 }
 
+func TestRunSubagentUsesProvidedSharedContext(t *testing.T) {
+	cwd := t.TempDir()
+	cfg := config.Defaults()
+	cfg.Providers.Default.Name = "fake"
+	registry := tools.NewRegistry()
+	tools.RegisterBuiltins(registry)
+	provider := &batchFakeProvider{}
+	providers := llm.NewRegistry()
+	providers.Register(provider)
+	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+
+	shared, _ := json.Marshal(map[string]string{"text": "shared compact facts"})
+	if _, err := runtime.RunSubagent(context.Background(), SubagentRequest{Agent: "explorer", Prompt: "small context", Context: shared}); err != nil {
+		t.Fatal(err)
+	}
+	prompt := provider.requests[0].Messages[1].Content
+	if !strings.Contains(prompt, "shared compact facts") {
+		t.Fatalf("expected shared context in prompt, got:\n%s", prompt)
+	}
+}
+
 func TestRunSubagentsPreservesOrderAndPartialErrors(t *testing.T) {
 	cwd := t.TempDir()
 	cfg := config.Defaults()
@@ -130,6 +284,34 @@ func TestRunSubagentsPreservesOrderAndPartialErrors(t *testing.T) {
 	third := strings.Index(text, "[2] reviewer completed")
 	if first < 0 || second < 0 || third < 0 || !(first < second && second < third) {
 		t.Fatalf("expected ordered batch output, got:\n%s", text)
+	}
+}
+
+func TestRunSubagentsConcurrentUnderSingleStrategy(t *testing.T) {
+	cwd := t.TempDir()
+	cfg := config.Defaults()
+	cfg.Providers.Default.Name = "fake"
+	cfg.ModelLoading.Enabled = true
+	cfg.ModelLoading.Strategy = "single"
+	registry := tools.NewRegistry()
+	tools.RegisterBuiltins(registry)
+	provider := &batchFakeProvider{delay: 50 * time.Millisecond}
+	providers := llm.NewRegistry()
+	providers.Register(provider)
+	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+
+	_, err := runtime.RunSubagents(context.Background(), SubagentBatchRequest{
+		MaxConcurrency: 2,
+		Tasks: []SubagentRequest{
+			{Agent: "explorer", Prompt: "alpha"},
+			{Agent: "reviewer", Prompt: "beta"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if provider.maxActive < 2 {
+		t.Fatalf("expected concurrent requests under single strategy, maxActive=%d", provider.maxActive)
 	}
 }
 

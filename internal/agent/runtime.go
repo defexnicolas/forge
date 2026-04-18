@@ -109,6 +109,11 @@ type Runtime struct {
 	// PendingBuildPreflight is a one-turn handoff from automatic read-only
 	// subagents into build mode. It is consumed by the next build-mode run.
 	PendingBuildPreflight string
+	// PendingExplorePreflight mirrors PendingBuildPreflight but for the
+	// explore-mode opt-in fan-out. Consumed at the top of the next
+	// explore-mode run and injected into the tier-C handoff block so the
+	// main explorer response is grounded in the preflight findings.
+	PendingExplorePreflight string
 	Policy                SprintPolicy
 	Commands              permissions.CommandPolicy
 	Plans                 *plans.Store
@@ -129,11 +134,31 @@ type Runtime struct {
 	ActiveModelFamily  string
 	currentLoadedModel string
 	loadedModels       map[string]bool
+	// startupReloadDone is set once after the first provider.LoadModel call
+	// issued by this runtime. Until it is true, EnsureRoleModelLoaded bypasses
+	// the "already loaded" short-circuit and calls LoadModel anyway — that
+	// path is the only one that applies ModelLoading.ParallelSlots to the
+	// backend. Without this, a model that was already resident in LM Studio
+	// (from a prior session or a manual load) would stay on whatever slot
+	// count LM Studio picked, typically 1.
+	startupReloadDone bool
 	LastTurnDuration   time.Duration
 	LastTurnTokensIn   int
 	LastTurnTokensOut  int
 	mu                 sync.Mutex
 	undoStack          []UndoEntry
+	// systemPromptCache memoizes the rendered system prompt by (nativeTools |
+	// mode | policy.AllowedNames | policy.AskNames). The body is dynamic in
+	// content but byte-stable across consecutive turns while the policy and
+	// mode do not change — caching guarantees the stable prefix needed for
+	// LM Studio's KV cache to hit turn over turn. Invalidated in SetMode.
+	systemPromptCache map[string]string
+	// preflightCache memoizes preflight subagent batch results by (mode|line)
+	// with a short TTL. Lets consecutive refinements of the same request
+	// skip re-dispatching the fan-out. Invalidated on any successful
+	// mutating tool call (edit_file / write_file / apply_patch) since a
+	// cached analysis of pre-mutation state no longer applies.
+	preflightCache map[string]preflightCacheEntry
 	// loadMu serializes actual provider.LoadModel calls. Without this, two
 	// concurrent subagents with different role models race to swap the
 	// currently-loaded model on LM Studio, causing thrash and starving the
@@ -142,7 +167,19 @@ type Runtime struct {
 	// EventTee, if set, receives a copy of every event emitted by Run. Used
 	// by /remote-control to broadcast to connected web clients.
 	EventTee EventTee
+	// activeEvents is the events channel of the in-flight turn. Set at the
+	// top of run() and cleared at the end. Subagents invoked during the turn
+	// (e.g. the builder via execute_task) read it so they can raise approval
+	// prompts for their own mutating tool calls. Nil when no turn is active.
+	activeEvents chan<- Event
 }
+
+type preflightCacheEntry struct {
+	Value     string
+	ExpiresAt time.Time
+}
+
+const preflightCacheTTL = 10 * time.Minute
 
 func NewRuntime(cwd string, cfg config.Config, registry *tools.Registry, providers *llm.Registry) *Runtime {
 	return &Runtime{
@@ -152,8 +189,8 @@ func NewRuntime(cwd string, cfg config.Config, registry *tools.Registry, provide
 		Providers: providers,
 		Builder:   contextbuilder.NewBuilder(cwd, cfg, registry),
 		MaxSteps:  40,
-		Mode:      "build",
-		Policy:    NewSprintPolicy(),
+		Mode:      "plan",
+		Policy:    NewPlanPolicy(),
 		Commands:  permissions.DefaultCommandPolicy(),
 		Plans:     plans.New(cwd),
 		Tasks:     tasks.New(cwd),
@@ -202,6 +239,11 @@ func (r *Runtime) MarkModelLoaded(modelID string) {
 	}
 	r.loadedModels[modelID] = true
 	r.currentLoadedModel = modelID
+	// If something upstream (test fixture, manual CLI hint) has explicitly
+	// marked a model as loaded, treat the startup-reload obligation as
+	// satisfied. Otherwise the next EnsureRoleModelLoaded would ignore the
+	// mark and force a redundant provider.LoadModel call.
+	r.startupReloadDone = true
 }
 
 func (r *Runtime) roleModel(role string) string {
@@ -229,8 +271,6 @@ func (r *Runtime) modelRoleForMode() string {
 	switch r.Mode {
 	case "plan":
 		return "planner"
-	case "build":
-		return "editor"
 	case "explore":
 		return "explorer"
 	default:
@@ -258,9 +298,35 @@ func (r *Runtime) buildTaskSnapshot(userMessage, role string) contextbuilder.Sna
 	return r.buildSnapshot(userMessage, config.ConfigForTaskRole(r.Config, role, r.roleModel(role)))
 }
 
+func (r *Runtime) SharedTaskContext(userMessage string) string {
+	if r == nil {
+		return ""
+	}
+	snapshot := r.buildTaskSnapshot(userMessage, "explorer")
+	return snapshot.Render()
+}
+
 func (r *Runtime) EnsureRoleModelLoaded(ctx context.Context, provider llm.Provider, role string) error {
-	if r == nil || provider == nil || !r.Config.ModelLoading.Enabled {
+	if r == nil || provider == nil {
 		return nil
+	}
+	// Two independent concerns converge on LoadModel:
+	//   1. ModelLoading.Enabled=true: the user wants forge to own model
+	//      loading (including per-role model swaps).
+	//   2. ParallelSlots > 1 and this is our first turn: even without (1),
+	//      we still need to apply GEN slots once so LM Studio actually
+	//      serves concurrent subagent requests instead of queueing them.
+	// Bail out only when both conditions are false.
+	if !r.Config.ModelLoading.Enabled {
+		if r.Config.ModelLoading.ParallelSlots <= 1 {
+			return nil
+		}
+		r.mu.Lock()
+		done := r.startupReloadDone
+		r.mu.Unlock()
+		if done {
+			return nil
+		}
 	}
 	modelID := r.roleModel(role)
 	if modelID == "" {
@@ -271,14 +337,17 @@ func (r *Runtime) EnsureRoleModelLoaded(ctx context.Context, provider llm.Provid
 		strategy = "single"
 	}
 	r.mu.Lock()
-	if strategy == "parallel" {
-		if r.loadedModels != nil && r.loadedModels[modelID] {
+	startupDone := r.startupReloadDone
+	if startupDone {
+		if strategy == "parallel" {
+			if r.loadedModels != nil && r.loadedModels[modelID] {
+				r.mu.Unlock()
+				return nil
+			}
+		} else if r.currentLoadedModel == modelID {
 			r.mu.Unlock()
 			return nil
 		}
-	} else if r.currentLoadedModel == modelID {
-		r.mu.Unlock()
-		return nil
 	}
 	r.mu.Unlock()
 
@@ -296,16 +365,71 @@ func (r *Runtime) EnsureRoleModelLoaded(ctx context.Context, provider llm.Provid
 	r.loadMu.Lock()
 	defer r.loadMu.Unlock()
 	r.mu.Lock()
-	if strategy == "parallel" {
-		if r.loadedModels != nil && r.loadedModels[modelID] {
+	startupDone = r.startupReloadDone
+	if startupDone {
+		if strategy == "parallel" {
+			if r.loadedModels != nil && r.loadedModels[modelID] {
+				r.mu.Unlock()
+				return nil
+			}
+		} else if r.currentLoadedModel == modelID {
 			r.mu.Unlock()
 			return nil
 		}
-	} else if r.currentLoadedModel == modelID {
-		r.mu.Unlock()
-		return nil
 	}
 	r.mu.Unlock()
+	loadCtx, cancel := context.WithTimeout(ctx, 6*time.Minute)
+	defer cancel()
+	loadErr := provider.LoadModel(loadCtx, modelID, llm.LoadConfig{
+		ContextLength:  contextLength,
+		FlashAttention: true,
+		ParallelSlots:  r.Config.ModelLoading.ParallelSlots,
+	})
+	// Mark the startup reload as done regardless of success — the one-time
+	// forced path has been exercised and subsequent EnsureRoleModelLoaded
+	// calls can short-circuit on the loaded-model maps again.
+	r.mu.Lock()
+	r.startupReloadDone = true
+	r.mu.Unlock()
+	if loadErr != nil {
+		// Best-effort load: LM Studio may already have the model resident
+		// (e.g. JIT cache or a prior session) and still reject an explicit
+		// load request. Emit a warning via stderr and let the subsequent
+		// Chat/Stream call be the real source of truth — if the model truly
+		// isn't available, that call will fail with an actionable error.
+		fmt.Fprintf(os.Stderr, "model-load warning (%s=%s): %v — proceeding anyway\n", role, modelID, loadErr)
+		r.MarkModelLoaded(modelID)
+		return nil
+	}
+	r.MarkModelLoaded(modelID)
+	return nil
+}
+
+// ReloadCurrentModel forces a provider-side load of the model for the current
+// mode, applying the configured context length and parallel generation slots
+// even if the runtime already marked that model as loaded.
+func (r *Runtime) ReloadCurrentModel(ctx context.Context) (string, error) {
+	if r == nil {
+		return "", fmt.Errorf("runtime unavailable")
+	}
+	provider, _, err := r.resolveProvider()
+	if err != nil {
+		return "", err
+	}
+	role := r.modelRoleForMode()
+	modelID := r.roleModel(role)
+	if modelID == "" {
+		return "", fmt.Errorf("model id is required")
+	}
+	contextLength := r.Config.Context.ModelContextTokens
+	if detected := config.DetectedForRole(r.Config, role, modelID); detected != nil && detected.LoadedContextLength > 0 {
+		contextLength = detected.LoadedContextLength
+	}
+	if contextLength <= 0 {
+		contextLength = 16384
+	}
+	r.loadMu.Lock()
+	defer r.loadMu.Unlock()
 	loadCtx, cancel := context.WithTimeout(ctx, 6*time.Minute)
 	defer cancel()
 	if err := provider.LoadModel(loadCtx, modelID, llm.LoadConfig{
@@ -313,17 +437,13 @@ func (r *Runtime) EnsureRoleModelLoaded(ctx context.Context, provider llm.Provid
 		FlashAttention: true,
 		ParallelSlots:  r.Config.ModelLoading.ParallelSlots,
 	}); err != nil {
-		// Best-effort load: LM Studio may already have the model resident
-		// (e.g. JIT cache or a prior session) and still reject an explicit
-		// load request. Emit a warning via stderr and let the subsequent
-		// Chat/Stream call be the real source of truth — if the model truly
-		// isn't available, that call will fail with an actionable error.
-		fmt.Fprintf(os.Stderr, "model-load warning (%s=%s): %v — proceeding anyway\n", role, modelID, err)
-		r.MarkModelLoaded(modelID)
-		return nil
+		return modelID, err
 	}
+	r.mu.Lock()
+	r.startupReloadDone = true
+	r.mu.Unlock()
 	r.MarkModelLoaded(modelID)
-	return nil
+	return modelID, nil
 }
 
 // Close releases resources owned by the runtime (currently the tasks DB).
@@ -350,7 +470,16 @@ func (r *Runtime) Close() error {
 }
 
 // SetMode switches the agent to a different operating mode.
+//
+// The historical "build" mode has been removed — execution is now delegated
+// from plan mode to the "builder" subagent via execute_task. For backwards
+// compatibility with persisted sessions, SetMode("build") silently re-maps
+// to "plan" and logs a one-line notice to stderr.
 func (r *Runtime) SetMode(name string) error {
+	if name == "build" {
+		fmt.Fprintln(os.Stderr, "build mode deprecated; remapped to plan — the planner now dispatches execute_task to the builder subagent")
+		name = "plan"
+	}
 	mode, ok := GetMode(name)
 	if !ok {
 		return fmt.Errorf("unknown mode: %s (available: %s)", name, strings.Join(ModeNames(), ", "))
@@ -358,13 +487,111 @@ func (r *Runtime) SetMode(name string) error {
 	previous := r.Mode
 	r.Mode = name
 	r.Policy = mode.Policy
-	// Fire a one-shot handoff on the next turn so the model knows it switched
-	// context. Especially important for plan→build so it executes instead of
-	// re-planning.
+	r.invalidateSystemPromptCache()
 	if previous != name {
 		r.ModeSwitchedFrom = previous
 	}
 	return nil
+}
+
+func (r *Runtime) invalidateSystemPromptCache() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.systemPromptCache = nil
+	r.mu.Unlock()
+}
+
+// cachedSystemPrompt returns the system prompt for the current (mode, policy,
+// nativeTools) signature, computing and memoizing on first hit. Callers must
+// not mutate the returned string.
+func (r *Runtime) cachedSystemPrompt(nativeToolCalling bool) string {
+	if r == nil {
+		return ""
+	}
+	key := systemPromptCacheKey(nativeToolCalling, r.Mode, r.Policy)
+	r.mu.Lock()
+	if r.systemPromptCache != nil {
+		if cached, ok := r.systemPromptCache[key]; ok {
+			r.mu.Unlock()
+			return cached
+		}
+	}
+	r.mu.Unlock()
+	rendered := systemPrompt(nativeToolCalling, r.Mode, r.Policy)
+	r.mu.Lock()
+	if r.systemPromptCache == nil {
+		r.systemPromptCache = map[string]string{}
+	}
+	r.systemPromptCache[key] = rendered
+	r.mu.Unlock()
+	return rendered
+}
+
+// PreflightCacheGet returns a cached preflight result for (mode, line) if
+// present and not expired. Callers still need to validate freshness against
+// repo state beyond what the TTL implies.
+func (r *Runtime) PreflightCacheGet(mode, line string) (string, bool) {
+	if r == nil {
+		return "", false
+	}
+	key := preflightCacheKey(mode, line)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.preflightCache == nil {
+		return "", false
+	}
+	entry, ok := r.preflightCache[key]
+	if !ok || time.Now().After(entry.ExpiresAt) {
+		return "", false
+	}
+	return entry.Value, true
+}
+
+// PreflightCacheSet stores a preflight result with the package-defined TTL.
+func (r *Runtime) PreflightCacheSet(mode, line, value string) {
+	if r == nil || strings.TrimSpace(value) == "" {
+		return
+	}
+	key := preflightCacheKey(mode, line)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.preflightCache == nil {
+		r.preflightCache = map[string]preflightCacheEntry{}
+	}
+	r.preflightCache[key] = preflightCacheEntry{Value: value, ExpiresAt: time.Now().Add(preflightCacheTTL)}
+}
+
+// InvalidatePreflightCache drops every cached preflight result. Called by
+// executeTool after a successful mutating tool, since any cached analysis of
+// pre-mutation state is now stale.
+func (r *Runtime) InvalidatePreflightCache() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.preflightCache = nil
+	r.mu.Unlock()
+}
+
+func preflightCacheKey(mode, line string) string {
+	return mode + "|" + strings.TrimSpace(line)
+}
+
+func systemPromptCacheKey(nativeTools bool, mode string, policy SprintPolicy) string {
+	var b strings.Builder
+	if nativeTools {
+		b.WriteString("native|")
+	} else {
+		b.WriteString("text|")
+	}
+	b.WriteString(mode)
+	b.WriteString("|allow:")
+	b.WriteString(strings.Join(policy.AllowedNames(), ","))
+	b.WriteString("|ask:")
+	b.WriteString(strings.Join(policy.AskNames(), ","))
+	return b.String()
 }
 
 func (r *Runtime) UndoLast() (string, error) {
@@ -432,8 +659,18 @@ func looksLikePlanOnlyResponse(content string) bool {
 	return checklistLines >= 2
 }
 
-func buildModeExecutionReprompt() string {
-	return "You are in BUILD mode. The previous response was only a plan/checklist and did not execute the user's request. Do not provide another plan. Start implementing now using tool_call blocks. Create or edit the required files with write_file/edit_file/apply_patch, then run a relevant verification command. If you need the current files first, call list_files or read_file."
+func looksLikePlanExecutionIntent(message string) bool {
+	lower := strings.ToLower(message)
+	for _, phrase := range []string{
+		"execute", "implement", "build", "continue", "resume",
+		"carry out", "do it", "run the plan", "execute the plan", "approved plan",
+		"ejecut", "implement", "constru", "contin", "sigue", "hazlo", "hacerlo",
+	} {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 // ToolSupporter is implemented by providers that may support native tool calling.
@@ -458,9 +695,65 @@ func (r *Runtime) resolveProvider() (llm.Provider, bool, error) {
 	return provider, supportsTools, nil
 }
 
+func (r *Runtime) planContextBlock(userMessage, switchedFrom string) string {
+	var lines []string
+	planSummary := ""
+	if r.Plans != nil {
+		if doc, ok, err := r.Plans.Current(); err == nil && ok {
+			planSummary = strings.TrimSpace(doc.Summary)
+			if planSummary == "" {
+				planSummary = "(no summary)"
+			}
+		}
+	}
+
+	var taskList []tasks.Task
+	if r.Tasks != nil {
+		if list, err := r.Tasks.List(); err == nil {
+			taskList = list
+		}
+	}
+	pending, inProgress, done := 0, 0, 0
+	for _, t := range taskList {
+		switch t.Status {
+		case "pending":
+			pending++
+		case "in_progress":
+			inProgress++
+		case "completed", "done":
+			done++
+		}
+	}
+	activeTasks := pending+inProgress > 0
+	executeIntent := switchedFrom == "plan" || looksLikePlanExecutionIntent(userMessage)
+	_ = executeIntent
+
+	switch r.Mode {
+	case "plan":
+		if planSummary != "" {
+			lines = append(lines, fmt.Sprintf("Plan document exists: %s. Call plan_get to read it before refining. Keep the executable checklist separate.", planSummary))
+		}
+		if len(taskList) > 0 {
+			if activeTasks {
+				lines = append(lines, fmt.Sprintf("Active checklist: %d pending, %d in progress, %d done. Call task_list to read it. Dispatch pending tasks one-by-one to the builder subagent via execute_task (pass only the minimal relevant_files). Use task_update after the builder returns. Use todo_write only when starting a fresh checklist.", pending, inProgress, done))
+			} else {
+				lines = append(lines, fmt.Sprintf("Previous checklist complete (%d tasks done). If refining, call task_list before deciding whether to preserve or replace it.", len(taskList)))
+			}
+		}
+	}
+
+	return strings.Join(lines, "\n")
+}
+
 func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Event) {
 	turnStart := time.Now()
+	r.mu.Lock()
+	r.activeEvents = events
+	r.mu.Unlock()
 	defer func() {
+		r.mu.Lock()
+		r.activeEvents = nil
+		r.mu.Unlock()
 		r.LastTurnDuration = time.Since(turnStart)
 	}()
 
@@ -479,6 +772,9 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 		return
 	}
 	roleConfig := r.configForRole(role)
+	if r.Mode == "explore" {
+		roleConfig = config.ConfigForTaskRole(r.Config, role, r.roleModel(role))
+	}
 	snapshot := r.buildSnapshot(userMessage, roleConfig)
 	r.LastTurnTokensOut = 0
 	r.LastTokensBudget = snapshot.TokensBudget
@@ -488,57 +784,16 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 	// the full list every turn (a) bloats context, and (b) encouraged the
 	// model to re-emit the plan via todo_write, triggering our destructive
 	// overwrite bug. Just tell it how many tasks exist and what state.
-	planBlock := ""
-	if r.Plans != nil {
-		if doc, ok, err := r.Plans.Current(); err == nil && ok {
-			summary := strings.TrimSpace(doc.Summary)
-			if summary == "" {
-				summary = "(no summary)"
-			}
-			planBlock = fmt.Sprintf("Plan document exists: %s. Call plan_get to read it before refining. Keep the executable checklist separate.", summary)
-		}
-	}
-	if r.Tasks != nil {
-		if list, err := r.Tasks.List(); err == nil && len(list) > 0 {
-			pending, inProgress, done := 0, 0, 0
-			for _, t := range list {
-				switch t.Status {
-				case "pending":
-					pending++
-				case "in_progress":
-					inProgress++
-				case "completed", "done":
-					done++
-				}
-			}
-			if pending+inProgress > 0 {
-				taskBlock := fmt.Sprintf("Checklist: %d pending, %d in progress, %d done. Call task_list to read it; use task_update to mark progress. Do NOT call todo_write unless the user asks for a fresh checklist.", pending, inProgress, done)
-				if planBlock != "" {
-					planBlock += "\n" + taskBlock
-				} else {
-					planBlock = taskBlock
-				}
-			} else {
-				taskBlock := fmt.Sprintf("Previous checklist complete (%d tasks done). Do NOT rewrite it. Respond to the user's current request.", len(list))
-				if planBlock != "" {
-					planBlock += "\n" + taskBlock
-				} else {
-					planBlock = taskBlock
-				}
-			}
-		}
-	}
+	switchedFrom := r.ModeSwitchedFrom
+	planBlock := r.planContextBlock(userMessage, switchedFrom)
 
 	// Mode handoff: when the user just switched modes, give the model an
-	// explicit one-turn signal so it adapts (e.g. plan→build should execute
-	// the existing plan, not regenerate it).
+	// explicit one-turn signal so it adapts.
 	handoff := ""
-	if r.ModeSwitchedFrom != "" && r.ModeSwitchedFrom != r.Mode {
-		handoff = fmt.Sprintf("MODE SWITCHED: %s → %s. ", strings.ToUpper(r.ModeSwitchedFrom), strings.ToUpper(r.Mode))
-		if r.ModeSwitchedFrom == "plan" && r.Mode == "build" {
-			handoff += "Execute the existing plan above without rewriting it, unless the user explicitly asks for a new plan."
-		} else if r.Mode == "plan" {
-			handoff += "Focus on plan_write for the full plan and todo_write/task_* for the executable checklist. Do not edit files. " +
+	if switchedFrom != "" && switchedFrom != r.Mode {
+		handoff = fmt.Sprintf("MODE SWITCHED: %s → %s. ", strings.ToUpper(switchedFrom), strings.ToUpper(r.Mode))
+		if r.Mode == "plan" {
+			handoff += "Focus on plan_write for the full plan and todo_write/task_* for the executable checklist. Do not edit files directly — dispatch each task to the builder subagent via execute_task. " +
 				"If the user's request leaves scope, constraints, or success criteria ambiguous, start by calling ask_user (3-6 focused questions) before drafting the plan. " +
 				"After the interview, call plan_write AND todo_write in the same turn so the user ends with both artifacts."
 		}
@@ -549,14 +804,29 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 		explorerHandoff = r.PendingExplorerContext
 		r.PendingExplorerContext = ""
 	}
+	// BUILD mode is deprecated (the planner now dispatches execute_task to the
+	// builder subagent), so PendingBuildPreflight is ignored even if legacy
+	// callers still set it. Drop it here so it can't accidentally leak into a
+	// future turn.
 	buildPreflight := ""
-	if r.Mode == "build" && strings.TrimSpace(r.PendingBuildPreflight) != "" {
-		buildPreflight = r.PendingBuildPreflight
+	if strings.TrimSpace(r.PendingBuildPreflight) != "" {
 		r.PendingBuildPreflight = ""
+	}
+	// Explore preflight is opt-in; when set, fold it into the explorerHandoff
+	// channel (tier-C block below) so the main explorer turn has the
+	// subagent fan-out findings as grounding. The plan-mode path reuses
+	// PendingExplorerContext for the same purpose.
+	if r.Mode == "explore" && strings.TrimSpace(r.PendingExplorePreflight) != "" {
+		if explorerHandoff != "" {
+			explorerHandoff += "\n\n" + r.PendingExplorePreflight
+		} else {
+			explorerHandoff = r.PendingExplorePreflight
+		}
+		r.PendingExplorePreflight = ""
 	}
 
 	messages := []llm.Message{
-		{Role: "system", Content: systemPrompt(snapshot, supportsTools, r.Mode, r.Policy)},
+		{Role: "system", Content: r.cachedSystemPrompt(supportsTools)},
 		{Role: "user", Content: userPrompt(snapshot, userMessage, planBlock, r.Mode, handoff, explorerHandoff, buildPreflight)},
 	}
 
@@ -578,7 +848,18 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 	// Build tool definitions for native mode.
 	var toolDefs []llm.ToolDef
 	if supportsTools {
-		toolDefs = r.Tools.ToolDefs(nil) // all tools
+		toolDefs = r.Tools.ToolDefs(policyToolNames(r.Policy))
+	}
+
+	// Precompute tool-definition byte size once — it doesn't change across
+	// steps within a single turn but used to be re-marshalled on every
+	// estimateRequestTokens call. O(tools * tool_size) per turn instead of
+	// per step.
+	toolsChars := 0
+	if len(toolDefs) > 0 {
+		if data, err := json.Marshal(toolDefs); err == nil {
+			toolsChars = len(data)
+		}
 	}
 
 	maxRetries := r.MaxParseRetries
@@ -589,25 +870,32 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 	lastFailedTool := ""
 	consecutiveToolFailures := 0
 	consecutiveReadOnly := 0
-	planOnlyReprompts := 0
 	planModeReprompts := 0
 
 	// Step loop: ask_user turns do NOT count toward maxSteps since they are
 	// blocked on human input, not model work. See the post-dispatch decrement
 	// below so long interviews don't starve plan_write / todo_write / edits.
 	for step := 0; step < maxSteps; step++ {
+		// Bound the growth of tool-result payloads in the step history. Keeps
+		// the last few verbatim and stubs the rest — the model can re-invoke
+		// a tool if it still needs the detail.
+		compactOldToolResults(messages, 3)
+
 		req := llm.ChatRequest{
 			Model:    model,
 			Messages: messages,
 			Tools:    toolDefs,
 		}
 
-		// Update context token count from current message history.
-		r.LastTurnTokensIn = estimateRequestTokens(req)
-		r.LastTokensUsed = r.LastTurnTokensIn
+		// Update context token count from current message history. Reuse the
+		// precomputed toolsChars so we don't re-marshal the tool definitions
+		// (unchanged across steps) on every iteration.
+		inputTokens := estimateMessageTokens(messages, toolsChars)
+		r.LastTurnTokensIn = inputTokens
+		r.LastTokensUsed = inputTokens
 
 		// Stream the response for real-time token display.
-		accumulated, toolCalls, usage, err := r.streamResponse(ctx, provider, req, step+1, events)
+		accumulated, toolCalls, usage, err := r.streamResponseWithInput(ctx, provider, req, step+1, inputTokens, events)
 		r.recordResponseUsage(accumulated, usage)
 		if err != nil {
 			events <- Event{Type: EventError, Error: err}
@@ -754,15 +1042,6 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 					continue
 				}
 			}
-			if r.Mode == "build" && planOnlyReprompts < 2 && looksLikePlanOnlyResponse(accumulated) {
-				planOnlyReprompts++
-				events <- Event{Type: EventClearStreaming}
-				messages = append(messages,
-					llm.Message{Role: "assistant", Content: accumulated},
-					llm.Message{Role: "user", Content: buildModeExecutionReprompt()},
-				)
-				continue
-			}
 			// No tool call — this is the final answer.
 			// Text was already streamed as deltas — no need to emit again.
 			events <- Event{Type: EventDone}
@@ -790,21 +1069,18 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 			step--
 		}
 
-		// No-progress stall guard: in build mode, if the agent keeps doing
-		// reconnaissance (read_file, list_files, search_*) without any
-		// mutating action (write_file, edit_file, apply_patch, todo_write,
-		// task_update, run_command, apply_plan) for 10 steps in a row,
-		// stop. Prevents the cap from being burned on aimless exploration.
-		if r.Mode == "build" {
-			if isMutatingToolCall(parsed.Call.Name) {
-				consecutiveReadOnly = 0
-			} else if isReadOnlyExploration(parsed.Call.Name) {
-				consecutiveReadOnly++
-				if consecutiveReadOnly >= 10 {
-					events <- Event{Type: EventError, Error: fmt.Errorf("stopped: 10 consecutive read-only tool calls with no edits — switch goals or call apply_patch/write_file when ready")}
-					events <- Event{Type: EventDone}
-					return
-				}
+		// No-progress stall guard: the planner should be dispatching
+		// execute_task or mutating tools (plan_write / todo_write /
+		// task_update). Long runs of read-only exploration without any of
+		// those signals an aimless loop; stop so the cap isn't burned.
+		if isMutatingToolCall(parsed.Call.Name) || parsed.Call.Name == "execute_task" {
+			consecutiveReadOnly = 0
+		} else if isReadOnlyExploration(parsed.Call.Name) {
+			consecutiveReadOnly++
+			if consecutiveReadOnly >= 10 {
+				events <- Event{Type: EventError, Error: fmt.Errorf("stopped: 10 consecutive read-only tool calls with no edits — dispatch execute_task, call plan_write / todo_write, or answer the user directly")}
+				events <- Event{Type: EventDone}
+				return
 			}
 		}
 
@@ -852,11 +1128,7 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 		}
 	}
 
-	hint := ""
-	if r.Mode == "plan" {
-		hint = " (plan mode cap; switch to build with Shift+Tab or `/mode build` for longer iterations)"
-	}
-	events <- Event{Type: EventError, Error: fmt.Errorf("agent stopped after %d steps in %s mode%s", maxSteps, r.Mode, hint)}
+	events <- Event{Type: EventError, Error: fmt.Errorf("agent stopped after %d steps in %s mode", maxSteps, r.Mode)}
 	events <- Event{Type: EventDone}
 }
 
@@ -881,6 +1153,12 @@ func isReadOnlyExploration(name string) bool {
 		return true
 	}
 	return false
+}
+
+func policyToolNames(policy SprintPolicy) []string {
+	names := append([]string{}, policy.AllowedNames()...)
+	names = append(names, policy.AskNames()...)
+	return names
 }
 
 func (r *Runtime) createPlanFromTextFallback(content string, events chan<- Event) bool {
@@ -997,7 +1275,14 @@ func stripStepPlanPrefix(line string) (string, bool) {
 // streamResponse streams the LLM response, emitting deltas and live progress to
 // the event channel, and returns the accumulated text content and any tool calls.
 func (r *Runtime) streamResponse(ctx context.Context, provider llm.Provider, req llm.ChatRequest, step int, events chan<- Event) (string, []llm.ToolCall, *llm.TokenUsage, error) {
-	inputTokens := estimateRequestTokens(req)
+	return r.streamResponseWithInput(ctx, provider, req, step, estimateRequestTokens(req), events)
+}
+
+// streamResponseWithInput is streamResponse with a precomputed input-token
+// estimate. The step loop in run() already maintains this incrementally with
+// cached tool-definition bytes, so passing it through avoids a redundant
+// walk+marshal on every step.
+func (r *Runtime) streamResponseWithInput(ctx context.Context, provider llm.Provider, req llm.ChatRequest, step, inputTokens int, events chan<- Event) (string, []llm.ToolCall, *llm.TokenUsage, error) {
 	start := time.Now()
 	var firstTokenAt time.Time
 	var text strings.Builder
@@ -1107,6 +1392,21 @@ func (r *Runtime) recordResponseUsage(content string, usage *llm.TokenUsage) {
 	}
 	r.LastTurnTokensOut += estimateTextTokens(content)
 	r.LastTokensUsed = r.LastTurnTokensIn + r.LastTurnTokensOut
+}
+
+// estimateMessageTokens counts characters across messages and folds in a
+// precomputed tools-payload byte size (produced once per turn by the caller).
+// Avoids the per-step json.Marshal of req.Tools that estimateRequestTokens
+// does on each invocation — tool defs don't change across steps in a turn.
+func estimateMessageTokens(messages []llm.Message, toolsChars int) int {
+	chars := toolsChars
+	for _, msg := range messages {
+		chars += len(msg.Role) + len(msg.Content) + len(msg.ToolCallID)
+		for _, call := range msg.ToolCalls {
+			chars += len(call.ID) + len(call.Type) + len(call.Function.Name) + len(call.Function.Arguments)
+		}
+	}
+	return estimateTokenCount(chars)
 }
 
 func estimateRequestTokens(req llm.ChatRequest) int {

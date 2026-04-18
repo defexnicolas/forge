@@ -32,6 +32,7 @@ func NewSprintPolicy() SprintPolicy {
 		"todo_write",
 		"spawn_subagent",
 		"spawn_subagents",
+		"execute_task",
 		"task_create",
 		"task_list",
 		"task_get",
@@ -65,6 +66,7 @@ func NewPlanPolicy() SprintPolicy {
 		"git_status", "git_diff",
 		"plan_write", "plan_get",
 		"todo_write", "spawn_subagent", "spawn_subagents",
+		"execute_task",
 		"task_create", "task_list", "task_get", "task_update",
 		"ask_user",
 	} {
@@ -78,7 +80,11 @@ func NewExplorePolicy() SprintPolicy {
 	for _, name := range []string{
 		"read_file", "list_files", "search_text", "search_files",
 		"git_status", "git_diff",
-		"plan_get",
+		// Read-only fan-out is consistent with explore's purpose: the
+		// subagents are themselves bound to read-only tools, so letting
+		// the main explorer delegate parallel analysis doesn't violate
+		// the mode's safety envelope.
+		"spawn_subagent", "spawn_subagents",
 	} {
 		allowed[name] = true
 	}

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"forge/internal/agent"
+	"forge/internal/tools"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -154,6 +155,88 @@ func TestScrollUpDisablesStickyBottom(t *testing.T) {
 	}
 	if !m.stickyBottom {
 		t.Fatalf("stickyBottom should be re-enabled after scrolling back to bottom")
+	}
+}
+
+func TestToolResultSurvivesClearStreaming(t *testing.T) {
+	m := newSizedLayoutModel(t, 80, 24)
+	m.appendAgentEvent(agent.Event{
+		Type:     agent.EventToolResult,
+		ToolName: "read_file",
+		Result:   &tools.Result{Summary: "first result\nimportant continuation"},
+	})
+	m.appendAgentEvent(agent.Event{Type: agent.EventAssistantDelta, Text: "draft before tool"})
+	m.appendAgentEvent(agent.Event{Type: agent.EventClearStreaming})
+
+	history := stripAnsi(strings.Join(m.history, "\n"))
+	if !strings.Contains(history, "first result") || !strings.Contains(history, "important continuation") {
+		t.Fatalf("tool result was removed by clear streaming:\n%s", history)
+	}
+	if strings.Contains(history, "draft before tool") {
+		t.Fatalf("streamed draft should have been removed:\n%s", history)
+	}
+}
+
+func TestToolResultWrapsToViewport(t *testing.T) {
+	m := newSizedLayoutModel(t, 56, 24)
+	long := "this is a very long diagnostic line that should wrap across multiple rows instead of disappearing off the right edge"
+	m.appendAgentEvent(agent.Event{
+		Type:     agent.EventToolResult,
+		ToolName: "read_file",
+		Result:   &tools.Result{Summary: long},
+	})
+
+	history := stripAnsi(strings.Join(m.history, "\n"))
+	if !strings.Contains(history, "this is a very long") ||
+		!strings.Contains(history, "instead of disappearing") {
+		t.Fatalf("wrapped content missing from history:\n%s", history)
+	}
+	if got := strings.Count(history, "         "); got < 1 {
+		t.Fatalf("expected wrapped continuation lines, got:\n%s", history)
+	}
+}
+
+func TestExplorerDoesNotAutoShowPlanPanel(t *testing.T) {
+	m := newSizedLayoutModel(t, 96, 24)
+	if err := m.agentRuntime.SetMode("explore"); err != nil {
+		t.Fatal(err)
+	}
+	m.appendAgentEvent(agent.Event{
+		Type:     agent.EventToolResult,
+		ToolName: "plan_write",
+		Result:   &tools.Result{Summary: "updated plan"},
+	})
+	if m.showPlan {
+		t.Fatal("explorer mode should not auto-show the plan panel")
+	}
+}
+
+func TestSwitchingToExploreHidesPlanPanel(t *testing.T) {
+	m := newSizedLayoutModel(t, 96, 24)
+	m.showPlan = true
+	m.recalcLayout()
+	narrowWidth := m.viewport.Width
+	_ = m.setMode("explore", "")
+	if m.showPlan {
+		t.Fatal("explore mode should hide an already-open plan panel")
+	}
+	if m.viewport.Width <= narrowWidth {
+		t.Fatalf("expected explore viewport to widen, got before=%d after=%d", narrowWidth, m.viewport.Width)
+	}
+}
+
+func TestPlanModeStillAutoShowsPlanPanel(t *testing.T) {
+	m := newSizedLayoutModel(t, 96, 24)
+	if err := m.agentRuntime.SetMode("plan"); err != nil {
+		t.Fatal(err)
+	}
+	m.appendAgentEvent(agent.Event{
+		Type:     agent.EventToolResult,
+		ToolName: "todo_write",
+		Result:   &tools.Result{Summary: "updated checklist"},
+	})
+	if !m.showPlan {
+		t.Fatal("plan mode should auto-show the plan panel after checklist updates")
 	}
 }
 

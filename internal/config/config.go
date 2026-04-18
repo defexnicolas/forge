@@ -20,9 +20,26 @@ type Config struct {
 	Models          map[string]string  `toml:"models"`
 	ModelLoading    ModelLoadingConfig `toml:"model_loading"`
 	Build           BuildConfig        `toml:"build"`
+	Explore         ExploreConfig      `toml:"explore"`
+	Plan            PlanConfig         `toml:"plan"`
 }
 
 type BuildConfig struct {
+	Subagents BuildSubagentsConfig `toml:"subagents"`
+}
+
+// ExploreConfig parameterizes explore-mode behavior. Currently only governs
+// the optional preflight fan-out: off by default so simple reads remain
+// zero-latency; flip Subagents.Enabled=true to dispatch an explorer subagent
+// before the main response.
+type ExploreConfig struct {
+	Subagents BuildSubagentsConfig `toml:"subagents"`
+}
+
+// PlanConfig parameterizes plan-mode behavior. Mirrors ExploreConfig — the
+// preflight is optional and off by default to keep the initial ask_user
+// round fast.
+type PlanConfig struct {
 	Subagents BuildSubagentsConfig `toml:"subagents"`
 }
 
@@ -90,6 +107,14 @@ type YarnConfig struct {
 	Mentions               string `toml:"mentions"`
 	CompactEvents          int    `toml:"compact_events"`
 	CompactTranscriptChars int    `toml:"compact_transcript_chars"`
+	// RenderMode controls how scored yarn nodes are materialized into the
+	// prompt. "full" emits Summary + entire Content (legacy behavior).
+	// "head" (default) emits Summary + the first RenderHeadLines lines of
+	// Content. "summary" emits only the Summary. Smaller rendering means
+	// the model re-reads detail via read_file when needed, saving tokens on
+	// every turn where the detail was not actually required.
+	RenderMode      string `toml:"render_mode"`
+	RenderHeadLines int    `toml:"render_head_lines"`
 }
 
 type YarnProfile struct {
@@ -184,6 +209,8 @@ func Defaults() Config {
 				Mentions:               "always",
 				CompactEvents:          100,
 				CompactTranscriptChars: 60000,
+				RenderMode:             "head",
+				RenderHeadLines:        40,
 			},
 			Task: TaskContextConfig{
 				BudgetTokens:  4000,
@@ -205,18 +232,41 @@ func Defaults() Config {
 			ClaudeCompatible: true,
 		},
 		ModelLoading: ModelLoadingConfig{
+			// Enabled=false keeps per-role model routing off so all main
+			// modes stay on "chat". Slot application is gated separately by
+			// ParallelSlots below and runs regardless of this flag, so the
+			// user gets parallel GEN slots on LM Studio even without opting
+			// into model-multi.
 			Strategy:      "single",
 			ParallelSlots: 2,
 		},
 		Build: BuildConfig{
 			Subagents: BuildSubagentsConfig{
-				// Disabled by default: on local single-model setups (LM Studio)
-				// running 3 preflight subagents with different role models causes
-				// load thrashing and stalls the real build turn. Enable via
-				// config when parallel inference capacity is available.
-				Enabled:     false,
-				Concurrency: 3,
+				// Enabled by default: request concurrency is independent from
+				// model-loading strategy. With single-model loading, workers
+				// reuse the current model and consume LM Studio GEN slots.
+				Enabled:     true,
+				Concurrency: 2,
 				Roles:       []string{"explorer", "reviewer", "debug"},
+			},
+		},
+		// Explore/Plan preflight default OFF. Build fan-out is universally
+		// useful before an edit; read-only analysis turns are cheap enough
+		// that auto-preflight would add more latency than value. Flip
+		// [explore.subagents] enabled=true / [plan.subagents] enabled=true
+		// in .forge/config.toml when you want the fan-out.
+		Explore: ExploreConfig{
+			Subagents: BuildSubagentsConfig{
+				Enabled:     false,
+				Concurrency: 1,
+				Roles:       []string{"explorer"},
+			},
+		},
+		Plan: PlanConfig{
+			Subagents: BuildSubagentsConfig{
+				Enabled:     false,
+				Concurrency: 1,
+				Roles:       []string{"explorer"},
 			},
 		},
 		Models: map[string]string{
@@ -279,6 +329,15 @@ func Normalize(cfg *Config) {
 	if cfg.Context.Yarn.CompactTranscriptChars <= 0 {
 		cfg.Context.Yarn.CompactTranscriptChars = defaults.Context.Yarn.CompactTranscriptChars
 	}
+	switch strings.ToLower(strings.TrimSpace(cfg.Context.Yarn.RenderMode)) {
+	case "summary", "head", "full":
+		// valid
+	default:
+		cfg.Context.Yarn.RenderMode = defaults.Context.Yarn.RenderMode
+	}
+	if cfg.Context.Yarn.RenderHeadLines <= 0 {
+		cfg.Context.Yarn.RenderHeadLines = defaults.Context.Yarn.RenderHeadLines
+	}
 	if cfg.Context.Task.BudgetTokens <= 0 {
 		cfg.Context.Task.BudgetTokens = defaults.Context.Task.BudgetTokens
 	}
@@ -291,6 +350,37 @@ func Normalize(cfg *Config) {
 	if cfg.Context.Task.HistoryEvents <= 0 {
 		cfg.Context.Task.HistoryEvents = defaults.Context.Task.HistoryEvents
 	}
+	if cfg.ModelLoading.ParallelSlots <= 0 {
+		cfg.ModelLoading.ParallelSlots = defaults.ModelLoading.ParallelSlots
+	}
+	if cfg.Build.Subagents.Concurrency <= 0 {
+		cfg.Build.Subagents.Concurrency = minPositive(cfg.ModelLoading.ParallelSlots, defaults.Build.Subagents.Concurrency)
+	}
+	if len(cfg.Build.Subagents.Roles) == 0 {
+		cfg.Build.Subagents.Roles = append([]string(nil), defaults.Build.Subagents.Roles...)
+	}
+	if cfg.Explore.Subagents.Concurrency <= 0 {
+		cfg.Explore.Subagents.Concurrency = defaults.Explore.Subagents.Concurrency
+	}
+	if len(cfg.Explore.Subagents.Roles) == 0 {
+		cfg.Explore.Subagents.Roles = append([]string(nil), defaults.Explore.Subagents.Roles...)
+	}
+	if cfg.Plan.Subagents.Concurrency <= 0 {
+		cfg.Plan.Subagents.Concurrency = defaults.Plan.Subagents.Concurrency
+	}
+	if len(cfg.Plan.Subagents.Roles) == 0 {
+		cfg.Plan.Subagents.Roles = append([]string(nil), defaults.Plan.Subagents.Roles...)
+	}
+}
+
+func minPositive(a, b int) int {
+	if a <= 0 {
+		return b
+	}
+	if b <= 0 || a < b {
+		return a
+	}
+	return b
 }
 
 func DetectedForRole(cfg Config, role, modelID string) *DetectedContext {
@@ -338,6 +428,15 @@ func ConfigForTaskRole(cfg Config, role, modelID string) Config {
 	// Task snapshots intentionally stay small even when the model was loaded
 	// with a larger detected context window.
 	out.Context.Detected = nil
+	// Subagents don't carry the parent's tier-B context: pins are a
+	// user-level signal for the main agent and would consume the task's
+	// tight 4k budget with material the worker doesn't need. Mentions in
+	// the task prompt itself still flow through normally.
+	out.Context.Yarn.Pins = "off"
+	// Subagents also get the most compact yarn rendering by default: they
+	// are read-only analysis workers and can re-read with read_file if a
+	// scored file turns out to matter.
+	out.Context.Yarn.RenderMode = "summary"
 	return out
 }
 

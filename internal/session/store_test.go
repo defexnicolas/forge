@@ -126,3 +126,48 @@ func TestStoreWritesLiveLog(t *testing.T) {
 		t.Fatalf("live log contains ANSI escapes:\n%q", log)
 	}
 }
+
+func TestContextTextCompactsPlanningArtifacts(t *testing.T) {
+	cwd := t.TempDir()
+	store, err := New(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LogUser("start planning"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LogAgentEvent(agent.Event{
+		Type:     agent.EventToolCall,
+		ToolName: "todo_write",
+		Input:    []byte(`{"items":["Create stale file","Update stale imports"]}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LogAgentEvent(agent.Event{
+		Type:     agent.EventToolResult,
+		ToolName: "todo_write",
+		Result: &tools.Result{
+			Summary: "Updated checklist:\n  [ ] Create stale file\n  [ ] Update stale imports",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LogAgentEvent(agent.Event{
+		Type:     agent.EventToolResult,
+		ToolName: "run_command",
+		Result:   &tools.Result{Summary: "go test ./... passed"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	text := store.ContextText(10)
+	if strings.Contains(text, "Create stale file") || strings.Contains(text, "Update stale imports") {
+		t.Fatalf("planning payload leaked into context:\n%s", text)
+	}
+	if !strings.Contains(text, "planning artifact updated") {
+		t.Fatalf("expected compact planning marker, got:\n%s", text)
+	}
+	if !strings.Contains(text, "go test ./... passed") {
+		t.Fatalf("expected non-planning event preserved, got:\n%s", text)
+	}
+}

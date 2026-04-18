@@ -64,6 +64,14 @@ func NewRootCommand() *cobra.Command {
 				fmt.Fprintf(cmd.OutOrStdout(), "Initialized .forge/ in %s\n\n", cwd)
 			}
 
+			// Redirect stderr to .forge/forge.log BEFORE any work that may
+			// write to it. Bubble Tea owns stdout; anything we print to
+			// stderr after this point lands in a tailable file instead of
+			// being scribbled over the TUI frame. Done at most once per
+			// process — no close hook needed, the OS reclaims the fd at
+			// exit.
+			_ = redirectStderrToLog(cwd)
+
 			cfg, err := config.Load(cwd)
 			if err != nil {
 				return err

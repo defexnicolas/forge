@@ -9,7 +9,7 @@ import (
 )
 
 func TestAllModesExist(t *testing.T) {
-	for _, name := range []string{"build", "plan", "explore"} {
+	for _, name := range []string{"plan", "explore"} {
 		mode, ok := GetMode(name)
 		if !ok {
 			t.Fatalf("mode %s should exist", name)
@@ -26,13 +26,18 @@ func TestAllModesExist(t *testing.T) {
 	}
 }
 
+func TestBuildModeRemoved(t *testing.T) {
+	if _, ok := GetMode("build"); ok {
+		t.Fatal("build mode was removed; execution now runs via the builder subagent dispatched by plan mode")
+	}
+}
+
 func TestModeNames(t *testing.T) {
 	names := ModeNames()
-	if len(names) != 3 {
-		t.Fatalf("expected 3 modes, got %d", len(names))
+	if len(names) != 2 {
+		t.Fatalf("expected 2 modes (plan + explore), got %d: %v", len(names), names)
 	}
-	// Should be sorted alphabetically.
-	expected := []string{"build", "explore", "plan"}
+	expected := []string{"explore", "plan"}
 	for i, name := range expected {
 		if names[i] != name {
 			t.Fatalf("expected mode %d to be %s, got %s (full: %v)", i, name, names[i], names)
@@ -48,8 +53,8 @@ func TestPlanModeDeniesEdits(t *testing.T) {
 			t.Fatalf("plan mode should deny %s, got %s", tool, decision)
 		}
 	}
-	// But allows reads
-	for _, tool := range []string{"read_file", "search_text", "plan_write", "plan_get", "todo_write", "spawn_subagents"} {
+	// But allows reads + the delegation primitives.
+	for _, tool := range []string{"read_file", "search_text", "plan_write", "plan_get", "todo_write", "spawn_subagents", "execute_task"} {
 		decision, _ := mode.Policy.Decision(tool)
 		if decision != ToolAllow {
 			t.Fatalf("plan mode should allow %s, got %s", tool, decision)
@@ -59,13 +64,13 @@ func TestPlanModeDeniesEdits(t *testing.T) {
 
 func TestExploreModeDeniesEverythingExceptReads(t *testing.T) {
 	mode, _ := GetMode("explore")
-	for _, tool := range []string{"edit_file", "write_file", "run_command", "spawn_subagent", "spawn_subagents", "todo_write"} {
+	for _, tool := range []string{"edit_file", "write_file", "run_command", "todo_write", "plan_get"} {
 		decision, _ := mode.Policy.Decision(tool)
 		if decision != ToolDeny {
 			t.Fatalf("explore mode should deny %s, got %s", tool, decision)
 		}
 	}
-	for _, tool := range []string{"read_file", "list_files", "search_text", "git_status"} {
+	for _, tool := range []string{"read_file", "list_files", "search_text", "git_status", "spawn_subagent", "spawn_subagents"} {
 		decision, _ := mode.Policy.Decision(tool)
 		if decision != ToolAllow {
 			t.Fatalf("explore mode should allow %s, got %s", tool, decision)
@@ -73,36 +78,24 @@ func TestExploreModeDeniesEverythingExceptReads(t *testing.T) {
 	}
 }
 
-// review, commit, debug are now subagents, not modes.
-
-func TestBuildModeAsksForEdits(t *testing.T) {
-	mode, _ := GetMode("build")
-	decision, _ := mode.Policy.Decision("edit_file")
-	if decision != ToolAsk {
-		t.Fatalf("build mode should ask for edit_file, got %s", decision)
-	}
-	decision, _ = mode.Policy.Decision("read_file")
-	if decision != ToolAllow {
-		t.Fatalf("build mode should allow read_file, got %s", decision)
-	}
-}
-
 func TestSetModeValid(t *testing.T) {
 	cwd := t.TempDir()
 	runtime := newTestRuntime(t, cwd, config.Defaults(), tools.NewRegistry(), llm.NewRegistry())
-	if runtime.Mode != "build" {
-		t.Fatalf("default mode should be build, got %s", runtime.Mode)
+	if runtime.Mode != "plan" {
+		t.Fatalf("default mode should be plan, got %s", runtime.Mode)
 	}
-	if err := runtime.SetMode("plan"); err != nil {
+	if err := runtime.SetMode("explore"); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.Mode != "explore" {
+		t.Fatalf("expected explore, got %s", runtime.Mode)
+	}
+	// Legacy "build" requests re-map silently to "plan" for backwards compat.
+	if err := runtime.SetMode("build"); err != nil {
 		t.Fatal(err)
 	}
 	if runtime.Mode != "plan" {
-		t.Fatalf("expected plan, got %s", runtime.Mode)
-	}
-	// Plan mode should deny edits
-	decision, _ := runtime.Policy.Decision("edit_file")
-	if decision != ToolDeny {
-		t.Fatalf("after SetMode(plan), edit_file should be denied, got %s", decision)
+		t.Fatalf("SetMode(build) should re-map to plan, got %s", runtime.Mode)
 	}
 }
 

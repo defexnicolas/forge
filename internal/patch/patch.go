@@ -165,6 +165,10 @@ func Diff(plan Plan) string {
 }
 
 func Apply(cwd string, plan Plan) ([]Snapshot, error) {
+	if len(plan.Operations) == 0 {
+		fmt.Fprintf(os.Stderr, "patch.Apply: plan has 0 operations — nothing to write\n")
+		return nil, nil
+	}
 	snapshots := make([]Snapshot, 0, len(plan.Operations))
 	for _, op := range plan.Operations {
 		path, err := WorkspacePath(cwd, op.Path)
@@ -192,6 +196,7 @@ func Apply(cwd string, plan Plan) ([]Snapshot, error) {
 		if err := os.WriteFile(path, []byte(op.NewText), 0o644); err != nil {
 			return nil, err
 		}
+		fmt.Fprintf(os.Stderr, "patch.Apply: wrote %s (%d bytes)\n", path, len(op.NewText))
 	}
 	return snapshots, nil
 }

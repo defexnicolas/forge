@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 
 	contextbuilder "forge/internal/context"
+	"forge/internal/llm"
 	"forge/internal/patch"
 	"forge/internal/permissions"
 	"forge/internal/plans"
@@ -23,11 +25,16 @@ func (r *Runtime) executeTool(ctx context.Context, call ToolCall, events chan<- 
 		}
 	}
 	result, observation := r.executeToolInner(ctx, call, events)
+	var changed []string
+	if result != nil {
+		changed = result.ChangedFiles
+	}
+	if len(changed) > 0 {
+		// Any file-mutating tool invalidates cached preflight findings —
+		// those were computed against pre-mutation state.
+		r.InvalidatePreflightCache()
+	}
 	if r.Hooks != nil {
-		var changed []string
-		if result != nil {
-			changed = result.ChangedFiles
-		}
 		r.Hooks.RunAfter("after:tool_call", call.Name, changed)
 		if len(changed) > 0 {
 			r.Hooks.RunAfter("after:patch", call.Name, changed)
@@ -60,6 +67,9 @@ func (r *Runtime) executeToolInner(ctx context.Context, call ToolCall, events ch
 	}
 	if canonicalName == "spawn_subagents" {
 		return r.executeSubagents(ctx, call.Input)
+	}
+	if canonicalName == "execute_task" {
+		return r.executeExecuteTask(ctx, call.Input)
 	}
 	if strings.HasPrefix(canonicalName, "plan_") {
 		return r.executePlan(canonicalName, call.Input)
@@ -119,6 +129,80 @@ func (r *Runtime) executeSubagents(ctx context.Context, input json.RawMessage) (
 		return &result, "Tool result for spawn_subagents: error: " + err.Error()
 	}
 	return &result, "Tool result for spawn_subagents:\n" + summarizeResult(result)
+}
+
+// executeExecuteTask delegates one checklist task to the "builder" subagent.
+// The builder receives ONLY the task (title + notes) and an optional
+// relevant_files hint as context — never the full plan document. This keeps
+// the editor-role prompt lean so a smaller/faster model can execute while the
+// planner (Gemma) keeps the high-level state.
+func (r *Runtime) executeExecuteTask(ctx context.Context, input json.RawMessage) (*tools.Result, string) {
+	var req struct {
+		TaskID        string   `json:"task_id"`
+		ID            string   `json:"id"` // tolerant alias
+		RelevantFiles []string `json:"relevant_files"`
+		Notes         string   `json:"notes"`
+	}
+	if err := json.Unmarshal(input, &req); err != nil {
+		result := tools.Result{Title: "execute_task", Summary: err.Error()}
+		return &result, "Tool result for execute_task: error: " + err.Error()
+	}
+	taskID := strings.TrimSpace(req.TaskID)
+	if taskID == "" {
+		taskID = strings.TrimSpace(req.ID)
+	}
+	if taskID == "" {
+		msg := "task_id is required"
+		result := tools.Result{Title: "execute_task", Summary: msg}
+		return &result, "Tool result for execute_task: error: " + msg
+	}
+	if r.Tasks == nil {
+		msg := "tasks store unavailable"
+		result := tools.Result{Title: "execute_task", Summary: msg}
+		return &result, "Tool result for execute_task: error: " + msg
+	}
+	task, err := r.Tasks.Get(taskID)
+	if err != nil {
+		result := tools.Result{Title: "execute_task", Summary: err.Error()}
+		return &result, "Tool result for execute_task: error: " + err.Error()
+	}
+	prompt := task.Title
+	if task.Notes != "" {
+		prompt += "\n\n" + task.Notes
+	}
+	if strings.TrimSpace(req.Notes) != "" {
+		prompt += "\n\nAdditional guidance:\n" + strings.TrimSpace(req.Notes)
+	}
+	contextPayload := map[string]any{
+		"task": map[string]string{
+			"id":     task.ID,
+			"title":  task.Title,
+			"status": task.Status,
+			"notes":  task.Notes,
+		},
+	}
+	if len(req.RelevantFiles) > 0 {
+		contextPayload["relevant_files"] = req.RelevantFiles
+	}
+	contextJSON, _ := json.Marshal(contextPayload)
+	subReq := SubagentRequest{
+		Agent:   "builder",
+		Prompt:  prompt,
+		Context: contextJSON,
+	}
+	result, err := r.RunSubagent(ctx, subReq)
+	if err != nil {
+		out := tools.Result{Title: "execute_task", Summary: err.Error()}
+		return &out, "Tool result for execute_task: error: " + err.Error()
+	}
+	summary := fmt.Sprintf("builder completed task %s: %s", task.ID, result.Summary)
+	out := tools.Result{
+		Title:        "execute_task",
+		Summary:      summary,
+		Content:      result.Content,
+		ChangedFiles: result.ChangedFiles,
+	}
+	return &out, "Tool result for execute_task:\n" + summarizeResult(out)
 }
 
 func (r *Runtime) executeTodoWrite(input json.RawMessage) (*tools.Result, string) {
@@ -467,9 +551,20 @@ func (r *Runtime) requestApproval(ctx context.Context, toolName string, input js
 			result := tools.Result{Title: toolName, Summary: "rejected by user"}
 			return &result, "Tool result for " + toolName + ": rejected by user"
 		}
+		if len(request.plan.Operations) == 0 {
+			// This can happen when prepareMutation succeeded structurally
+			// (no Unmarshal error) but the resulting plan had no
+			// operations — e.g. a patch with zero hunks. Surface it
+			// explicitly instead of silently "approving" a no-op.
+			msg := "no file operations in plan — nothing to apply"
+			fmt.Fprintf(os.Stderr, "approval-apply skipped (%s): %s\n", toolName, msg)
+			result := tools.Result{Title: toolName, Summary: msg}
+			return &result, "Tool result for " + toolName + ": " + msg
+		}
 		snapshots, err := patch.Apply(r.CWD, request.plan)
 		if err != nil {
-			result := tools.Result{Title: toolName, Summary: err.Error()}
+			fmt.Fprintf(os.Stderr, "approval-apply failed (%s): %v — plan had %d op(s)\n", toolName, err, len(request.plan.Operations))
+			result := tools.Result{Title: toolName, Summary: "apply failed: " + err.Error()}
 			return &result, "Tool result for " + toolName + ": error: " + err.Error()
 		}
 		r.mu.Lock()
@@ -710,6 +805,36 @@ func (r *Runtime) completeMatchingTask(summary string) {
 	}
 }
 
+// compactOldToolResults stubs all tool-role messages except the last `keep`,
+// replacing their content with a short marker. Tool results are the single
+// largest growing fraction of prompt tokens on long agent runs — a single
+// read_file can push 10k tokens that stay in the context for the rest of
+// the turn-chain. The model can re-invoke the tool if it needs the detail
+// again; that's cheaper than paying to re-prefill the old result on every
+// subsequent step.
+func compactOldToolResults(messages []llm.Message, keep int) {
+	if keep < 0 {
+		keep = 0
+	}
+	toolIdx := make([]int, 0, len(messages))
+	for i, m := range messages {
+		if m.Role == "tool" {
+			toolIdx = append(toolIdx, i)
+		}
+	}
+	if len(toolIdx) <= keep {
+		return
+	}
+	stubCount := len(toolIdx) - keep
+	for i := 0; i < stubCount; i++ {
+		idx := toolIdx[i]
+		if strings.HasPrefix(messages[idx].Content, "[compacted]") {
+			continue
+		}
+		messages[idx].Content = "[compacted] earlier tool result omitted — re-call the tool if you need the content again."
+	}
+}
+
 func summarizeResult(result tools.Result) string {
 	payload, err := json.Marshal(result)
 	if err != nil {
@@ -722,7 +847,7 @@ func summarizeResult(result tools.Result) string {
 	return string(payload)
 }
 
-func systemPrompt(snapshot contextbuilder.Snapshot, nativeToolCalling bool, modeName string, policy SprintPolicy) string {
+func systemPrompt(nativeToolCalling bool, modeName string, policy SprintPolicy) string {
 	modePrefix := ""
 	if mode, ok := GetMode(modeName); ok && modeName != "build" {
 		modePrefix = mode.Prompt + "\n\n"
@@ -798,25 +923,56 @@ If you have enough information, answer normally without calling a tool.`)
 	return strings.TrimSpace(b.String())
 }
 
+// userPrompt assembles the user-role message as a tiered prompt, ordered
+// strictly stable → session → turn → user request. The first two tiers are
+// byte-identical across consecutive turns within a session while their source
+// items do not change, so LM Studio's token-level prompt cache hits the
+// entire prefix and only re-prefills tier C plus the fresh user request.
+// Everything volatile (yarn-scored context, handoffs, the user message
+// itself) is pushed to the tail.
 func userPrompt(snapshot contextbuilder.Snapshot, userMessage, planBlock, mode, handoff, explorerHandoff, buildPreflight string) string {
-	modeTag := ""
-	if mode != "" {
-		modeTag = fmt.Sprintf("[mode: %s]\n", strings.ToUpper(mode))
+	var b strings.Builder
+
+	b.WriteString("=== STABLE CONTEXT ===\n")
+	b.WriteString(snapshot.RenderStable())
+	b.WriteString("\n\n")
+
+	if session := snapshot.RenderSession(); session != "" {
+		b.WriteString("=== SESSION CONTEXT ===\n")
+		b.WriteString(session)
+		b.WriteString("\n\n")
 	}
-	prompt := modeTag + "Context snapshot:\n" + snapshot.Render() + "\n\nUser request:\n" + userMessage
-	if planBlock != "" {
-		prompt += "\n\n" + planBlock
+
+	b.WriteString("=== TURN CONTEXT ===\n")
+	if turn := snapshot.RenderTurn(); turn != "" {
+		b.WriteString(turn)
+		b.WriteString("\n")
 	}
-	if handoff != "" {
-		prompt += "\n\n" + handoff
+	if strings.TrimSpace(planBlock) != "" {
+		b.WriteString("\n")
+		b.WriteString(strings.TrimSpace(planBlock))
+		b.WriteString("\n")
+	}
+	if strings.TrimSpace(handoff) != "" {
+		b.WriteString("\n")
+		b.WriteString(strings.TrimSpace(handoff))
+		b.WriteString("\n")
 	}
 	if strings.TrimSpace(explorerHandoff) != "" {
-		prompt += "\n\nEXPLORER FINDINGS:\n" + strings.TrimSpace(explorerHandoff) +
-			"\n\nUse the explorer findings to confirm repository facts and create or refine the full plan document. Do not edit files. Use plan_write for the detailed plan and todo_write/task_* for the executable checklist."
+		b.WriteString("\nEXPLORER FINDINGS:\n")
+		b.WriteString(strings.TrimSpace(explorerHandoff))
+		b.WriteString("\nUse the explorer findings to confirm repository facts and create or refine the full plan document. Do not edit files. Use plan_write for the detailed plan and todo_write/task_* for the executable checklist.\n")
 	}
 	if strings.TrimSpace(buildPreflight) != "" {
-		prompt += "\n\nBUILD PREFLIGHT FINDINGS:\n" + strings.TrimSpace(buildPreflight) +
-			"\n\nUse these read-only subagent findings to execute the existing plan. Do not rerun the same preflight unless new information is required."
+		b.WriteString("\nBUILD PREFLIGHT FINDINGS:\n")
+		b.WriteString(strings.TrimSpace(buildPreflight))
+		b.WriteString("\nUse these read-only subagent findings to execute the existing plan. Do not rerun the same preflight unless new information is required.\n")
 	}
-	return prompt
+
+	if mode != "" {
+		fmt.Fprintf(&b, "\nMode: %s\n", strings.ToUpper(mode))
+	}
+	b.WriteString("\n=== USER REQUEST ===\n")
+	b.WriteString(userMessage)
+	return b.String()
 }

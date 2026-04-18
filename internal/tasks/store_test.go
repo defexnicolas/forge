@@ -52,3 +52,39 @@ func TestReplacePlan(t *testing.T) {
 		t.Fatalf("unexpected plan ids %#v", plan)
 	}
 }
+
+func TestClearRemovesTasks(t *testing.T) {
+	store := New(t.TempDir())
+	t.Cleanup(func() { store.Close() })
+	if _, err := store.ReplacePlan([]string{"first", "second"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Clear(); err != nil {
+		t.Fatal(err)
+	}
+	list, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("expected cleared tasks, got %#v", list)
+	}
+}
+
+func TestReplacePlanRejectsAccidentalEmptyOverwrite(t *testing.T) {
+	store := New(t.TempDir())
+	t.Cleanup(func() { store.Close() })
+	if _, err := store.ReplacePlan([]string{"first"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ReplacePlan(nil); err == nil {
+		t.Fatal("expected empty overwrite to be rejected")
+	}
+	list, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].Title != "first" {
+		t.Fatalf("expected existing task preserved, got %#v", list)
+	}
+}

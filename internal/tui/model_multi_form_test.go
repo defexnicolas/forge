@@ -25,23 +25,39 @@ func TestModelMultiFormAssignsAgentRoleModels(t *testing.T) {
 	}
 
 	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // strategy: single
+
+	// Role 0 (EXPLORER): no prior selections and no models reported as
+	// State="loaded", so the reuse step is skipped — straight to the
+	// model picker.
 	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // explorer: first model
 	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // keep current
 
+	// Role 1 (PLAN): the reuse step now appears with "explore-model (from
+	// EXPLORER)" + "Pick a different model". We want the second model, so
+	// Down -> Pick a different model -> then navigate in the model form.
+	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyDown})  // cursor -> "Pick different"
+	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // enter model picker
 	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyDown})
 	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // plan: second model
 	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // keep current
 
+	// Role 2 (BUILDER): reuse step now has 2 options + "Pick different".
+	// Same pattern: skip to picker, pick third model.
+	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // into picker
 	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyDown})
 	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyDown})
 	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // builder: third model
 	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // keep current
 
-	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // reviewer: first model
-	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // keep current
+	// Role 3 (REVIEWER): reuse explore-model (first option) — this
+	// validates the reuse-by-session path without going through the
+	// picker or triggering another load.
+	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // reuse first option (explore-model)
 
-	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // summarizer: first model
-	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // keep current
+	// Role 4 (SUMMARIZER): same — reuse explore-model.
+	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // reuse first option (explore-model)
 
 	if m.activeForm != formNone {
 		t.Fatalf("activeForm = %v, want formNone", m.activeForm)

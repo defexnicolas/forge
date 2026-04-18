@@ -178,7 +178,7 @@ func (b *Builder) buildYarn(userMessage string, snapshot Snapshot, opts BuildOpt
 		snapshot.Items = append(snapshot.Items, Item{
 			Kind:    "yarn:" + node.Kind,
 			Path:    node.Path,
-			Content: renderYarnNode(node),
+			Content: renderYarnNode(node, b.Config.Context.Yarn.RenderMode, b.Config.Context.Yarn.RenderHeadLines),
 			Source:  "yarn",
 			Mode:    "scored",
 		})
@@ -343,7 +343,7 @@ func (b *Builder) enforceTokenBudget(snapshot Snapshot) Snapshot {
 	return snapshot
 }
 
-func renderYarnNode(node yarn.Node) string {
+func renderYarnNode(node yarn.Node, mode string, headLines int) string {
 	var b strings.Builder
 	if node.Summary != "" {
 		fmt.Fprintf(&b, "Summary: %s\n", node.Summary)
@@ -351,14 +351,76 @@ func renderYarnNode(node yarn.Node) string {
 	if len(node.Links) > 0 {
 		fmt.Fprintf(&b, "Links: %s\n", strings.Join(node.Links, ", "))
 	}
-	b.WriteString(node.Content)
-	if !strings.HasSuffix(node.Content, "\n") {
-		b.WriteByte('\n')
+	switch strings.ToLower(mode) {
+	case "summary":
+		// Summary-only: the model can re-read via read_file when it needs
+		// detail. Biggest token savings, at the cost of possibly one extra
+		// turn when the model actually needs the body.
+	case "full":
+		b.WriteString(node.Content)
+		if node.Content != "" && !strings.HasSuffix(node.Content, "\n") {
+			b.WriteByte('\n')
+		}
+	default: // "head"
+		b.WriteString(headLinesOf(node.Content, headLines))
 	}
 	return b.String()
 }
 
-func (s Snapshot) Render() string {
+// headLinesOf returns the first n lines of content plus a truncation marker
+// if the content was longer. Used for the "head" yarn render mode to give
+// the model enough signal to decide whether to read_file for the rest.
+func headLinesOf(content string, n int) string {
+	if content == "" {
+		return ""
+	}
+	if n <= 0 {
+		n = 40
+	}
+	lines := strings.SplitN(content, "\n", n+1)
+	if len(lines) <= n {
+		if !strings.HasSuffix(content, "\n") {
+			return content + "\n"
+		}
+		return content
+	}
+	head := strings.Join(lines[:n], "\n")
+	return head + "\n[...truncated — call read_file for full content...]\n"
+}
+
+// tierForItem maps an Item to one of three tiers used for prompt assembly:
+// "stable" (cacheable multi-turn: project_state, skills, instructions),
+// "session" (stable within session until pins/mentions change), and "turn"
+// (volatile, yarn-scored or anything else). Classification is by Source for
+// robustness — item.Mode gets rewritten mid-pipeline.
+func tierForItem(item Item) string {
+	switch item.Source {
+	case "projectstate", "skill", "instructions":
+		return "stable"
+	case "pin", "mention":
+		return "session"
+	default:
+		return "turn"
+	}
+}
+
+func renderItem(b *strings.Builder, item Item) {
+	fmt.Fprintf(b, "\n[%s] %s\n", item.Kind, item.Path)
+	if item.Error != "" {
+		fmt.Fprintf(b, "Error: %s\n", item.Error)
+		return
+	}
+	b.WriteString(item.Content)
+	if !strings.HasSuffix(item.Content, "\n") {
+		b.WriteByte('\n')
+	}
+}
+
+// renderHeader emits the session-stable identity block. Includes the static
+// per-mode token budget (byte-stable within a mode+session) but NOT the
+// per-turn usage — that field changes every turn and would bust the prefix
+// cache on every call. Display token usage in the UI, not in the prompt.
+func (s Snapshot) renderHeader() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "CWD: %s\n", s.CWD)
 	fmt.Fprintf(&b, "Provider: %s\n", s.Provider)
@@ -367,19 +429,62 @@ func (s Snapshot) Render() string {
 	}
 	fmt.Fprintf(&b, "Context engine: %s\n", s.ContextEngine)
 	if s.TokensBudget > 0 {
-		fmt.Fprintf(&b, "Tokens: %d/%d\n", s.TokensUsed, s.TokensBudget)
+		fmt.Fprintf(&b, "Tokens: 0/%d\n", s.TokensBudget)
 	}
 	fmt.Fprintf(&b, "Read-only tools: %s\n", strings.Join(s.ReadOnlyToolNames, ", "))
+	return b.String()
+}
+
+// RenderStable returns the tier-A block: identity header + stable items
+// (project snapshot, installed skills, root AGENTS.md). Byte-identical across
+// turns within a session; sits at the top of the user prompt so LM Studio's
+// prompt cache can reuse tokens turn over turn.
+func (s Snapshot) RenderStable() string {
+	var b strings.Builder
+	b.WriteString(s.renderHeader())
 	for _, item := range s.Items {
-		fmt.Fprintf(&b, "\n[%s] %s\n", item.Kind, item.Path)
-		if item.Error != "" {
-			fmt.Fprintf(&b, "Error: %s\n", item.Error)
+		if tierForItem(item) != "stable" {
 			continue
 		}
-		b.WriteString(item.Content)
-		if !strings.HasSuffix(item.Content, "\n") {
-			b.WriteByte('\n')
+		renderItem(&b, item)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// RenderSession returns the tier-B block: pins and mentions. Stable across
+// turns until pins change or a new mention appears.
+func (s Snapshot) RenderSession() string {
+	var b strings.Builder
+	for _, item := range s.Items {
+		if tierForItem(item) != "session" {
+			continue
 		}
+		renderItem(&b, item)
+	}
+	return strings.TrimLeft(strings.TrimRight(b.String(), "\n"), "\n")
+}
+
+// RenderTurn returns the tier-C block: yarn-scored nodes and anything else
+// not classified as stable or session. Expected to change every turn.
+func (s Snapshot) RenderTurn() string {
+	var b strings.Builder
+	for _, item := range s.Items {
+		if tierForItem(item) != "turn" {
+			continue
+		}
+		renderItem(&b, item)
+	}
+	return strings.TrimLeft(strings.TrimRight(b.String(), "\n"), "\n")
+}
+
+// Render emits the legacy all-in-one rendering. Kept for SharedTaskContext
+// and subagent snapshots where tier separation is not needed. New callers
+// should use RenderStable / RenderSession / RenderTurn directly.
+func (s Snapshot) Render() string {
+	var b strings.Builder
+	b.WriteString(s.renderHeader())
+	for _, item := range s.Items {
+		renderItem(&b, item)
 	}
 	return strings.TrimSpace(b.String())
 }

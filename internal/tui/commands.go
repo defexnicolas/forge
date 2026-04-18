@@ -24,6 +24,15 @@ func (m *model) handleModelCommand(fields []string) string {
 		switch fields[1] {
 		case "list":
 			return m.listModels()
+		case "reload":
+			ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+			defer cancel()
+			modelID, err := m.agentRuntime.ReloadCurrentModel(ctx)
+			if err != nil {
+				return t.ErrorStyle.Render("Model reload failed: " + err.Error())
+			}
+			return t.Success.Render(fmt.Sprintf("Model reloaded: %s", modelID)) +
+				t.Muted.Render(fmt.Sprintf(" (parallel_slots=%d)", m.agentRuntime.Config.ModelLoading.ParallelSlots))
 		case "set":
 			if len(fields) < 3 {
 				return "Usage: /model set <model-name>"
@@ -145,6 +154,8 @@ func (m model) describeStatus() string {
 		{"provider", m.options.Config.Providers.Default.Name},
 		{"model", currentModelName(m)},
 		{"model_loading", fmt.Sprintf("%t/%s", m.options.Config.ModelLoading.Enabled, m.options.Config.ModelLoading.Strategy)},
+		{"parallel_slots", fmt.Sprintf("%d", m.options.Config.ModelLoading.ParallelSlots)},
+		{"build_subagents", fmt.Sprintf("%t/concurrency=%d", m.options.Config.Build.Subagents.Enabled, m.options.Config.Build.Subagents.Concurrency)},
 		{"model_roles", formatModelRoles(m.options.Config.Models)},
 		{"session", sessionID},
 		{"command_profile", commandProfileName(m.agentRuntime.Commands)},
@@ -189,6 +200,10 @@ func (m model) describeConfig() string {
 		{"providers.lmstudio.supports_tools", fmt.Sprintf("%t", cfg.Providers.LMStudio.SupportsTools)},
 		{"model_loading.enabled", fmt.Sprintf("%t", cfg.ModelLoading.Enabled)},
 		{"model_loading.strategy", cfg.ModelLoading.Strategy},
+		{"model_loading.parallel_slots", fmt.Sprintf("%d", cfg.ModelLoading.ParallelSlots)},
+		{"build.subagents.enabled", fmt.Sprintf("%t", cfg.Build.Subagents.Enabled)},
+		{"build.subagents.concurrency", fmt.Sprintf("%d", cfg.Build.Subagents.Concurrency)},
+		{"build.subagents.roles", strings.Join(cfg.Build.Subagents.Roles, ", ")},
 		{"context.engine", cfg.Context.Engine},
 		{"context.budget_tokens", fmt.Sprintf("%d", cfg.Context.BudgetTokens)},
 		{"context.task.budget_tokens", fmt.Sprintf("%d", cfg.Context.Task.BudgetTokens)},
@@ -343,7 +358,7 @@ func (m *model) handlePlanCommand(fields []string) string {
 			}
 		}
 		if m.agentRuntime.Tasks != nil {
-			if _, err := m.agentRuntime.Tasks.ReplacePlan(nil); err != nil {
+			if err := m.agentRuntime.Tasks.Clear(); err != nil {
 				return m.theme.ErrorStyle.Render("Clear todos failed: " + err.Error())
 			}
 		}
@@ -701,6 +716,10 @@ func (m *model) setMode(name, goal string) string {
 		m.agentRunning = true
 		m.pendingCommand = waitForAgentEvent(m.agentEvents)
 		return m.theme.Success.Render("Entering plan mode — starting interview...")
+	}
+	if name == "explore" && m.showPlan {
+		m.showPlan = false
+		m.recalcLayout()
 	}
 	// Mode shown in status bar; no inline message.
 	return ""

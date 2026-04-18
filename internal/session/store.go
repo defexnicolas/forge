@@ -365,6 +365,7 @@ func (s *Store) ContextText(limit int) string {
 	if len(events) == 0 {
 		return FormatTail(events)
 	}
+	events = contextEvents(events)
 	return "Session summary:\n" + Summarize(events) + "\n\nRecent timeline:\n" + FormatTail(events)
 }
 
@@ -421,6 +422,39 @@ func FormatTail(events []Event) string {
 		}
 	}
 	return strings.TrimSpace(b.String())
+}
+
+func contextEvents(events []Event) []Event {
+	out := make([]Event, 0, len(events))
+	for _, event := range events {
+		out = append(out, compactPlanningEvent(event))
+	}
+	return out
+}
+
+func compactPlanningEvent(event Event) Event {
+	if !isPlanningArtifactTool(event.ToolName) {
+		return event
+	}
+	event.Input = nil
+	event.Diff = ""
+	event.Text = ""
+	switch event.Type {
+	case agent.EventToolCall:
+		event.Summary = "planning tool call compacted; use plan_get/task_list for current state"
+	case agent.EventToolResult:
+		event.Summary = "planning artifact updated; use plan_get/task_list for current state"
+	}
+	return event
+}
+
+func isPlanningArtifactTool(toolName string) bool {
+	switch toolName {
+	case "plan_write", "plan_get", "todo_write", "task_list":
+		return true
+	default:
+		return false
+	}
 }
 
 func Summarize(events []Event) string {

@@ -13,6 +13,12 @@ func TestDefaultsUseRecommendedYarnProfile(t *testing.T) {
 	if cfg.ModelLoading.Enabled {
 		t.Fatal("model_loading.enabled should default to false")
 	}
+	if cfg.ModelLoading.ParallelSlots != 2 {
+		t.Fatalf("parallel_slots = %d, want 2", cfg.ModelLoading.ParallelSlots)
+	}
+	if !cfg.Build.Subagents.Enabled || cfg.Build.Subagents.Concurrency != 2 {
+		t.Fatalf("unexpected build subagent defaults: %#v", cfg.Build.Subagents)
+	}
 	if cfg.Context.Yarn.Profile != "9B" {
 		t.Fatalf("profile = %q, want 9B", cfg.Context.Yarn.Profile)
 	}
@@ -51,6 +57,9 @@ func TestNormalizeBackfillsMultiModelDefaults(t *testing.T) {
 	if cfg.Context.Task.BudgetTokens != 4000 || cfg.Context.Task.MaxNodes != 6 {
 		t.Fatalf("expected task context defaults, got %#v", cfg.Context.Task)
 	}
+	if cfg.Build.Subagents.Concurrency != 2 || len(cfg.Build.Subagents.Roles) == 0 {
+		t.Fatalf("expected build concurrency defaults, got %#v", cfg.Build.Subagents)
+	}
 }
 
 func TestConfigForTaskRoleUsesSmallContext(t *testing.T) {
@@ -80,6 +89,22 @@ func TestConfigForTaskRoleUsesSmallContext(t *testing.T) {
 	}
 	if taskCfg.Context.Detected != nil {
 		t.Fatalf("task context should not inherit detected large window: %#v", taskCfg.Context.Detected)
+	}
+}
+
+func TestNormalizeDerivesBuildConcurrencyFromParallelSlots(t *testing.T) {
+	cfg := Config{
+		Models: map[string]string{"chat": "qwen"},
+		ModelLoading: ModelLoadingConfig{
+			ParallelSlots: 4,
+		},
+	}
+	Normalize(&cfg)
+	if cfg.Build.Subagents.Concurrency != 2 {
+		t.Fatalf("concurrency = %d, want capped default 2", cfg.Build.Subagents.Concurrency)
+	}
+	if len(cfg.Build.Subagents.Roles) == 0 {
+		t.Fatalf("expected default build subagent roles")
 	}
 }
 

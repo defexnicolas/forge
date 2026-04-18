@@ -9,15 +9,17 @@ import (
 
 	"forge/internal/config"
 	"forge/internal/llm"
+	"forge/internal/plans"
 	"forge/internal/tools"
 )
 
 // fakeProvider simulates a text-based (non-tool-calling) provider.
 type fakeProvider struct {
-	responses []string
-	requests  []llm.ChatRequest
-	loads     []string
-	calls     int
+	responses   []string
+	requests    []llm.ChatRequest
+	loads       []string
+	loadConfigs []llm.LoadConfig
+	calls       int
 }
 
 func (f *fakeProvider) Name() string { return "fake" }
@@ -51,6 +53,7 @@ func (f *fakeProvider) ProbeModel(ctx context.Context, id string) (*llm.ModelInf
 }
 func (f *fakeProvider) LoadModel(ctx context.Context, id string, cfg llm.LoadConfig) error {
 	f.loads = append(f.loads, id)
+	f.loadConfigs = append(f.loadConfigs, cfg)
 	return nil
 }
 
@@ -137,41 +140,95 @@ func TestRuntimeReadsFileThenAnswers(t *testing.T) {
 	}
 }
 
-func TestRuntimeRepromptsBuildModePlanOnlyResponse(t *testing.T) {
+func TestPlanPromptIncludesActiveChecklistWithExecuteTaskGuidance(t *testing.T) {
 	cwd := t.TempDir()
 	cfg := config.Defaults()
 	cfg.Providers.Default.Name = "fake"
-	cfg.Models["chat"] = "Qwen3-Coder-30B-A3B"
 	registry := tools.NewRegistry()
 	tools.RegisterBuiltins(registry)
-	provider := &fakeProvider{responses: []string{
-		"[ ] Create index.html\n[ ] Implement script.js\n[ ] Develop Snake.js\n\n[>] Planning complete. Next steps involve creating files.",
-		`<tool_call>{"name":"list_files","input":{}}</tool_call>`,
-		"done",
-	}}
+	provider := &fakeProvider{responses: []string{"done"}}
 	providers := llm.NewRegistry()
 	providers.Register(provider)
 
 	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
-	var sawClear bool
-	var sawListFiles bool
-	for event := range runtime.Run(context.Background(), "create the game portal") {
-		if event.Type == EventClearStreaming {
-			sawClear = true
-		}
-		if event.Type == EventToolResult && event.ToolName == "list_files" {
-			sawListFiles = true
-		}
+	if _, err := runtime.Plans.Save(plans.Document{Summary: "active portal plan"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Tasks.ReplacePlan([]string{"Create portal"}); err != nil {
+		t.Fatal(err)
 	}
 
-	if provider.calls < 2 {
-		t.Fatalf("expected plan-only response to be reprompted, provider calls = %d", provider.calls)
+	for range runtime.Run(context.Background(), "continue") {
 	}
-	if !sawClear {
-		t.Fatal("expected plan-only streamed response to be cleared")
+	prompt := provider.requests[0].Messages[1].Content
+	if !strings.Contains(prompt, "Plan document exists: active portal plan") ||
+		!strings.Contains(prompt, "Active checklist: 1 pending, 0 in progress, 0 done") ||
+		!strings.Contains(prompt, "execute_task") {
+		t.Fatalf("expected active checklist guidance with execute_task, got:\n%s", prompt)
 	}
-	if !sawListFiles {
-		t.Fatal("expected second response tool call to execute")
+}
+
+func TestPlanPromptIncludesExistingPlanForRefinement(t *testing.T) {
+	cwd := t.TempDir()
+	cfg := config.Defaults()
+	cfg.Providers.Default.Name = "fake"
+	registry := tools.NewRegistry()
+	tools.RegisterBuiltins(registry)
+	provider := &fakeProvider{responses: []string{"done"}}
+	providers := llm.NewRegistry()
+	providers.Register(provider)
+
+	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+	if _, err := runtime.Plans.Save(plans.Document{Summary: "refactor plan"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Tasks.ReplacePlan([]string{"Move code"}); err != nil {
+		t.Fatal(err)
+	}
+	for range runtime.Run(context.Background(), "refine it") {
+	}
+	prompt := provider.requests[0].Messages[1].Content
+	if !strings.Contains(prompt, "Plan document exists: refactor plan") ||
+		!strings.Contains(prompt, "Active checklist: 1 pending, 0 in progress, 0 done") {
+		t.Fatalf("expected existing plan in plan prompt, got:\n%s", prompt)
+	}
+}
+
+func TestExplorePromptUsesCompactContextAndSkipsPlanPointers(t *testing.T) {
+	cwd := t.TempDir()
+	cfg := config.Defaults()
+	cfg.Providers.Default.Name = "fake"
+	cfg.Context.BudgetTokens = 9000
+	cfg.Context.Task.BudgetTokens = 1234
+	registry := tools.NewRegistry()
+	tools.RegisterBuiltins(registry)
+	provider := &fakeProvider{responses: []string{"done"}}
+	providers := llm.NewRegistry()
+	providers.Register(provider)
+
+	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+	if _, err := runtime.Plans.Save(plans.Document{Summary: "stale menu plan"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Tasks.ReplacePlan([]string{"Old task"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.SetMode("explore"); err != nil {
+		t.Fatal(err)
+	}
+
+	for range runtime.Run(context.Background(), "analyze the project") {
+	}
+	if len(provider.requests) == 0 {
+		t.Fatal("expected provider request")
+	}
+	prompt := provider.requests[0].Messages[1].Content
+	if !strings.Contains(prompt, "Tokens: 0/1234") {
+		t.Fatalf("expected compact explore token budget, got:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "stale menu plan") || strings.Contains(prompt, "Old task") ||
+		strings.Contains(prompt, "Plan document exists") || strings.Contains(prompt, "Checklist:") {
+		t.Fatalf("explore prompt leaked plan/checklist state:\n%s", prompt)
 	}
 }
 
@@ -205,7 +262,10 @@ func TestRuntimeInjectsExplorerHandoffIntoPlanOnce(t *testing.T) {
 	}
 }
 
-func TestRuntimeInjectsBuildPreflightOnce(t *testing.T) {
+// TestBuildPreflightDroppedForDeprecatedBuildMode asserts the legacy
+// PendingBuildPreflight field is cleared on entry without leaking into the
+// prompt — build mode no longer exists, the planner delegates to execute_task.
+func TestBuildPreflightDroppedForDeprecatedBuildMode(t *testing.T) {
 	cwd := t.TempDir()
 	cfg := config.Defaults()
 	cfg.Providers.Default.Name = "fake"
@@ -216,25 +276,15 @@ func TestRuntimeInjectsBuildPreflightOnce(t *testing.T) {
 	providers.Register(provider)
 
 	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
-	if err := runtime.SetMode("plan"); err != nil {
-		t.Fatal(err)
-	}
-	if err := runtime.SetMode("build"); err != nil {
-		t.Fatal(err)
-	}
-	runtime.PendingBuildPreflight = "explorer found files\nreviewer found risks"
+	runtime.PendingBuildPreflight = "stale explorer output"
 	for range runtime.Run(context.Background(), "execute") {
 	}
 	if runtime.PendingBuildPreflight != "" {
-		t.Fatalf("expected preflight consumed, got %q", runtime.PendingBuildPreflight)
-	}
-	if len(provider.requests) == 0 {
-		t.Fatal("expected provider request")
+		t.Fatalf("expected legacy preflight to be dropped, got %q", runtime.PendingBuildPreflight)
 	}
 	prompt := provider.requests[0].Messages[1].Content
-	if !strings.Contains(prompt, "BUILD PREFLIGHT FINDINGS:") ||
-		!strings.Contains(prompt, "explorer found files") {
-		t.Fatalf("expected preflight in prompt, got:\n%s", prompt)
+	if strings.Contains(prompt, "BUILD PREFLIGHT FINDINGS:") || strings.Contains(prompt, "stale explorer output") {
+		t.Fatalf("legacy build preflight leaked into prompt:\n%s", prompt)
 	}
 }
 
@@ -424,15 +474,12 @@ func TestRuntimeUsesRoleModelsWhenModelMultiEnabled(t *testing.T) {
 	provider := &fakeProvider{responses: []string{
 		`<tool_call>{"name":"todo_write","input":{"items":["Plan task"]}}</tool_call>`,
 		"Plan summary.",
-		"built",
 	}}
 	providers := llm.NewRegistry()
 	providers.Register(provider)
 	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
 
-	if err := runtime.SetMode("plan"); err != nil {
-		t.Fatal(err)
-	}
+	// Default mode is "plan" → uses the planner role model.
 	for range runtime.Run(context.Background(), "plan it") {
 	}
 	if len(provider.requests) == 0 || provider.requests[0].Model != "plan-model" {
@@ -440,18 +487,6 @@ func TestRuntimeUsesRoleModelsWhenModelMultiEnabled(t *testing.T) {
 	}
 	if provider.loads[0] != "plan-model" {
 		t.Fatalf("plan load = %#v, want plan-model first", provider.loads)
-	}
-
-	if err := runtime.SetMode("build"); err != nil {
-		t.Fatal(err)
-	}
-	for range runtime.Run(context.Background(), "build it") {
-	}
-	if len(provider.requests) < 3 || provider.requests[len(provider.requests)-1].Model != "build-model" {
-		t.Fatalf("build request model = %#v, want build-model", provider.requests)
-	}
-	if provider.loads[len(provider.loads)-1] != "build-model" {
-		t.Fatalf("build load = %#v, want build-model last", provider.loads)
 	}
 }
 
@@ -478,8 +513,11 @@ func TestRuntimeUsesChatForMainModesUntilModelMultiEnabled(t *testing.T) {
 	if len(provider.requests) == 0 || provider.requests[0].Model != "chat-model" {
 		t.Fatalf("request model = %#v, want chat-model", provider.requests)
 	}
-	if len(provider.loads) != 0 {
-		t.Fatalf("expected no auto-load before model-multi, got %#v", provider.loads)
+	// Without model-multi, per-role routing stays off and main modes keep
+	// using the chat model. Forge still issues one startup load so
+	// ParallelSlots reaches LM Studio (GEN slots wouldn't apply otherwise).
+	if len(provider.loads) != 1 || provider.loads[0] != "chat-model" {
+		t.Fatalf("expected exactly one startup slot-apply load on chat-model, got %#v", provider.loads)
 	}
 }
 
@@ -509,14 +547,14 @@ func TestExplorerSubagentUsesExplorerModelRole(t *testing.T) {
 
 // Under strategy="single" a subagent must NOT swap models; it runs on the
 // model loaded for the current mode so LM Studio doesn't thrash. The default
-// mode is "build" which resolves to the "editor" role.
+// mode is now "plan" which resolves to the "planner" role.
 func TestSingleStrategySubagentReusesCurrentModel(t *testing.T) {
 	cwd := t.TempDir()
 	cfg := config.Defaults()
 	cfg.Providers.Default.Name = "fake"
 	cfg.ModelLoading.Enabled = true
 	cfg.ModelLoading.Strategy = "single"
-	cfg.Models["editor"] = "editor-model"
+	cfg.Models["planner"] = "planner-model"
 	cfg.Models["explorer"] = "explore-model"
 	registry := tools.NewRegistry()
 	tools.RegisterBuiltins(registry)
@@ -528,8 +566,8 @@ func TestSingleStrategySubagentReusesCurrentModel(t *testing.T) {
 	if _, err := runtime.RunSubagent(context.Background(), SubagentRequest{Agent: "explorer", Prompt: "inspect"}); err != nil {
 		t.Fatal(err)
 	}
-	if len(provider.requests) == 0 || provider.requests[0].Model != "editor-model" {
-		t.Fatalf("under single strategy + build mode, subagent model = %#v, want editor-model", provider.requests)
+	if len(provider.requests) == 0 || provider.requests[0].Model != "planner-model" {
+		t.Fatalf("under single strategy + plan mode, subagent model = %#v, want planner-model", provider.requests)
 	}
 }
 
@@ -556,6 +594,38 @@ func TestParallelModelLoadingSkipsMarkedLoadedModel(t *testing.T) {
 	}
 }
 
+func TestReloadCurrentModelAppliesParallelSlots(t *testing.T) {
+	cwd := t.TempDir()
+	cfg := config.Defaults()
+	cfg.Providers.Default.Name = "fake"
+	cfg.ModelLoading.Enabled = true
+	cfg.ModelLoading.Strategy = "single"
+	cfg.ModelLoading.ParallelSlots = 2
+	cfg.Context.ModelContextTokens = 32000
+	cfg.Models["planner"] = "planner-model"
+	registry := tools.NewRegistry()
+	tools.RegisterBuiltins(registry)
+	provider := &fakeProvider{}
+	providers := llm.NewRegistry()
+	providers.Register(provider)
+	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+
+	modelID, err := runtime.ReloadCurrentModel(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if modelID != "planner-model" {
+		t.Fatalf("modelID = %q, want planner-model", modelID)
+	}
+	if len(provider.loadConfigs) != 1 {
+		t.Fatalf("expected one load config, got %#v", provider.loadConfigs)
+	}
+	got := provider.loadConfigs[0]
+	if got.ParallelSlots != 2 || got.ContextLength != 32000 || !got.FlashAttention {
+		t.Fatalf("unexpected load config: %#v", got)
+	}
+}
+
 func TestRuntimeApprovesEditThenAnswers(t *testing.T) {
 	cwd := t.TempDir()
 	if err := os.WriteFile(filepath.Join(cwd, "file.txt"), []byte("hello world\n"), 0o644); err != nil {
@@ -572,6 +642,7 @@ func TestRuntimeApprovesEditThenAnswers(t *testing.T) {
 	}})
 
 	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+	runtime.Policy = NewSprintPolicy()
 	var sawApproval bool
 	var sawApplied bool
 	for event := range runtime.Run(context.Background(), "edit a file") {
@@ -618,6 +689,7 @@ func TestRuntimeRejectsEditThenAnswers(t *testing.T) {
 	}})
 
 	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+	runtime.Policy = NewSprintPolicy()
 	var sawRejected bool
 	for event := range runtime.Run(context.Background(), "edit a file") {
 		if event.Type == EventApproval {
@@ -652,6 +724,7 @@ func TestRuntimeDeniesCommandTool(t *testing.T) {
 	}})
 
 	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+	runtime.Policy = NewSprintPolicy()
 	var sawDeny bool
 	for event := range runtime.Run(context.Background(), "run a command") {
 		if event.Type == EventToolResult && strings.Contains(event.Text, "denied by command policy") {
@@ -676,6 +749,7 @@ func TestRuntimeAllowsSafeCommandTool(t *testing.T) {
 	}})
 
 	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+	runtime.Policy = NewSprintPolicy()
 	var sawResult bool
 	for event := range runtime.Run(context.Background(), "check diff") {
 		if event.Type == EventToolResult && strings.Contains(event.Text, "git diff") {
@@ -700,6 +774,7 @@ func TestRuntimeApprovesAskCommandTool(t *testing.T) {
 	}})
 
 	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+	runtime.Policy = NewSprintPolicy()
 	var sawApproval bool
 	for event := range runtime.Run(context.Background(), "check python") {
 		if event.Type == EventApproval {
@@ -831,6 +906,7 @@ func TestRuntimeRejectsAskCommandTool(t *testing.T) {
 	}})
 
 	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+	runtime.Policy = NewSprintPolicy()
 	var sawRejected bool
 	for event := range runtime.Run(context.Background(), "check python") {
 		if event.Type == EventApproval {

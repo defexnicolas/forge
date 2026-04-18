@@ -142,6 +142,21 @@ func (s *Store) Update(id, title, status, notes string) (Task, error) {
 	return task, nil
 }
 
+// Clear removes the current executable checklist. This is only for explicit
+// user-driven reset flows; todo_write should continue to use ReplacePlan so
+// accidental empty model output cannot erase work in progress.
+func (s *Store) Clear() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.db.Exec("DELETE FROM tasks"); err != nil {
+		return fmt.Errorf("clear tasks: %w", err)
+	}
+	return nil
+}
+
 // ReplacePlan swaps the entire task list for a new one parsed from the model's
 // todo_write payload. Guards against empty overwrites: if the model emits no
 // valid items while tasks exist, we reject the rewrite so the panel never

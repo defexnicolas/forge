@@ -235,6 +235,7 @@ func (s *SQLiteStore) ContextText(limit int) string {
 	if len(events) == 0 {
 		return FormatTail(events)
 	}
+	events = contextEvents(events)
 	return "Session summary:\n" + Summarize(events) + "\n\nRecent timeline:\n" + FormatTail(events)
 }
 

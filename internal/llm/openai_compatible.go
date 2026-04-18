@@ -372,23 +372,43 @@ func (p *OpenAICompatible) loadModelHTTP(ctx context.Context, base, modelID stri
 	// We try it first, then fall back to /api/v0/models/load for older builds.
 	stripped := strings.TrimSuffix(base, "/v1")
 	paths := []string{"/api/v1/models/load", "/api/v0/models/load"}
-	body := map[string]any{
-		"model":            modelID,
-		"echo_load_config": true,
-	}
+	// LM Studio 0.3+ moved the load-time options under a nested "config"
+	// object; older builds accepted them at the top level. Mirror the same
+	// fields in both places so either version picks them up. Unknown fields
+	// are ignored by the server.
+	nested := map[string]any{}
 	if loadCfg.ContextLength > 0 {
-		body["context_length"] = loadCfg.ContextLength
+		nested["context_length"] = loadCfg.ContextLength
+		nested["contextLength"] = loadCfg.ContextLength
 	}
 	if loadCfg.FlashAttention {
-		body["flash_attention"] = true
+		nested["flash_attention"] = true
+		nested["flashAttention"] = true
 	}
-	// LM Studio has used several field names for parallel generation slots
-	// across versions. Send all three — unknown fields are ignored — so
-	// "max_parallel_sequences=2" produces the 2+ GEN slots the user wants.
 	if loadCfg.ParallelSlots > 0 {
-		body["max_parallel_sequences"] = loadCfg.ParallelSlots
-		body["parallel_requests"] = loadCfg.ParallelSlots
-		body["n_parallel"] = loadCfg.ParallelSlots
+		// Field names have shifted across LM Studio versions (and inside
+		// llama.cpp vs mlx backends). Send every known spelling so at
+		// least one is honored. If the user still sees 1 GEN slot after
+		// this reload, the field name changed again and we need to log
+		// the echoed response to find the new one.
+		nested["max_parallel_sequences"] = loadCfg.ParallelSlots
+		nested["maxParallelSequences"] = loadCfg.ParallelSlots
+		nested["parallel_requests"] = loadCfg.ParallelSlots
+		nested["parallelRequests"] = loadCfg.ParallelSlots
+		nested["n_parallel"] = loadCfg.ParallelSlots
+		nested["nParallel"] = loadCfg.ParallelSlots
+		nested["num_parallel"] = loadCfg.ParallelSlots
+		nested["numParallel"] = loadCfg.ParallelSlots
+	}
+	body := map[string]any{
+		"model":            modelID,
+		"identifier":       modelID,
+		"echo_load_config": true,
+		"config":           nested,
+		"load_config":      nested,
+	}
+	for k, v := range nested {
+		body[k] = v
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -434,6 +454,14 @@ func (p *OpenAICompatible) loadModelHTTP(ctx context.Context, base, modelID stri
 						echo.LoadConfig.ContextLength, loadCfg.ContextLength)
 				}
 			}
+		}
+		// Surface the full echoed config to stderr when ParallelSlots was
+		// requested. LM Studio's actual slot field has moved between
+		// versions and spellings — logging the echo lets the user (and
+		// future code) see exactly which field LM Studio accepted and
+		// whether it matches the requested value.
+		if loadCfg.ParallelSlots > 0 && len(respBody) > 0 {
+			fmt.Fprintf(os.Stderr, "lm-studio load echo [%s]: %s\n", path, strings.TrimSpace(string(respBody)))
 		}
 		return nil
 	}

@@ -111,6 +111,7 @@ type model struct {
 	pendingExecuteLine     string
 	pendingExplorerHandoff string
 	lastBuildPreflight     string
+	streamingStartIdx      int
 	pendingCommand         tea.Cmd
 	btwEvents              <-chan agent.Event
 	btwStreaming           bool
@@ -132,6 +133,20 @@ type model struct {
 	toolUsesInTurn       int
 	collapsedToolLineIdx int
 	lastToolCollapsed    bool
+	// turnToolActivity accumulates tool calls (name + key input) for the
+	// current turn so explore→plan handoffs can ship a structured summary
+	// instead of just the final assistant text. Reset at turn start.
+	turnToolActivity []turnToolEntry
+	// turnUserInput captures the user's message for the current turn so the
+	// explore→plan handoff can include the question that produced the
+	// findings.
+	turnUserInput string
+}
+
+type turnToolEntry struct {
+	Name   string
+	Input  string
+	Result string
 }
 
 func newModel(options Options) model {
@@ -174,6 +189,7 @@ func newModel(options Options) model {
 		theme:                theme,
 		currentAssistant:     &strings.Builder{},
 		collapsedToolLineIdx: -1,
+		streamingStartIdx:    -1,
 		stickyBottom:         true,
 		history: []string{
 			"",
@@ -517,8 +533,6 @@ func (m model) statusLineView() string {
 	switch m.agentRuntime.Mode {
 	case "plan":
 		mode = t.Warning.Render("[" + modeName + "]")
-	case "build":
-		mode = t.Success.Render("[" + modeName + "]")
 	case "explore":
 		mode = t.Accent.Render("[" + modeName + "]")
 	default:
@@ -669,24 +683,27 @@ func (m *model) handleLine(line string) tea.Cmd {
 		m.history = append(m.history, t.Warning.Render("  Agent is still running."))
 		return nil
 	}
-	// If in plan mode with tasks and the user wants to execute, show confirm prompt.
-	if m.agentRuntime.Mode == "plan" && looksLikeExecute(line) {
-		if tasks, err := m.agentRuntime.Tasks.List(); err == nil && len(tasks) > 0 {
-			m.pendingExecuteLine = line
-			m.activeForm = formConfirmExecute
-			m.confirmExecute = newConfirmForm("Switch to build mode and execute the plan?", m.theme)
-			return nil
-		}
-	}
+	// If in plan mode with tasks and the user wants to execute, route the
+	// message straight through — the planner will now dispatch each task to
+	// the builder subagent via execute_task, so no mode switch is needed.
 	m.history = append(m.history, t.SeparatorLine(m.width-4))
 	m.history = append(m.history, t.IndicatorAgent.Render("* ")+t.AgentPrefix.Render("forge"))
 	m.history = append(m.history, "")
 	m.modelProgress = nil
-	if m.agentRuntime.Mode == "build" {
-		if preflight := m.runBuildPreflight(line); strings.TrimSpace(preflight) != "" {
-			m.agentRuntime.PendingBuildPreflight = preflight
-			m.lastBuildPreflight = preflight
-			m.history = append(m.history, "    "+t.Muted.Render("Build preflight complete."))
+	// Reset per-turn capture buffers so the explore→plan handoff reflects
+	// this turn's activity only.
+	m.turnToolActivity = nil
+	m.turnUserInput = line
+	switch m.agentRuntime.Mode {
+	case "explore":
+		if preflight := m.runModePreflight("explore", line); strings.TrimSpace(preflight) != "" {
+			m.agentRuntime.PendingExplorePreflight = preflight
+			m.history = append(m.history, "    "+t.Muted.Render("Explore preflight complete."))
+		}
+	case "plan":
+		if preflight := m.runModePreflight("plan", line); strings.TrimSpace(preflight) != "" {
+			m.agentRuntime.PendingExplorerContext = preflight
+			m.history = append(m.history, "    "+t.Muted.Render("Plan preflight complete."))
 		}
 	}
 	// In plan mode, wrap every user message with the interview prompt so the
@@ -766,6 +783,8 @@ func (m *model) handleCommand(line string) string {
 			return "Usage: /agent <explorer|reviewer|tester> <task>"
 		}
 		return m.runSubagentCommand(fields[1], strings.Join(fields[2:], " "))
+	case "/plan-new":
+		return m.handlePlanCommand(append([]string{"/plan", "new"}, fields[1:]...))
 	case "/plan":
 		return m.handlePlanCommand(fields)
 	case "/tools":
@@ -939,6 +958,10 @@ func (m *model) cycleMode() {
 		if name == current {
 			next := modes[(i+1)%len(modes)]
 			_ = m.agentRuntime.SetMode(next)
+			if next == "explore" && m.showPlan {
+				m.showPlan = false
+				m.recalcLayout()
+			}
 			// Mode is reflected in the status bar — don't pollute the viewport.
 			return
 		}

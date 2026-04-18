@@ -104,6 +104,18 @@ func DefaultSubagents() SubagentRegistry {
 			ContextMode:  "forked",
 			AllowedTools: []string{"read_file", "list_files", "search_text", "search_files", "git_status", "git_diff", "run_command"},
 		},
+		{
+			Name:         "builder",
+			Description:  "Executes ONE checklist task: reads relevant files, edits/patches with user approval, runs verification. Dispatched by the planner via execute_task.",
+			ModelRole:    "editor",
+			ContextMode:  "forked",
+			AllowedTools: []string{
+				"read_file", "list_files", "search_text", "search_files",
+				"edit_file", "write_file", "apply_patch", "run_command",
+				"git_status", "git_diff",
+				"task_get", "task_update",
+			},
+		},
 	}
 	registry := SubagentRegistry{agents: map[string]Subagent{}}
 	for _, agent := range agents {
@@ -168,9 +180,13 @@ func (r *Runtime) RunSubagent(ctx context.Context, request SubagentRequest) (too
 		model = r.roleModel("chat")
 	}
 	snapshot := r.buildTaskSnapshot(prompt, worker.ModelRole)
+	contextText := renderSubagentContext(request.Context)
+	if contextText == "" {
+		contextText = snapshot.Render()
+	}
 	messages := []llm.Message{
 		{Role: "system", Content: subagentSystemPrompt(worker, snapshot)},
-		{Role: "user", Content: "Context snapshot:\n" + snapshot.Render() + "\n\nTask:\n" + prompt},
+		{Role: "user", Content: "Context snapshot:\n" + contextText + "\n\nTask:\n" + prompt},
 	}
 
 	var trace []string
@@ -334,11 +350,51 @@ func (r *Runtime) executeSubagentTool(ctx context.Context, worker Subagent, call
 			return "", err
 		}
 		decision, reason := r.Commands.Decide(req.Command)
-		if decision != permissions.Allow {
+		if decision == permissions.Deny {
 			return "Tool result for run_command: " + reason, nil
+		}
+		if decision == permissions.Ask {
+			events := r.currentEvents()
+			if events == nil {
+				return "Tool result for run_command: no event channel available for approval", nil
+			}
+			request := &ApprovalRequest{
+				ID:       fmt.Sprintf("approval-subagent-command-%p", &call),
+				ToolName: "run_command",
+				Input:    call.Input,
+				Summary:  req.Command,
+				Diff:     "Subagent " + worker.Name + " requests command:\n" + req.Command,
+				Response: make(chan ApprovalResponse, 1),
+				command:  &call,
+			}
+			events <- Event{Type: EventApproval, ToolName: "run_command", Input: call.Input, Approval: request}
+			select {
+			case <-ctx.Done():
+				return "Tool result for run_command: error: " + ctx.Err().Error(), nil
+			case response := <-request.Response:
+				if !response.Approved {
+					return "Tool result for run_command: rejected by user", nil
+				}
+			}
 		}
 		result, _ := r.runCommandTool(ctx, call.Input, reason)
 		return "Tool result for run_command:\n" + summarizeResult(*result), nil
+	}
+	if canonicalName == "edit_file" || canonicalName == "write_file" || canonicalName == "apply_patch" {
+		events := r.currentEvents()
+		if events == nil {
+			return "Tool result for " + canonicalName + ": no event channel available for approval", nil
+		}
+		result, observation := r.requestApproval(ctx, canonicalName, call.Input, events)
+		_ = result
+		return observation, nil
+	}
+	if canonicalName == "task_get" || canonicalName == "task_update" {
+		result, err := r.runTaskTool(canonicalName, call.Input)
+		if err != nil {
+			return "Tool result for " + canonicalName + ": error: " + err.Error(), nil
+		}
+		return "Tool result for " + canonicalName + ":\n" + summarizeResult(result), nil
 	}
 	result, err := tool.Run(tools.Context{
 		Context: ctx,
@@ -349,6 +405,17 @@ func (r *Runtime) executeSubagentTool(ctx context.Context, worker Subagent, call
 		return "", err
 	}
 	return "Tool result for " + canonicalName + ":\n" + summarizeResult(result), nil
+}
+
+// currentEvents returns the events channel of the in-flight turn, or nil when
+// no turn is active. Used by subagents that need to raise approval prompts.
+func (r *Runtime) currentEvents() chan<- Event {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.activeEvents
 }
 
 func subagentSystemPrompt(worker Subagent, snapshot contextbuilder.Snapshot) string {
@@ -393,4 +460,27 @@ func hasMutatingTools(names []string) bool {
 		}
 	}
 	return false
+}
+
+func renderSubagentContext(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		return strings.TrimSpace(text)
+	}
+	var payload struct {
+		Text    string `json:"text"`
+		Summary string `json:"summary"`
+		Context string `json:"context"`
+	}
+	if err := json.Unmarshal(raw, &payload); err == nil {
+		for _, value := range []string{payload.Text, payload.Summary, payload.Context} {
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	return strings.TrimSpace(string(raw))
 }

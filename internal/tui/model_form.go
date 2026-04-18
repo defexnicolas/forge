@@ -57,10 +57,11 @@ type modelForm struct {
 	chosen   string
 	errMsg   string
 
-	cwd      string
-	theme    Theme
-	provider llm.Provider
-	profile  config.YarnProfile
+	cwd           string
+	theme         Theme
+	provider      llm.Provider
+	profile       config.YarnProfile
+	parallelSlots int
 }
 
 // loadCompleteMsg is dispatched from the background load goroutine.
@@ -94,13 +95,14 @@ func newModelFormForRole(cwd string, cfg config.Config, providers *llm.Registry,
 		current = cfg.Models["chat"]
 	}
 	f := modelForm{
-		current:    current,
-		role:       role,
-		title:      title,
-		cwd:        cwd,
-		theme:      theme,
-		step:       stepSelectModel,
-		modelInfos: map[string]llm.ModelInfo{},
+		current:       current,
+		role:          role,
+		title:         title,
+		cwd:           cwd,
+		theme:         theme,
+		step:          stepSelectModel,
+		modelInfos:    map[string]llm.ModelInfo{},
+		parallelSlots: cfg.ModelLoading.ParallelSlots,
 	}
 	if profile, ok := config.GetYarnProfile(cfg.Context.Yarn.Profile); ok {
 		f.profile = profile
@@ -222,19 +224,20 @@ func (f modelForm) updateContextStep(msg tea.KeyMsg) (modelForm, tea.Cmd) {
 			return f, nil
 		}
 		f.step = stepLoading
-		return f, loadModelCmd(f.provider, f.chosenModel, chosen.ctx)
+		return f, loadModelCmd(f.provider, f.chosenModel, chosen.ctx, f.parallelSlots)
 	}
 	return f, nil
 }
 
 // loadModelCmd runs the load in the background and reports the probed state.
-func loadModelCmd(provider llm.Provider, modelID string, contextLength int) tea.Cmd {
+func loadModelCmd(provider llm.Provider, modelID string, contextLength, parallelSlots int) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 		defer cancel()
 		err := provider.LoadModel(ctx, modelID, llm.LoadConfig{
 			ContextLength:  contextLength,
 			FlashAttention: true,
+			ParallelSlots:  parallelSlots,
 		})
 		if err != nil {
 			if errors.Is(err, llm.ErrNotSupported) {

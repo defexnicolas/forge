@@ -47,12 +47,14 @@ func (m *model) appendAgentEvent(event agent.Event) {
 				m.history[len(m.history)-1] += indented
 			} else {
 				m.streaming = true
+				m.streamingStartIdx = len(m.history)
 				lastAgentResponse = event.Text
 				m.history = append(m.history, "    "+indented)
 			}
 		}
 	case agent.EventAssistantText:
 		m.streaming = false
+		m.streamingStartIdx = -1
 		// Assistant is speaking again — any new tool group restarts from zero.
 		m.toolUsesInTurn = 0
 		m.collapsedToolLineIdx = -1
@@ -67,24 +69,25 @@ func (m *model) appendAgentEvent(event agent.Event) {
 			m.history = append(m.history, strings.TrimRight(indented, "\n"))
 		}
 	case agent.EventClearStreaming:
-		// Remove streamed text lines that precede a tool call.
+		// Remove only the streamed assistant block that precedes a tool call.
 		m.streaming = false
-		for len(m.history) > 0 {
-			last := m.history[len(m.history)-1]
-			if strings.HasPrefix(last, "    ") && !strings.Contains(last, "* ") && !strings.Contains(last, "-> ") {
-				m.history = m.history[:len(m.history)-1]
-			} else {
-				break
-			}
+		if m.streamingStartIdx >= 0 && m.streamingStartIdx <= len(m.history) {
+			m.history = m.history[:m.streamingStartIdx]
 		}
+		m.streamingStartIdx = -1
 		lastAgentResponse = ""
 	case agent.EventToolCall:
 		m.streaming = false
+		m.streamingStartIdx = -1
 		m.modelProgress = nil
 		input := strings.TrimSpace(string(event.Input))
 		if input == "" {
 			input = "{}"
 		}
+		m.turnToolActivity = append(m.turnToolActivity, turnToolEntry{
+			Name:  event.ToolName,
+			Input: summarizeToolInput(event.ToolName, event.Input),
+		})
 		m.toolUsesInTurn++
 		// Show the first 2 tool uses in full; fold the rest into a counter.
 		if m.toolUsesInTurn <= 2 {
@@ -103,6 +106,13 @@ func (m *model) appendAgentEvent(event agent.Event) {
 			}
 		}
 	case agent.EventToolResult:
+		if len(m.turnToolActivity) > 0 && m.turnToolActivity[len(m.turnToolActivity)-1].Name == event.ToolName {
+			summary := event.Text
+			if summary == "" && event.Result != nil {
+				summary = event.Result.Summary
+			}
+			m.turnToolActivity[len(m.turnToolActivity)-1].Result = truncate(strings.TrimSpace(summary), 160)
+		}
 		if m.lastToolCollapsed {
 			// Result is part of a folded pair — swallow it.
 			break
@@ -111,21 +121,22 @@ func (m *model) appendAgentEvent(event agent.Event) {
 		if summary == "" && event.Result != nil {
 			summary = event.Result.Summary
 		}
-		// Multi-line summaries (e.g. todo_write plan list) keep indent on every line.
-		if strings.Contains(summary, "\n") {
-			lines := strings.Split(summary, "\n")
-			m.history = append(m.history, "      "+t.Muted.Render("-> ")+t.ToolResult.Render(event.ToolName+": "+lines[0]))
-			for _, line := range lines[1:] {
-				m.history = append(m.history, "         "+t.ToolResult.Render(line))
-			}
-		} else {
-			m.history = append(m.history, "      "+t.Muted.Render("-> ")+t.ToolResult.Render(event.ToolName+": "+truncate(summary, 160)))
+		lines := wrapToolResult(summary, event.ToolName, m.viewport.Width)
+		if len(lines) == 0 {
+			lines = []string{""}
 		}
-		// Auto-show plan panel when plan/checklist tools produce results.
-		if event.ToolName == "todo_write" || strings.HasPrefix(event.ToolName, "task_") || strings.HasPrefix(event.ToolName, "plan_") {
-			if !m.showPlan {
-				m.showPlan = true
-				m.recalcLayout()
+		m.history = append(m.history, "      "+t.Muted.Render("-> ")+t.ToolResult.Render(event.ToolName+": "+lines[0]))
+		for _, line := range lines[1:] {
+			m.history = append(m.history, "         "+t.ToolResult.Render(line))
+		}
+		// Auto-show plan panel when plan/checklist tools produce state-changing
+		// results. Explorer mode keeps the full viewport width for analysis.
+		if m.agentRuntime == nil || m.agentRuntime.Mode != "explore" {
+			if event.ToolName == "todo_write" || strings.HasPrefix(event.ToolName, "task_") || event.ToolName == "plan_write" {
+				if !m.showPlan {
+					m.showPlan = true
+					m.recalcLayout()
+				}
 			}
 		}
 	case agent.EventError:
@@ -164,19 +175,22 @@ func (m *model) appendAgentEvent(event agent.Event) {
 		m.forceScrollBottom = true
 	case agent.EventDone:
 		m.streaming = false
+		m.streamingStartIdx = -1
 		m.modelProgress = nil
 		m.toolUsesInTurn = 0
 		m.collapsedToolLineIdx = -1
 		m.lastToolCollapsed = false
 		exploreHandoff := ""
 		if m.agentRuntime != nil && m.agentRuntime.Mode == "explore" {
-			exploreHandoff = strings.TrimSpace(m.currentAssistant.String())
+			exploreHandoff = buildExploreHandoff(m.turnUserInput, m.turnToolActivity, m.currentAssistant.String())
 		}
 		// Persist a clean Q&A transcript line for the session's chat.md.
 		if m.options.Session != nil {
 			_ = m.options.Session.AppendChatTurn(m.currentAssistant.String())
 		}
 		m.currentAssistant.Reset()
+		m.turnToolActivity = nil
+		m.turnUserInput = ""
 		duration := m.agentRuntime.LastTurnDuration
 		tokensIn := m.agentRuntime.LastTurnTokensIn
 		tokensOut := m.agentRuntime.LastTurnTokensOut
@@ -199,6 +213,155 @@ func (m *model) appendAgentEvent(event agent.Event) {
 		}
 		m.forceScrollBottom = true
 	}
+}
+
+// summarizeToolInput extracts the one-or-two high-signal fields from a
+// tool_call input JSON so the explore→plan handoff can carry "what did the
+// explorer actually do" (which paths, which queries) without dragging the
+// whole payload. Returns a short "path=..., query=..." style string.
+func summarizeToolInput(toolName string, input json.RawMessage) string {
+	if len(input) == 0 {
+		return ""
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(input, &decoded); err != nil {
+		return ""
+	}
+	keys := toolInputSignalKeys(toolName)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		v, ok := decoded[key]
+		if !ok {
+			continue
+		}
+		switch s := v.(type) {
+		case string:
+			if s == "" {
+				continue
+			}
+			parts = append(parts, key+"="+truncate(s, 80))
+		default:
+			if data, err := json.Marshal(v); err == nil && string(data) != "\"\"" {
+				parts = append(parts, key+"="+truncate(string(data), 80))
+			}
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+func toolInputSignalKeys(toolName string) []string {
+	switch toolName {
+	case "read_file":
+		return []string{"path"}
+	case "list_files":
+		return []string{"path", "pattern"}
+	case "search_text":
+		return []string{"query", "path"}
+	case "search_files":
+		return []string{"pattern", "path"}
+	case "git_diff":
+		return []string{"path", "staged"}
+	case "apply_patch", "edit_file", "write_file":
+		return []string{"path"}
+	case "run_command", "powershell_command":
+		return []string{"command"}
+	case "spawn_subagent":
+		return []string{"agent", "prompt"}
+	case "spawn_subagents":
+		return []string{"tasks"}
+	case "ask_user":
+		return []string{"question"}
+	case "plan_write", "plan_get":
+		return []string{"summary"}
+	case "todo_write":
+		return []string{"items"}
+	case "task_create", "task_update", "task_get", "task_list":
+		return []string{"id", "title", "status"}
+	default:
+		return []string{"path", "query", "pattern"}
+	}
+}
+
+// buildExploreHandoff formats the explore turn's activity as a structured
+// summary for plan mode. Includes the user's question, the tools the
+// explorer exercised (with the files/queries they targeted), and the final
+// assistant text. Without this, plan mode only sees the final text and
+// loses the "where did we look" signal that explorers typically produce.
+func buildExploreHandoff(userInput string, activity []turnToolEntry, finalText string) string {
+	final := strings.TrimSpace(finalText)
+	if len(activity) == 0 && strings.TrimSpace(userInput) == "" {
+		return final
+	}
+	var b strings.Builder
+	if q := strings.TrimSpace(userInput); q != "" {
+		b.WriteString("QUESTION:\n")
+		b.WriteString(q)
+		b.WriteString("\n\n")
+	}
+	if len(activity) > 0 {
+		grouped := groupToolActivity(activity)
+		b.WriteString("EXPLORER ACTIVITY:\n")
+		for _, bucket := range grouped {
+			if bucket.label == "" || len(bucket.entries) == 0 {
+				continue
+			}
+			fmt.Fprintf(&b, "- %s:\n", bucket.label)
+			for _, e := range bucket.entries {
+				line := "    - " + e.Input
+				if e.Result != "" {
+					line += "  →  " + e.Result
+				}
+				b.WriteString(line)
+				b.WriteByte('\n')
+			}
+		}
+		b.WriteByte('\n')
+	}
+	if final != "" {
+		b.WriteString("FINDINGS:\n")
+		b.WriteString(final)
+	}
+	return strings.TrimSpace(b.String())
+}
+
+type toolActivityBucket struct {
+	label   string
+	entries []turnToolEntry
+}
+
+func groupToolActivity(activity []turnToolEntry) []toolActivityBucket {
+	order := []string{"read_file", "list_files", "search_text", "search_files", "git_diff", "git_status", "spawn_subagent", "spawn_subagents", "run_command", "powershell_command"}
+	labels := map[string]string{
+		"read_file":          "Files read",
+		"list_files":         "Directories listed",
+		"search_text":        "Text searches",
+		"search_files":       "File-name searches",
+		"git_diff":           "Diffs inspected",
+		"git_status":         "Repo status checks",
+		"spawn_subagent":     "Subagent runs",
+		"spawn_subagents":    "Subagent batches",
+		"run_command":        "Commands executed",
+		"powershell_command": "Commands executed",
+	}
+	byName := map[string][]turnToolEntry{}
+	for _, e := range activity {
+		byName[e.Name] = append(byName[e.Name], e)
+	}
+	buckets := make([]toolActivityBucket, 0, len(order)+1)
+	for _, name := range order {
+		if entries, ok := byName[name]; ok {
+			buckets = append(buckets, toolActivityBucket{label: labels[name], entries: entries})
+			delete(byName, name)
+		}
+	}
+	var others []turnToolEntry
+	for _, entries := range byName {
+		others = append(others, entries...)
+	}
+	if len(others) > 0 {
+		buckets = append(buckets, toolActivityBucket{label: "Other tools", entries: others})
+	}
+	return buckets
 }
 
 func (m *model) shouldOfferPlanExecution() bool {
@@ -267,6 +430,40 @@ func truncate(s string, limit int) string {
 		return s[:limit] + "..."
 	}
 	return s
+}
+
+func wrapToolResult(summary, toolName string, viewportWidth int) []string {
+	if strings.TrimSpace(summary) == "" {
+		return nil
+	}
+	firstWidth := max(20, viewportWidth-len(toolName)-16)
+	nextWidth := max(20, viewportWidth-12)
+	var out []string
+	for i, line := range strings.Split(summary, "\n") {
+		width := nextWidth
+		if i == 0 {
+			width = firstWidth
+		}
+		out = append(out, wrapPlainLine(line, width)...)
+	}
+	return out
+}
+
+func wrapPlainLine(line string, width int) []string {
+	if width <= 0 || len(line) <= width {
+		return []string{line}
+	}
+	var out []string
+	for len(line) > width {
+		cut := width
+		if idx := strings.LastIndexAny(line[:width], " \t"); idx > width/2 {
+			cut = idx
+		}
+		out = append(out, strings.TrimRight(line[:cut], " \t"))
+		line = strings.TrimLeft(line[cut:], " \t")
+	}
+	out = append(out, line)
+	return out
 }
 
 func summarizeContent(blocks []tools.ContentBlock) string {

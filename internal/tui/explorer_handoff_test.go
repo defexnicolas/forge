@@ -126,8 +126,10 @@ func TestExplorerHandoffCanBeCanceled(t *testing.T) {
 	if cmd != nil {
 		t.Fatal("expected no command when handoff is canceled")
 	}
-	if updated.agentRuntime.Mode != "build" {
-		t.Fatalf("mode = %q, want build", updated.agentRuntime.Mode)
+	// Default mode is now "plan" (build was removed). When the handoff is
+	// canceled, the mode stays on whatever it was before — which is plan.
+	if updated.agentRuntime.Mode != "plan" {
+		t.Fatalf("mode = %q, want plan", updated.agentRuntime.Mode)
 	}
 	if updated.pendingExplorerHandoff != "" {
 		t.Fatalf("expected pending handoff cleared, got %q", updated.pendingExplorerHandoff)
@@ -176,97 +178,18 @@ func TestExploreModeCompletionCanHandoffToPlanMode(t *testing.T) {
 	}
 }
 
-func TestPlanModeCompletionOffersBuildExecutionDefaultNo(t *testing.T) {
-	provider := &tuiFakeProvider{responses: []string{
-		`<tool_call>{"name":"todo_write","input":{"items":["Create snake.js","Update main.js"]}}</tool_call>`,
-		"Plan created.",
-	}}
-	m := newExplorerHandoffTestModel(t, provider)
-	if err := m.agentRuntime.SetMode("plan"); err != nil {
-		t.Fatal(err)
-	}
-	m.agentEvents = m.agentRuntime.Run(context.Background(), "create plan")
-	m.agentRunning = true
-	m = drainAgentEvents(t, m, waitForAgentEvent(m.agentEvents))
-
-	if m.activeForm != formConfirmExecute {
-		t.Fatalf("activeForm = %v, want formConfirmExecute", m.activeForm)
-	}
-	if m.pendingExecuteLine == "" {
-		t.Fatal("expected pending execute prompt")
-	}
-	if m.confirmExecute.selected != 1 {
-		t.Fatalf("confirm selected = %d, want No by default", m.confirmExecute.selected)
-	}
-
-	result, cmd, handled := m.handleFormUpdate(tea.KeyMsg{Type: tea.KeyEnter})
-	if !handled {
-		t.Fatal("expected execute confirm form to handle Enter")
-	}
-	updated := result.(*model)
-	if updated.agentRuntime.Mode != "plan" {
-		t.Fatalf("mode = %q, want plan after default Enter", updated.agentRuntime.Mode)
-	}
-	if updated.agentRunning {
-		t.Fatal("default Enter should not start build execution")
-	}
-	if cmd != nil {
-		t.Fatal("default Enter should not return build command")
-	}
-}
-
-func TestPlanModeCompletionExecutesWhenUserPressesY(t *testing.T) {
-	provider := &tuiFakeProvider{responses: []string{
-		`<tool_call>{"name":"todo_write","input":{"items":["Create snake.js","Update main.js"]}}</tool_call>`,
-		"Plan created.",
-		`{"status":"completed","summary":"explorer preflight"}`,
-		`{"status":"completed","summary":"reviewer preflight"}`,
-		"Executing plan.",
-	}}
-	m := newExplorerHandoffTestModel(t, provider)
-	if err := m.agentRuntime.SetMode("plan"); err != nil {
-		t.Fatal(err)
-	}
-	m.agentEvents = m.agentRuntime.Run(context.Background(), "create plan")
-	m.agentRunning = true
-	m = drainAgentEvents(t, m, waitForAgentEvent(m.agentEvents))
-
-	result, cmd, handled := m.handleFormUpdate(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
-	if !handled {
-		t.Fatal("expected execute confirm form to handle y")
-	}
-	updated := result.(*model)
-	if updated.agentRuntime.Mode != "build" {
-		t.Fatalf("mode = %q, want build", updated.agentRuntime.Mode)
-	}
-	if !strings.Contains(updated.lastBuildPreflight, "explorer preflight") ||
-		!strings.Contains(updated.lastBuildPreflight, "reviewer preflight") {
-		t.Fatalf("expected preflight findings, got:\n%s", updated.lastBuildPreflight)
-	}
-	if cmd == nil {
-		t.Fatal("expected build run command")
-	}
-	finalModel := drainAgentEvents(t, *updated, cmd)
-	if len(provider.requests) < 4 {
-		t.Fatalf("expected plan, 2 preflight, and build requests, got %d", len(provider.requests))
-	}
-	buildPrompt := provider.requests[len(provider.requests)-1].Messages[1].Content
-	if !strings.Contains(buildPrompt, "BUILD PREFLIGHT FINDINGS:") ||
-		!strings.Contains(buildPrompt, "explorer preflight") ||
-		!strings.Contains(buildPrompt, "reviewer preflight") {
-		t.Fatalf("expected build prompt to include preflight, got:\n%s", buildPrompt)
-	}
-	if finalModel.agentRuntime.PendingBuildPreflight != "" {
-		t.Fatalf("expected preflight handoff consumed, got %q", finalModel.agentRuntime.PendingBuildPreflight)
-	}
-}
+// Note: TestPlanModeCompletionOffersBuildExecutionDefaultNo and
+// TestPlanModeCompletionExecutesWhenUserPressesY were removed together with
+// the "build" mode. The planner now stays in plan mode and dispatches each
+// task to the builder subagent via execute_task, so there is no confirm form
+// asking the user to switch modes after plan completion.
 
 func newExplorerHandoffTestModel(t *testing.T, provider *tuiFakeProvider) model {
 	t.Helper()
 	cfg := config.Defaults()
 	cfg.Providers.Default.Name = "fake"
-	// Preflight subagents are disabled by default (see config.Defaults); this
-	// test specifically exercises the preflight path, so opt in explicitly.
+	// This test specifically exercises the preflight path; keep it explicit so
+	// future default changes do not alter the setup.
 	cfg.Build.Subagents.Enabled = true
 	cwd := t.TempDir()
 	store, err := session.New(cwd)

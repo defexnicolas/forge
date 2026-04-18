@@ -169,6 +169,22 @@ mentions = "always"
 compact_events = 80
 compact_transcript_chars = 50000
 
+[context.task]
+budget_tokens = 4000
+max_nodes = 6
+max_file_bytes = 8000
+history_events = 4
+
+[model_loading]
+enabled = false
+strategy = "single"
+parallel_slots = 2
+
+[build.subagents]
+enabled = true
+concurrency = 2
+roles = ["explorer", "reviewer", "debug"]
+
 [skills]
 cli = "npx"
 directory_url = "https://skills.sh/"

@@ -10,33 +10,30 @@ type Mode struct {
 	Prompt      string
 }
 
-// DefaultModes returns the 3 principal agent modes.
-// commit, debug, and review are subagents, not modes.
+// DefaultModes returns the agent operating modes.
+//
+// Historically there were three modes (plan/build/explore). BUILD was removed:
+// execution is now delegated from PLAN to the "builder" subagent via
+// execute_task. The planner (typically Gemma) orchestrates, the builder
+// executes one task at a time with user approval on every mutation. Sessions
+// persisted with mode="build" are silently re-mapped to "plan" in SetMode.
+//
+// commit, debug, docs, reviewer, tester, refactorer, summarizer are subagents,
+// not modes.
 func DefaultModes() map[string]Mode {
 	return map[string]Mode{
-		"build": {
-			Name:        "build",
-			Description: "Full coding agent. Can read, edit (with approval), and run commands.",
-			Policy:      NewSprintPolicy(),
-			Prompt: "You are in build mode. You can read code, make edits (with approval), and run commands.\n" +
-				"Be efficient: prefer a small number of decisive tool calls over long exploration. " +
-				"Before each read or search, ask yourself if you already know the answer from prior context — skip the call if so. " +
-				"Call apply_patch / write_file / edit_file as soon as you have what you need; do not restate the plan in prose before acting. " +
-				"Batch related tiny changes into one apply_patch rather than multiple edit_file calls. " +
-				"After a verification command passes, stop — do not re-inspect files to narrate the result.",
-		},
 		"plan": {
 			Name:        "plan",
-			Description: "Analysis mode. Proposes changes without editing files.",
+			Description: "Planner. Designs the work, writes the plan, and dispatches builder subagents per task.",
 			Policy:      NewPlanPolicy(),
-			Prompt: "You are in plan mode. Your job is to create or refine a full plan document, then keep a separate executable checklist.\n" +
-				"Do NOT edit, write, or create files.\n" +
+			Prompt: "You are in plan mode. You are the orchestrator: design the work, write the plan, then DELEGATE each task to the builder subagent via execute_task. You never edit files directly.\n" +
 				"STEP 1: If the user's request leaves scope, constraints, tech choices, or success criteria ambiguous, call ask_user (3-6 focused questions, one per call) BEFORE anything else. Wait for the answers. Only skip this step when the user's request is already fully specified OR a prior plan already answers these questions.\n" +
-			"When calling ask_user, ALWAYS include an `options` array with exactly 3 short, mutually-exclusive suggested answers the user can pick with arrow keys. Example: {\"question\":\"Which CSS framework?\",\"options\":[\"Vanilla CSS\",\"Tailwind\",\"Bootstrap\"]}. The TUI adds a 'Write my own' row automatically, so do not include one.\n" +
+				"When calling ask_user, ALWAYS include an `options` array with exactly 3 short, mutually-exclusive suggested answers the user can pick with arrow keys. Example: {\"question\":\"Which CSS framework?\",\"options\":[\"Vanilla CSS\",\"Tailwind\",\"Bootstrap\"]}. The TUI adds a 'Write my own' row automatically, so do not include one.\n" +
 				"STEP 2: Call plan_write with the full plan document — summary, context, assumptions, approach, possible stubs, risks, and validation.\n" +
 				"STEP 3: Call todo_write with a fresh executable checklist (or task_* tools for incremental changes). The checklist is not the full plan.\n" +
-				"If a prior plan or tasks exist, read them first with plan_get/task_list and preserve what still applies.\n" +
-				"After steps 2 and 3 are both done in the same turn, give a one-sentence summary.",
+				"STEP 4: For each task in the checklist, call execute_task with {\"task_id\":\"plan-N\",\"relevant_files\":[\"path1\",\"path2\"]}. relevant_files is the MINIMAL list of paths the builder needs — do NOT pass the plan document, the full checklist, or wide globs. The builder runs under its own model (editor role) with user approval for every edit. After the builder returns, read the result, mark the task with task_update(status=\"completed\") if successful, or ajust and retry. Then proceed to the next task. Do not ask the user for confirmation between tasks — the approval system fires per edit.\n" +
+				"If a prior plan or tasks exist, read them first with plan_get / task_list and preserve what still applies.\n" +
+				"After steps 2 and 3 are both done in the same turn, give a one-sentence summary before you start dispatching execute_task.",
 		},
 		"explore": {
 			Name:        "explore",
