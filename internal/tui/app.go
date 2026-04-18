@@ -505,10 +505,16 @@ func (m model) View() string {
 	chatArea := m.viewport.View()
 	if m.showPlan && m.agentRuntime.Tasks != nil {
 		list, err := m.agentRuntime.Tasks.List()
+		hasPlan := false
+		if m.agentRuntime.Plans != nil {
+			if _, ok, _ := m.agentRuntime.Plans.Current(); ok {
+				hasPlan = true
+			}
+		}
 		// Hide the panel only when the plan is genuinely empty — previously we
 		// also hid it when nothing was "pending", which made the panel vanish
 		// after a few approvals even though there were in_progress tasks.
-		if err != nil || len(list) == 0 {
+		if err != nil || (len(list) == 0 && !hasPlan) {
 			m.showPlan = false
 			m.recalcLayout()
 		} else {
@@ -516,7 +522,7 @@ func (m model) View() string {
 			if vpHeight <= 0 {
 				vpHeight = 20
 			}
-			panel := RenderPlanPanel(list, vpHeight, t)
+			panel := RenderPlanPanel(list, hasPlan, vpHeight, t)
 			chatArea = lipgloss.JoinHorizontal(lipgloss.Top, chatArea, "  ", panel)
 		}
 	}
