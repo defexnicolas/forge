@@ -209,8 +209,29 @@ func newExplorerHandoffTestModel(t *testing.T, provider *tuiFakeProvider) model 
 
 func drainAgentEvents(t *testing.T, m model, cmd tea.Cmd) model {
 	t.Helper()
-	for cmd != nil {
+	queue := []tea.Cmd{cmd}
+	for len(queue) > 0 {
+		cmd = queue[0]
+		queue = queue[1:]
+		if cmd == nil {
+			continue
+		}
 		msg := cmd()
+		if msg == nil {
+			continue
+		}
+		// Update now returns tea.Batch(...) when a streaming delta arrives
+		// (waitForAgentEvent + scheduleStreamFlush), which surfaces to the
+		// caller as a BatchMsg. Expand it so the test exercises each sub-cmd
+		// just like the bubbletea runtime would.
+		if batch, ok := msg.(tea.BatchMsg); ok {
+			for _, c := range batch {
+				if c != nil {
+					queue = append(queue, c)
+				}
+			}
+			continue
+		}
 		updated, next := m.Update(msg)
 		var ok bool
 		m, ok = updated.(model)
@@ -221,8 +242,10 @@ func drainAgentEvents(t *testing.T, m model, cmd tea.Cmd) model {
 			}
 			m = *ptr
 		}
-		cmd = next
-		if !m.agentRunning && m.agentEvents == nil {
+		if next != nil {
+			queue = append(queue, next)
+		}
+		if !m.agentRunning && m.agentEvents == nil && len(queue) == 0 {
 			return m
 		}
 	}

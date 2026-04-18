@@ -112,7 +112,19 @@ type model struct {
 	pendingExplorerHandoff string
 	lastBuildPreflight     string
 	streamingStartIdx      int
-	pendingCommand         tea.Cmd
+	// streamingBuilder holds the full indented text of the assistant line
+	// currently being streamed. Replaces the O(n²) `m.history[last] += delta`
+	// concat — we append to the builder on every delta and materialize the
+	// single-string result into m.history at each flush tick.
+	streamingBuilder   strings.Builder
+	streamingRaw       strings.Builder
+	streamFlushPending bool
+	// prefixRendered caches strings.Join(m.history[:streamingStartIdx], "\n")
+	// so refreshStreaming can skip rejoining the entire history on every flush.
+	// Rebuilt lazily when prefixDirty is true.
+	prefixRendered string
+	prefixDirty    bool
+	pendingCommand tea.Cmd
 	btwEvents              <-chan agent.Event
 	btwStreaming           bool
 	remoteServer           *remoteControlHandle
@@ -219,14 +231,51 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.recalcLayout()
 		m.refresh()
 	case agentEventMsg:
-		m.appendAgentEvent(msg.event)
-		m.refresh()
+		switch msg.event.Type {
+		case agent.EventAssistantDelta:
+			// Hot path during local (Ollama) streaming. Append to the
+			// streaming builders only — no viewport re-render. A single
+			// flush tick at ~30fps (streamFlushMsg below) materializes the
+			// accumulated text into m.history and repaints the viewport.
+			m.appendAgentEvent(msg.event)
+			if m.streaming && !m.streamFlushPending {
+				m.streamFlushPending = true
+				cmds = append(cmds, scheduleStreamFlush())
+			}
+		case agent.EventModelProgress:
+			// Progress is rendered in the footer (modelProgressView) which
+			// is drawn by View() after every Update — no viewport refresh
+			// is needed, and on streaming responses these events fire per
+			// chunk so a full refresh here was a pure tax.
+			m.appendAgentEvent(msg.event)
+		case agent.EventClearStreaming:
+			// Streamed block is being discarded (a <tool_call> was detected
+			// mid-stream). Do NOT flush the pending builder — its contents
+			// are exactly what we need to throw away.
+			m.appendAgentEvent(msg.event)
+			m.refresh()
+		default:
+			// Any structural event (tool call, tool result, assistant text,
+			// done, error, etc.) — materialize any pending streaming delta
+			// first so the mutation sees up-to-date history.
+			m.flushStreaming()
+			m.appendAgentEvent(msg.event)
+			m.refresh()
+		}
 		if msg.event.Type == agent.EventDone {
 			m.agentRunning = false
 			m.agentEvents = nil
 			break
 		}
 		cmds = append(cmds, waitForAgentEvent(msg.events))
+	case streamFlushMsg:
+		m.streamFlushPending = false
+		if m.streaming {
+			m.flushStreaming()
+			m.refreshStreaming()
+			m.streamFlushPending = true
+			cmds = append(cmds, scheduleStreamFlush())
+		}
 	case btwEventMsg:
 		m.appendBtwEvent(msg.event)
 		m.refresh()
@@ -982,8 +1031,69 @@ func (m *model) refresh() {
 	// Reserved trailing padding so the last rendered line can never sit flush
 	// against the bottom edge of the viewport and appear crowded by the input.
 	rendered := strings.Join(content, "\n") + strings.Repeat("\n", viewportInputGapLines)
+	// The full rebuild already covers whatever the streaming prefix cache
+	// pointed to, so invalidate it — the next refreshStreaming will rebuild.
+	m.prefixDirty = true
 	// Inherit sticky state from previous position: if the viewport was already
 	// at the bottom, keep it pinned.
+	if m.viewport.AtBottom() {
+		m.stickyBottom = true
+	}
+	m.viewport.SetContent(rendered)
+	if m.forceScrollBottom {
+		m.viewport.GotoBottom()
+		m.stickyBottom = true
+		m.forceScrollBottom = false
+		return
+	}
+	if m.stickyBottom {
+		m.viewport.GotoBottom()
+	}
+}
+
+// flushStreaming materializes the accumulated streamingBuilder into the
+// single history line reserved at streamingStartIdx. Called at ~30fps from
+// the streamFlushMsg tick and synchronously before any non-delta event that
+// mutates m.history, so downstream event handlers always observe up-to-date
+// history. Safe to call when not streaming — no-op.
+func (m *model) flushStreaming() {
+	if !m.streaming || m.streamingStartIdx < 0 || m.streamingStartIdx >= len(m.history) {
+		return
+	}
+	m.history[m.streamingStartIdx] = m.streamingBuilder.String()
+	lastAgentResponse = m.streamingRaw.String()
+}
+
+// refreshStreaming paints the viewport during an active streaming response
+// without rejoining the entire history. Reuses a cached prefix (everything
+// before streamingStartIdx) plus the current streaming line. Falls back to
+// the full refresh when search is active (correctness beats throughput in
+// that rare case).
+func (m *model) refreshStreaming() {
+	if !m.streaming || m.searchMode.query != "" {
+		m.refresh()
+		return
+	}
+	m.recalcLayout()
+	if m.prefixDirty {
+		if m.streamingStartIdx > 0 {
+			m.prefixRendered = strings.Join(m.history[:m.streamingStartIdx], "\n")
+		} else {
+			m.prefixRendered = ""
+		}
+		m.prefixDirty = false
+	}
+	streamingLine := ""
+	if m.streamingStartIdx >= 0 && m.streamingStartIdx < len(m.history) {
+		streamingLine = m.history[m.streamingStartIdx]
+	}
+	var rendered string
+	if m.prefixRendered == "" {
+		rendered = streamingLine
+	} else {
+		rendered = m.prefixRendered + "\n" + streamingLine
+	}
+	rendered += strings.Repeat("\n", viewportInputGapLines)
 	if m.viewport.AtBottom() {
 		m.stickyBottom = true
 	}

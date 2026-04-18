@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"forge/internal/agent"
 	"forge/internal/tools"
@@ -16,6 +17,17 @@ type agentEventMsg struct {
 	events <-chan agent.Event
 }
 
+// streamFlushMsg triggers a coalesced materialization of streaming deltas
+// into the viewport. Scheduled by the Update loop whenever an assistant
+// delta arrives and no flush is already pending, so per-token tk/s rates
+// of 100+ collapse into ~30 renders/sec of work.
+type streamFlushMsg struct{}
+
+// streamFlushInterval trades off perceived smoothness against CPU cost.
+// 33ms ≈ 30fps — fast enough that characters still appear to "stream" but
+// slow enough that Ollama at 150+ tk/s doesn't saturate the event loop.
+const streamFlushInterval = 33 * time.Millisecond
+
 func waitForAgentEvent(events <-chan agent.Event) tea.Cmd {
 	return func() tea.Msg {
 		event, ok := <-events
@@ -24,6 +36,12 @@ func waitForAgentEvent(events <-chan agent.Event) tea.Cmd {
 		}
 		return agentEventMsg{event: event, events: events}
 	}
+}
+
+func scheduleStreamFlush() tea.Cmd {
+	return tea.Tick(streamFlushInterval, func(time.Time) tea.Msg {
+		return streamFlushMsg{}
+	})
 }
 
 func (m *model) appendAgentEvent(event agent.Event) {
@@ -39,17 +57,29 @@ func (m *model) appendAgentEvent(event agent.Event) {
 		}
 	case agent.EventAssistantDelta:
 		if event.Text != "" {
-			lastAgentResponse += event.Text
 			m.currentAssistant.WriteString(event.Text)
-			// Preserve indent on every wrapped/newline'd line.
 			indented := strings.ReplaceAll(event.Text, "\n", "\n    ")
 			if m.streaming {
-				m.history[len(m.history)-1] += indented
+				// Hot path: append only to the builders. Writing to
+				// strings.Builder is amortized O(1); the previous
+				// `m.history[last] += indented` was O(len(turn)) per token
+				// which became the dominant cost at Ollama streaming speeds.
+				// The viewport picks up the materialized text from the
+				// periodic flush in Update (streamFlushMsg).
+				m.streamingBuilder.WriteString(indented)
+				m.streamingRaw.WriteString(event.Text)
 			} else {
 				m.streaming = true
 				m.streamingStartIdx = len(m.history)
-				lastAgentResponse = event.Text
-				m.history = append(m.history, "    "+indented)
+				m.streamingBuilder.Reset()
+				m.streamingRaw.Reset()
+				m.streamingBuilder.WriteString("    ")
+				m.streamingBuilder.WriteString(indented)
+				m.streamingRaw.WriteString(event.Text)
+				m.history = append(m.history, "")
+				// The new streaming line sits at streamingStartIdx, so
+				// everything up to that index is a fresh, stable prefix.
+				m.prefixDirty = true
 			}
 		}
 	case agent.EventAssistantText:
@@ -70,12 +100,17 @@ func (m *model) appendAgentEvent(event agent.Event) {
 		}
 	case agent.EventClearStreaming:
 		// Remove only the streamed assistant block that precedes a tool call.
+		// The pending streaming builder is exactly what we need to discard —
+		// do not flush it out to history before clearing.
 		m.streaming = false
 		if m.streamingStartIdx >= 0 && m.streamingStartIdx <= len(m.history) {
 			m.history = m.history[:m.streamingStartIdx]
 		}
 		m.streamingStartIdx = -1
+		m.streamingBuilder.Reset()
+		m.streamingRaw.Reset()
 		lastAgentResponse = ""
+		m.prefixDirty = true
 	case agent.EventToolCall:
 		m.streaming = false
 		m.streamingStartIdx = -1
@@ -194,10 +229,15 @@ func (m *model) appendAgentEvent(event agent.Event) {
 		duration := m.agentRuntime.LastTurnDuration
 		tokensIn := m.agentRuntime.LastTurnTokensIn
 		tokensOut := m.agentRuntime.LastTurnTokensOut
+		tps := m.agentRuntime.LastTurnTokensPerSec
 		timing := fmt.Sprintf("%.1fs", duration.Seconds())
 		tokens := fmt.Sprintf("~%d in, ~%d out", tokensIn, tokensOut)
+		suffix := "  " + timing + " | " + tokens
+		if tps > 0 {
+			suffix += fmt.Sprintf(" | %.1f tk/s", tps)
+		}
 		m.history = append(m.history, "")
-		m.history = append(m.history, "    "+t.IndicatorDone.Render("* ")+t.DoneStyle.Render("turn complete")+t.Muted.Render("  "+timing+" | "+tokens))
+		m.history = append(m.history, "    "+t.IndicatorDone.Render("* ")+t.DoneStyle.Render("turn complete")+t.Muted.Render(suffix))
 		m.history = append(m.history, t.SeparatorLine(m.width-4))
 		m.history = append(m.history, "")
 		if exploreHandoff != "" {

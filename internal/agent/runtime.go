@@ -142,9 +142,10 @@ type Runtime struct {
 	// (from a prior session or a manual load) would stay on whatever slot
 	// count LM Studio picked, typically 1.
 	startupReloadDone bool
-	LastTurnDuration   time.Duration
-	LastTurnTokensIn   int
-	LastTurnTokensOut  int
+	LastTurnDuration     time.Duration
+	LastTurnTokensIn     int
+	LastTurnTokensOut    int
+	LastTurnTokensPerSec float64
 	mu                 sync.Mutex
 	undoStack          []UndoEntry
 	// systemPromptCache memoizes the rendered system prompt by (nativeTools |
@@ -777,6 +778,7 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 	}
 	snapshot := r.buildSnapshot(userMessage, roleConfig)
 	r.LastTurnTokensOut = 0
+	r.LastTurnTokensPerSec = 0
 	r.LastTokensBudget = snapshot.TokensBudget
 
 	// Plan pointer: we don't dump the whole plan into the user prompt anymore
@@ -1342,6 +1344,12 @@ func (r *Runtime) streamResponseWithInput(ctx context.Context, provider llm.Prov
 
 	var toolCalls []llm.ToolCall
 	toolCallSeen := false
+	// searchFrom tracks how far into `text` we've already scanned for the
+	// <tool_call> tag. Only the newly-written slice (minus a small back-off
+	// covering a tag split across chunks) needs to be searched — avoids the
+	// O(n²) full-buffer rescan that previously stalled the UI at high tk/s.
+	const toolCallTag = "<tool_call>"
+	searchFrom := 0
 
 	for event := range stream {
 		switch event.Type {
@@ -1354,12 +1362,14 @@ func (r *Runtime) streamResponseWithInput(ctx context.Context, provider llm.Prov
 			// Once we detect <tool_call> in the accumulated text, stop streaming to UI.
 			if !toolCallSeen {
 				accumulated := text.String()
-				if idx := strings.Index(accumulated, "<tool_call>"); idx >= 0 {
+				start := max(searchFrom-(len(toolCallTag)-1), 0)
+				if idx := strings.Index(accumulated[start:], toolCallTag); idx >= 0 {
 					toolCallSeen = true
 					// Don't emit any more deltas — the text will be processed by ParseToolCall.
 				} else {
 					events <- Event{Type: EventAssistantDelta, Text: event.Text}
 				}
+				searchFrom = len(accumulated)
 			}
 		case "tool_calls":
 			toolCalls = event.ToolCalls
@@ -1371,6 +1381,18 @@ func (r *Runtime) streamResponseWithInput(ctx context.Context, provider llm.Prov
 			return text.String(), toolCalls, usage, event.Error
 		case "done":
 			// Stream finished.
+		}
+	}
+	// Capture the final tk/s for this stream so the TUI footer and the
+	// per-turn log line can show it alongside timing + token counts.
+	if !firstTokenAt.IsZero() {
+		outputTokens := estimateTextTokens(text.String())
+		if usage != nil && usage.CompletionTokens > 0 {
+			outputTokens = usage.CompletionTokens
+		}
+		elapsed := time.Since(firstTokenAt)
+		if elapsed > 0 && outputTokens > 0 {
+			r.LastTurnTokensPerSec = float64(outputTokens) / elapsed.Seconds()
 		}
 	}
 	emitProgress("complete", true)
