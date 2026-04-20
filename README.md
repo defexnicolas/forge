@@ -451,7 +451,7 @@ Colors accept `#rrggbb` hex or ANSI256 numbers (`"86"`). Apply with `/theme cosm
 **Qwen3 ~35B, Q4_K quantization, 8 GB VRAM + 32 GB DDR5 RAM:**
 
 - Partial offload (MoE active experts on GPU) with `llama.cpp` / LM Studio
-- Typical streaming: **~12–15 tk/s** sustained
+- Typical streaming: **~35-45 tk/s** sustained
 - Forge TUI coalesces tokens at 33 ms intervals (~30 fps) — no frame drops, no janky redraws even under Ollama's burstiest output
 - `tui.stream_flush_ms = 16` in config gives 60fps on hardware-accelerated terminals (iTerm2, WezTerm, Alacritty)
 
