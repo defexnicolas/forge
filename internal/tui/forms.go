@@ -194,12 +194,12 @@ func (m *model) handleFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 			if m.confirmExecute.done {
 				m.activeForm = formNone
 				if m.confirmExecute.confirmed {
-					cmd := m.runBuildWithPreflight(m.pendingExecuteLine)
+					cmd := m.runPlanExecution(m.pendingExecuteLine)
 					m.refresh()
 					return m, cmd, true
 				}
 				m.pendingExecuteLine = ""
-				m.history = append(m.history, m.theme.Muted.Render("Plan left pending. Use /mode build or type an execute request when ready."))
+				m.history = append(m.history, m.theme.Muted.Render("Plan left pending. Type an execute request when ready."))
 				m.refresh()
 			}
 			return m, nil, true
@@ -347,28 +347,18 @@ func (m *model) handleFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 	return m, nil, false
 }
 
-func (m *model) runBuildWithPreflight(line string) tea.Cmd {
+func (m *model) runPlanExecution(line string) tea.Cmd {
 	line = strings.TrimSpace(line)
 	if line == "" {
 		line = "Execute the approved plan."
 	}
-	_ = m.agentRuntime.SetMode("build")
 	m.pendingExecuteLine = ""
 	m.history = append(m.history, m.theme.SeparatorLine(m.width-4))
 	m.history = append(m.history, m.theme.IndicatorAgent.Render("* ")+m.theme.AgentPrefix.Render("forge"))
 	m.history = append(m.history, "")
-	if preflight := m.runBuildPreflight(line); strings.TrimSpace(preflight) != "" {
-		m.agentRuntime.PendingBuildPreflight = preflight
-		m.lastBuildPreflight = preflight
-		m.history = append(m.history, "    "+m.theme.Muted.Render("Build preflight complete."))
-	}
 	m.agentEvents = m.agentRuntime.Run(context.Background(), line)
 	m.agentRunning = true
 	return waitForAgentEvent(m.agentEvents)
-}
-
-func (m *model) runBuildPreflight(line string) string {
-	return m.runModePreflight("build", line)
 }
 
 // runModePreflight dispatches the configured preflight subagents for the

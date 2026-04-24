@@ -278,8 +278,8 @@ func (m *model) appendAgentEvent(event agent.Event) {
 		} else if m.shouldOfferPlanExecution() {
 			m.pendingExecuteLine = "Execute the approved plan."
 			m.activeForm = formConfirmExecute
-			m.confirmExecute = newConfirmFormWithDefault("Execute this plan in Build mode?", m.theme, false)
-			m.history = append(m.history, t.Muted.Render("Plan finished. Press Y to execute it in Build mode, or Enter/Esc to leave it pending."))
+			m.confirmExecute = newConfirmFormWithDefault("Execute this approved plan now?", m.theme, false)
+			m.history = append(m.history, t.Muted.Render("Plan finished. Press Y to execute it now, or Enter/Esc to leave it pending."))
 		}
 		m.forceScrollBottom = true
 	}

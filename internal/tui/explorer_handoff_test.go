@@ -7,6 +7,7 @@ import (
 
 	"forge/internal/config"
 	"forge/internal/llm"
+	"forge/internal/plans"
 	"forge/internal/session"
 	"forge/internal/tools"
 
@@ -175,6 +176,40 @@ func TestExploreModeCompletionCanHandoffToPlanMode(t *testing.T) {
 	}
 	if finalModel.pendingExplorerHandoff != "" {
 		t.Fatalf("expected pending handoff cleared, got %q", finalModel.pendingExplorerHandoff)
+	}
+}
+
+func TestPlanModeExecuteIntentBypassesPlanResetInterview(t *testing.T) {
+	provider := &tuiFakeProvider{responses: []string{"Executing the approved plan."}}
+	m := newExplorerHandoffTestModel(t, provider)
+	if _, err := m.agentRuntime.Plans.Save(plans.Document{Summary: "existing plan"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.agentRuntime.Tasks.ReplacePlan([]string{"Implement the fix"}); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := m.handleLine("ejecuta el plan")
+	if m.activeForm == formConfirmPlanReset {
+		t.Fatal("execute intent should not open the plan reset confirmation")
+	}
+	if !m.agentRunning {
+		t.Fatal("execute intent should start a planner turn immediately")
+	}
+	finalModel := drainAgentEvents(t, m, cmd)
+
+	if len(provider.requests) == 0 {
+		t.Fatal("expected provider request")
+	}
+	userPrompt := provider.requests[0].Messages[1].Content
+	if !strings.Contains(userPrompt, "=== USER REQUEST ===\nExecute the approved plan.") {
+		t.Fatalf("expected canonical execute request, got:\n%s", userPrompt)
+	}
+	if strings.Contains(userPrompt, "NEW PLAN GOAL:") {
+		t.Fatalf("execute intent should not be wrapped in planInterviewPrompt, got:\n%s", userPrompt)
+	}
+	if finalModel.activeForm == formConfirmPlanReset {
+		t.Fatal("execute flow regressed back into the reset confirmation")
 	}
 }
 

@@ -105,10 +105,10 @@ func DefaultSubagents() SubagentRegistry {
 			AllowedTools: []string{"read_file", "list_files", "search_text", "search_files", "git_status", "git_diff", "run_command"},
 		},
 		{
-			Name:         "builder",
-			Description:  "Executes ONE checklist task: reads relevant files, edits/patches with user approval, runs verification. Dispatched by the planner via execute_task.",
-			ModelRole:    "editor",
-			ContextMode:  "forked",
+			Name:        "builder",
+			Description: "Executes ONE checklist task: reads relevant files, edits/patches with user approval, runs verification. Dispatched by the planner via execute_task.",
+			ModelRole:   "editor",
+			ContextMode: "forked",
 			AllowedTools: []string{
 				"read_file", "list_files", "search_text", "search_files",
 				"edit_file", "write_file", "apply_patch", "run_command",
@@ -190,7 +190,8 @@ func (r *Runtime) RunSubagent(ctx context.Context, request SubagentRequest) (too
 	}
 
 	var trace []string
-	for step := 0; step < 4; step++ {
+	stepLimit := subagentStepLimit(worker)
+	for step := 0; step < stepLimit; step++ {
 		resp, err := provider.Chat(ctx, llm.ChatRequest{
 			Model:       model,
 			Messages:    messages,
@@ -462,6 +463,19 @@ func (r *Runtime) currentEvents() chan<- Event {
 }
 
 func subagentSystemPrompt(worker Subagent, snapshot contextbuilder.Snapshot) string {
+	var rules strings.Builder
+	if worker.Name == "builder" {
+		rules.WriteString("You execute exactly ONE checklist task end-to-end.\n")
+		rules.WriteString("You MAY read files, edit files, apply patches, run allowed verification commands, and update task state.\n")
+		rules.WriteString("Do not re-plan, do not rewrite the checklist, and do not call execute_task or spawn_subagent.\n")
+		rules.WriteString("Prefer this workflow: inspect task context -> read/search the minimal files -> apply the smallest viable edit -> verify if useful -> update the task if you changed its state -> return the final result.\n")
+		rules.WriteString("Stop once the single task is completed or clearly blocked.\n")
+	} else if hasMutatingTools(worker.AllowedTools) {
+		rules.WriteString("You may edit files only when the assigned task requires it.\n")
+		rules.WriteString("Keep edits scoped and reversible.\n")
+	} else {
+		rules.WriteString("Do not edit files.\n")
+	}
 	return strings.TrimSpace(`You are Forge subagent ` + worker.Name + `.
 
 Role: ` + worker.Description + `
@@ -474,8 +488,19 @@ You are a limited worker. Prefer a concise final JSON object:
 If you need information, request exactly one tool call:
 <tool_call>{"name":"read_file","input":{"path":"path/to/file"}}</tool_call>
 
-Do not edit files. Do not request tools outside the allowed list.
+` + strings.TrimSpace(rules.String()) + `
+Do not request tools outside the allowed list.
 Main context engine: ` + snapshot.ContextEngine)
+}
+
+func subagentStepLimit(worker Subagent) int {
+	if worker.Name == "builder" {
+		return 12
+	}
+	if hasMutatingTools(worker.AllowedTools) {
+		return 8
+	}
+	return 4
 }
 
 func contains(items []string, value string) bool {

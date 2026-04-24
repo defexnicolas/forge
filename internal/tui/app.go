@@ -134,23 +134,23 @@ type model struct {
 	// lines). Layout-only refreshes (WindowSizeMsg spam during resize, and
 	// any refresh triggered without a history mutation) skip the full
 	// strings.Join and reuse the cached string.
-	fullRenderCache   string
+	fullRenderCache       string
 	fullRenderFingerprint uint64
-	pendingCommand tea.Cmd
-	btwEvents              <-chan agent.Event
-	btwStreaming           bool
-	remoteServer           *remoteControlHandle
-	forceScrollBottom      bool
-	stickyBottom           bool
-	lastEscTime            time.Time
-	lastRuneInputAt        time.Time
-	pasteGuardUntil        time.Time
-	width                  int
-	height                 int
-	input                  textarea.Model
-	viewport               viewport.Model
-	history                []string
-	theme                  Theme
+	pendingCommand        tea.Cmd
+	btwEvents             <-chan agent.Event
+	btwStreaming          bool
+	remoteServer          *remoteControlHandle
+	forceScrollBottom     bool
+	stickyBottom          bool
+	lastEscTime           time.Time
+	lastRuneInputAt       time.Time
+	pasteGuardUntil       time.Time
+	width                 int
+	height                int
+	input                 textarea.Model
+	viewport              viewport.Model
+	history               []string
+	theme                 Theme
 	// Tool-call collapsing: after the first couple of tool uses in a turn,
 	// subsequent ones fold into a single "+N more tool uses" line so the
 	// viewport doesn't drown in read_file/search noise.
@@ -818,6 +818,11 @@ func (m *model) handleLine(line string) tea.Cmd {
 			if _, ok, _ := m.agentRuntime.Plans.Current(); ok {
 				hasPlan = true
 			}
+		}
+		if hasPlan && looksLikeExecute(line) {
+			m.agentEvents = m.agentRuntime.Run(context.Background(), "Execute the approved plan.")
+			m.agentRunning = true
+			return waitForAgentEvent(m.agentEvents)
 		}
 		if hasPlan {
 			m.pendingPlanLine = line

@@ -21,17 +21,17 @@ import (
 )
 
 const (
-	EventAssistantText     = "assistant_text"
-	EventAssistantDelta    = "assistant_delta"
-	EventModelProgress     = "model_progress"
-	EventClearStreaming    = "clear_streaming"
-	EventToolCall          = "tool_call"
-	EventToolResult        = "tool_result"
-	EventApproval          = "approval_required"
-	EventAskUser           = "ask_user"
-	EventSubagentProgress  = "subagent_progress"
-	EventError             = "error"
-	EventDone              = "done"
+	EventAssistantText    = "assistant_text"
+	EventAssistantDelta   = "assistant_delta"
+	EventModelProgress    = "model_progress"
+	EventClearStreaming   = "clear_streaming"
+	EventToolCall         = "tool_call"
+	EventToolResult       = "tool_result"
+	EventApproval         = "approval_required"
+	EventAskUser          = "ask_user"
+	EventSubagentProgress = "subagent_progress"
+	EventError            = "error"
+	EventDone             = "done"
 )
 
 // SubagentProgress reports the lifecycle of one task within a spawn_subagents
@@ -130,18 +130,18 @@ type Runtime struct {
 	// explore-mode run and injected into the tier-C handoff block so the
 	// main explorer response is grounded in the preflight findings.
 	PendingExplorePreflight string
-	Policy                SprintPolicy
-	Commands              permissions.CommandPolicy
-	Plans                 *plans.Store
-	Tasks                 *tasks.Store
-	Subagents             SubagentRegistry
-	Hooks                 *hooks.Runner
-	Parsers               *ParserRegistry
-	MaxParseRetries       int
-	LastTokensUsed        int
-	LastTokensBudget      int
-	LastModelUsed         string
-	LastParserUsed        string
+	Policy                  SprintPolicy
+	Commands                permissions.CommandPolicy
+	Plans                   *plans.Store
+	Tasks                   *tasks.Store
+	Subagents               SubagentRegistry
+	Hooks                   *hooks.Runner
+	Parsers                 *ParserRegistry
+	MaxParseRetries         int
+	LastTokensUsed          int
+	LastTokensBudget        int
+	LastModelUsed           string
+	LastParserUsed          string
 	// ActiveParserName is the parser selected at model-load time (via
 	// SetChatModel). Cached so the TUI can display it without re-running
 	// ForModel every frame. The per-turn LastParserUsed still tracks which
@@ -157,13 +157,13 @@ type Runtime struct {
 	// backend. Without this, a model that was already resident in LM Studio
 	// (from a prior session or a manual load) would stay on whatever slot
 	// count LM Studio picked, typically 1.
-	startupReloadDone bool
+	startupReloadDone    bool
 	LastTurnDuration     time.Duration
 	LastTurnTokensIn     int
 	LastTurnTokensOut    int
 	LastTurnTokensPerSec float64
-	mu                 sync.Mutex
-	undoStack          []UndoEntry
+	mu                   sync.Mutex
+	undoStack            []UndoEntry
 	// systemPromptCache memoizes the rendered system prompt by (nativeTools |
 	// mode | policy.AllowedNames | policy.AskNames). The body is dynamic in
 	// content but byte-stable across consecutive turns while the policy and
@@ -743,12 +743,18 @@ func (r *Runtime) planContextBlock(userMessage, switchedFrom string) string {
 	}
 	activeTasks := pending+inProgress > 0
 	executeIntent := switchedFrom == "plan" || looksLikePlanExecutionIntent(userMessage)
-	_ = executeIntent
 
 	switch r.Mode {
 	case "plan":
 		if planSummary != "" {
 			lines = append(lines, fmt.Sprintf("Plan document exists: %s. Call plan_get to read it before refining. Keep the executable checklist separate.", planSummary))
+		}
+		if executeIntent {
+			if activeTasks {
+				lines = append(lines, "Execution intent detected. Do NOT call plan_write or todo_write unless the user explicitly asks to re-plan. Read the existing checklist with task_list, execute only the remaining pending tasks via execute_task, and keep the checklist as-is.")
+			} else if len(taskList) > 0 {
+				lines = append(lines, "Execution intent detected, but the current checklist is already complete. Do NOT create a new plan or rewrite the checklist. Tell the user execution is already complete unless they explicitly ask to refine or re-plan.")
+			}
 		}
 		if len(taskList) > 0 {
 			if activeTasks {
@@ -804,6 +810,7 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 	// overwrite bug. Just tell it how many tasks exist and what state.
 	switchedFrom := r.ModeSwitchedFrom
 	planBlock := r.planContextBlock(userMessage, switchedFrom)
+	executeIntent := r.Mode == "plan" && looksLikePlanExecutionIntent(userMessage)
 
 	// Mode handoff: when the user just switched modes, give the model an
 	// explicit one-turn signal so it adapts.
@@ -1136,6 +1143,19 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 			events <- Event{Type: EventDone}
 			return
 		}
+		if r.Mode == "plan" && executeIntent && parsed.Call.Name == "execute_task" && !r.hasActiveChecklistTasks() {
+			messages = append(messages,
+				llm.Message{Role: "assistant", Content: accumulated},
+				llm.Message{Role: "user", Content: observation + "\n\nAll checklist tasks are now complete. Do not call plan_write, todo_write, or execute_task again. Give a brief completion summary to the user and stop."},
+			)
+			summaryAcc, _, summaryUsage, err := r.streamResponse(ctx, provider, llm.ChatRequest{Model: model, Messages: messages}, step+1, events)
+			r.recordResponseUsage(summaryAcc, summaryUsage)
+			if err != nil {
+				events <- Event{Type: EventError, Error: err}
+			}
+			events <- Event{Type: EventDone}
+			return
+		}
 
 		messages = append(messages,
 			llm.Message{Role: "assistant", Content: accumulated},
@@ -1169,6 +1189,23 @@ func isReadOnlyExploration(name string) bool {
 	switch name {
 	case "read_file", "list_files", "search_text", "search_files", "git_diff":
 		return true
+	}
+	return false
+}
+
+func (r *Runtime) hasActiveChecklistTasks() bool {
+	if r == nil || r.Tasks == nil {
+		return false
+	}
+	list, err := r.Tasks.List()
+	if err != nil {
+		return false
+	}
+	for _, task := range list {
+		switch task.Status {
+		case "", "pending", "in_progress":
+			return true
+		}
 	}
 	return false
 }

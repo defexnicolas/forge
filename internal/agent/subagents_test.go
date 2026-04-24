@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -250,6 +252,43 @@ func TestRunSubagentUsesProvidedSharedContext(t *testing.T) {
 	prompt := provider.requests[0].Messages[1].Content
 	if !strings.Contains(prompt, "shared compact facts") {
 		t.Fatalf("expected shared context in prompt, got:\n%s", prompt)
+	}
+}
+
+func TestBuilderSubagentGetsHigherStepBudget(t *testing.T) {
+	cwd := t.TempDir()
+	cfg := config.Defaults()
+	cfg.Providers.Default.Name = "fake"
+	registry := tools.NewRegistry()
+	tools.RegisterBuiltins(registry)
+	if err := os.WriteFile(filepath.Join(cwd, "notes.txt"), []byte("builder context"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	provider := &fakeProvider{responses: []string{
+		`<tool_call>{"name":"read_file","input":{"path":"notes.txt"}}</tool_call>`,
+		`<tool_call>{"name":"read_file","input":{"path":"notes.txt"}}</tool_call>`,
+		`<tool_call>{"name":"read_file","input":{"path":"notes.txt"}}</tool_call>`,
+		`<tool_call>{"name":"read_file","input":{"path":"notes.txt"}}</tool_call>`,
+		`<tool_call>{"name":"read_file","input":{"path":"notes.txt"}}</tool_call>`,
+		`{"status":"completed","summary":"finished after multiple steps"}`,
+	}}
+	providers := llm.NewRegistry()
+	providers.Register(provider)
+	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+
+	result, err := runtime.RunSubagent(context.Background(), SubagentRequest{Agent: "builder", Prompt: "finish the task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result.Summary, "finished after multiple steps") {
+		t.Fatalf("expected builder to survive more than 4 steps, got %#v", result)
+	}
+	if len(provider.requests) == 0 {
+		t.Fatal("expected provider request")
+	}
+	systemPrompt := provider.requests[0].Messages[0].Content
+	if !strings.Contains(systemPrompt, "You MAY read files, edit files, apply patches, run allowed verification commands, and update task state.") {
+		t.Fatalf("expected builder-specific prompt, got:\n%s", systemPrompt)
 	}
 }
 

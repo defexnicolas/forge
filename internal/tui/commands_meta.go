@@ -14,7 +14,7 @@ var tuiCommands = []commandDescriptor{
 	{Name: "/model", Usage: "/model [list|set|reload]", Description: "manage models"},
 	{Name: "/model-multi", Usage: "/model-multi [off]", Description: "assign models per agent role", Subcommands: []string{"off"}},
 	{Name: "/provider", Usage: "/provider", Description: "configure provider URL, key, model"},
-	{Name: "/mode", Usage: "/mode [name]", Description: "switch mode (build/plan/explore/review)"},
+	{Name: "/mode", Usage: "/mode [name]", Description: "switch mode (plan/explore)"},
 	{Name: "/agents", Usage: "/agents", Description: "list subagents"},
 	{Name: "/agent", Usage: "/agent <name> <task>", Description: "run a subagent task"},
 	{Name: "/plan", Usage: "/plan [panel|full|todos|new]", Description: "manage plan document and checklist panel", Subcommands: []string{"panel", "full", "todos", "new", "refine"}},

@@ -194,6 +194,32 @@ func TestPlanPromptIncludesExistingPlanForRefinement(t *testing.T) {
 	}
 }
 
+func TestPlanPromptExecutionIntentAvoidsReplanning(t *testing.T) {
+	cwd := t.TempDir()
+	cfg := config.Defaults()
+	cfg.Providers.Default.Name = "fake"
+	registry := tools.NewRegistry()
+	tools.RegisterBuiltins(registry)
+	provider := &fakeProvider{responses: []string{"done"}}
+	providers := llm.NewRegistry()
+	providers.Register(provider)
+
+	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+	if _, err := runtime.Plans.Save(plans.Document{Summary: "approved execution plan"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Tasks.ReplacePlan([]string{"Apply the patch"}); err != nil {
+		t.Fatal(err)
+	}
+
+	for range runtime.Run(context.Background(), "execute the approved plan") {
+	}
+	prompt := provider.requests[0].Messages[1].Content
+	if !strings.Contains(prompt, "Execution intent detected. Do NOT call plan_write or todo_write") {
+		t.Fatalf("expected execution-intent anti-replan guidance, got:\n%s", prompt)
+	}
+}
+
 func TestExplorePromptUsesCompactContextAndSkipsPlanPointers(t *testing.T) {
 	cwd := t.TempDir()
 	cfg := config.Defaults()
@@ -454,6 +480,57 @@ func TestPlanModeNativePlanWriteThenTodoWrite(t *testing.T) {
 	}
 	if len(list) != 2 || list[0].Title != "Add plan store" {
 		t.Fatalf("unexpected checklist %#v", list)
+	}
+}
+
+func TestPlanModeExecuteTaskStopsAfterChecklistCompletes(t *testing.T) {
+	cwd := t.TempDir()
+	cfg := config.Defaults()
+	cfg.Providers.Default.Name = "fake"
+	registry := tools.NewRegistry()
+	tools.RegisterBuiltins(registry)
+	provider := &fakeProvider{responses: []string{
+		`<tool_call>{"name":"execute_task","input":{"task_id":"plan-1","relevant_files":["file.txt"]}}</tool_call>`,
+		`<tool_call>{"name":"task_update","input":{"id":"plan-1","status":"completed"}}</tool_call>`,
+		`{"status":"completed","summary":"builder finished"}`,
+		`Execution complete.`,
+	}}
+	providers := llm.NewRegistry()
+	providers.Register(provider)
+
+	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+	if err := runtime.SetMode("plan"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Tasks.ReplacePlan([]string{"Ship the change"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var sawExecuteTask bool
+	var sawFinalText bool
+	for event := range runtime.Run(context.Background(), "execute the approved plan") {
+		if event.Type == EventToolResult && event.ToolName == "execute_task" {
+			sawExecuteTask = true
+		}
+		if (event.Type == EventAssistantText || event.Type == EventAssistantDelta) && strings.Contains(event.Text, "Execution complete.") {
+			sawFinalText = true
+		}
+	}
+	if !sawExecuteTask {
+		t.Fatal("expected execute_task result")
+	}
+	if !sawFinalText {
+		t.Fatal("expected final completion summary")
+	}
+	if provider.calls != 4 {
+		t.Fatalf("expected planner->builder->builder->planner sequence with no replan, calls=%d", provider.calls)
+	}
+	list, err := runtime.Tasks.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].Status != "completed" {
+		t.Fatalf("expected checklist task to be completed, got %#v", list)
 	}
 }
 

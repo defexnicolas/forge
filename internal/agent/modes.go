@@ -33,6 +33,7 @@ func DefaultModes() map[string]Mode {
 				"STEP 3: Call todo_write with a fresh executable checklist (or task_* tools for incremental changes). The checklist is not the full plan.\n" +
 				"STEP 4: For each task in the checklist, call execute_task with {\"task_id\":\"plan-N\",\"relevant_files\":[\"path1\",\"path2\"]}. relevant_files is the MINIMAL list of paths the builder needs — do NOT pass the plan document, the full checklist, or wide globs. The builder runs under its own model (editor role) with user approval for every edit. After the builder returns, read the result, mark the task with task_update(status=\"completed\") if successful, or ajust and retry. Then proceed to the next task. Do not ask the user for confirmation between tasks — the approval system fires per edit.\n" +
 				"If a prior plan or tasks exist, read them first with plan_get / task_list and preserve what still applies.\n" +
+				"If the user is asking to execute an EXISTING approved plan, do NOT create a new plan and do NOT rewrite the checklist. Read the existing plan/checklist, execute only the remaining pending tasks, and stop once the checklist is complete.\n" +
 				"After steps 2 and 3 are both done in the same turn, give a one-sentence summary before you start dispatching execute_task.",
 		},
 		"explore": {
