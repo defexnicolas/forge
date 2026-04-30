@@ -14,7 +14,7 @@ Written in Go. Runs against LM Studio, Ollama (via any OpenAI-compatible endpoin
 | **Core language / binary** | Go, single 34MB `.exe` | TypeScript, Node runtime | Python, pip install |
 | **TUI** | Bubble Tea, 30fps flush, inline diff, Glamour markdown | OpenTUI, 60fps, syntax highlighting broken ([#12301](https://github.com/sst/opencode/issues/12301)) | Rich terminal, REPL-style |
 | **Parallel subagents** | Live multi-lane with `EventSubagentProgress` | Sequential despite appearing parallel ([#14195](https://github.com/sst/opencode/issues/14195)) | None |
-| **Plan mode** | Two artifacts (plan doc + checklist), phase indicator, delegates to builder subagent | Tool-restricted agent swap | None (commit-loop style) |
+| **Plan/Build modes** | Plan writes the plan + checklist (no edits); Build walks the checklist with editor tools — separate prompts and policies | Tool-restricted agent swap | None (commit-loop style) |
 | **Claude Code plugins** | Discovers `.claude/plugins` + `.claude-plugin/plugin.json`, loads commands/agents/hooks/MCP | Partial | No |
 | **MCP servers** | Full stdio + SSE transport from `.mcp.json` | Full | Partial |
 | **Skills ecosystem** | `skills.sh` directory via `/skills` browser, install-scoped to project | No | No |
@@ -119,29 +119,31 @@ Any OpenAI-compatible endpoint works: vLLM, llama.cpp's server, Groq, Together, 
 
 ### Modes
 
-Two modes cycle with **Shift+Tab**.
+Three modes cycle with **Shift+Tab** (`build` → `explore` → `plan` → `build` …). Switch directly with `/mode <name>`.
 
 | Mode | Role | Tools allowed |
 |---|---|---|
 | **EXPLORE** | Read-only investigation. The model reads, searches, and reports — no edits possible. | `read_file`, `list_files`, `search_text`, `search_files`, `git_status`, `git_diff`, `web_fetch` |
-| **PLAN** | Orchestrator. Interviews the user, writes a plan document, populates a checklist, then delegates each task to the `builder` subagent via `execute_task`. The builder is the one that actually mutates files (with approval). | `ask_user`, `plan_write`, `todo_write`, `execute_task`, `task_*`, plus read-only tools |
+| **PLAN** | Designer. Asks 3–6 clarifying questions (`ask_user`), writes the plan document (`plan_write`), and produces the executable checklist (`todo_write`/`task_*`). Does **not** edit files and does **not** dispatch subagents — its turn ends after the checklist is written. | `ask_user`, `plan_write`, `todo_write`, `task_*`, plus read-only tools |
+| **BUILD** | Executor. Reads the approved plan + checklist and walks tasks directly with editor tools, one task at a time (each mutation prompts for approval). Does **not** dispatch subagents and does **not** rewrite the plan. | `plan_get`, `task_list`, `task_update`, `read_file`, `edit_file`, `write_file`, `apply_patch`, `run_command`, plus read-only tools |
 
-**There is no separate BUILD mode.** PLAN is the orchestrator; the `builder` subagent is what executes a single task end-to-end (read files → edit with approval → verify). This split is deliberate: the planner keeps a stable context across the whole workstream while each builder turn gets a fresh, tightly-scoped context for its single task.
+**The plan/build split is deliberate.** PLAN keeps a stable, long-lived context across the whole workstream while it designs and decomposes the work. BUILD then gets a tight, executor-only prompt and a build-specific policy (`NewBuildPolicy()` in `internal/agent/policy.go`) so the model can't drift back into re-planning while it should be shipping. Subagents (like `builder`, `tester`, `reviewer`) are a separate dispatch mechanism available from the planner via `execute_task` / `spawn_subagents` — they are not modes.
 
 ### The recommended workflow
 
 ```
-  EXPLORE      PLAN → builder subagent
-  ────────     ─────────────────────────────
-  1. ask questions    3. Ctrl+Shift+Tab → PLAN
-  2. read files       4. answer interview questions
-                      5. approve plan
-                      6. builder works one task at a time
+  EXPLORE         PLAN                    BUILD
+  ─────────       ──────────────────      ──────────────────────
+  1. ask          3. Shift+Tab → PLAN     6. Shift+Tab → BUILD
+  2. read files   4. answer interview     7. work the checklist
+                  5. approve plan            one task at a time
+                                             (each edit asks for
+                                             approval)
 ```
 
 **Always start in EXPLORE.** The first few minutes of any non-trivial task should be the model reading your code — *not* writing any. In EXPLORE mode there are no approval modals, no undo stack to worry about, and the model's output is pure signal about what it understands.
 
-Once you're confident the model has the right mental model of your code, switch to PLAN with `Shift+Tab`. The planner will ask 3–6 clarifying questions, write a plan document (`plan_write`), produce a checklist (`todo_write`), and offer to execute it. You can review the checklist in the right-hand panel (which shows `EXPLORE → DESIGN → REVIEW → EXECUTE` as the active phase) before approving.
+Once you're confident the model has the right mental model of your code, switch to PLAN with `Shift+Tab`. The planner will ask 3–6 clarifying questions, write a plan document (`plan_write`), and produce a checklist (`todo_write`). You can review the checklist in the right-hand panel (which shows `EXPLORE → DESIGN → REVIEW → EXECUTE` as the active phase) before approving. When the checklist is approved, switch to BUILD (`/mode build` or Shift+Tab) and the executor walks the tasks directly.
 
 ### Subagents
 
@@ -152,7 +154,7 @@ Forge ships with 9 built-in subagents. Invoke them manually with `/agent <name> 
 | `explorer` | YARN-scored | read-only | investigation, preflight |
 | `reviewer` | shared-read | read-only | diff review, PR sanity check |
 | `tester` | forked | read + `run_command` | run allowlisted test commands |
-| `builder` | forked | full mutating | executes ONE checklist task (dispatched by PLAN) |
+| `builder` | forked | full mutating | executes ONE checklist task — invoked manually with `/agent builder <task>` or via `execute_task` when you want a forked, scoped context per task instead of running tasks inline in BUILD mode |
 | `refactorer` | forked | edit + write | scoped mechanical refactors |
 | `docs` | shared-read | edit + write | update README, changelog |
 | `commit` | shared-read | git + run_command | draft and stage conventional commits |
@@ -168,7 +170,7 @@ Parallel dispatch lives in the `spawn_subagents` tool. The TUI renders each batc
     o [2] tester      pending
 ```
 
-Parallel subagents cannot mutate files (enforced at dispatch); mutations go through `builder` sequentially.
+Parallel subagents cannot mutate files (enforced at dispatch); mutations go through BUILD mode (or a sequential `builder` subagent) one task at a time.
 
 ### Native tools
 

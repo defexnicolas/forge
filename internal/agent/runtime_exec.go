@@ -919,9 +919,9 @@ If you have enough information, answer normally without calling a tool.`)
 	b.WriteString("You are Forge, a coding agent inside a terminal workbench.\n\n")
 
 	if len(askTools) > 0 {
-		b.WriteString("This sprint allows read-only tools automatically, task/plan tools, limited read-only subagents, small file edits after user approval, and safe test/diff commands through run_command. Do not request external tools, network tools, or MCP tools.\n\n")
+		b.WriteString("This mode allows read-only tools automatically, task/plan tools, limited read-only subagents, small file edits after user approval, and safe test/diff commands through run_command. Do not request external tools, network tools, or MCP tools.\n\n")
 	} else {
-		b.WriteString("This sprint allows read-only tools and planning tools only. Do not attempt to edit, write, or create files. Use plan_write for the full plan document and todo_write/task_* for the executable checklist. Do not request external tools, network tools, or MCP tools.\n\n")
+		b.WriteString("This mode allows read-only tools and planning tools only. Do not attempt to edit, write, or create files. Use plan_write for the full plan document and todo_write/task_* for the executable checklist. Do not request external tools, network tools, or MCP tools.\n\n")
 	}
 
 	b.WriteString("When you need information, request exactly one tool call using this format:\n")
