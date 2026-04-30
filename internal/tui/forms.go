@@ -160,9 +160,11 @@ func (m *model) handleFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 				m.options.Config = m.modelMultiForm.cfg
 				m.agentRuntime.Config = m.options.Config
 				m.agentRuntime.Builder.Config = m.options.Config
+				activeRole := m.activeModelRole()
+				strategy := strings.ToLower(strings.TrimSpace(m.options.Config.ModelLoading.Strategy))
 				for _, selection := range m.modelMultiForm.selections {
 					m.agentRuntime.SetRoleModel(selection.role, selection.modelID)
-					if selection.detected != nil && selection.detected.LoadedContextLength > 0 {
+					if strategy == "parallel" || selection.role == activeRole {
 						m.agentRuntime.MarkModelLoaded(selection.modelID)
 					}
 				}
@@ -227,7 +229,11 @@ func (m *model) handleFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 					m.history = append(m.history, m.theme.Success.Render("Prior plan and todos cleared."))
 					cleared = true
 				}
-				m.agentEvents = m.agentRuntime.Run(context.Background(), planInterviewPrompt(line, cleared))
+				prompt := planInterviewPrompt(line, cleared)
+				if !cleared {
+					prompt = planRefinementPrompt(line)
+				}
+				m.agentEvents = m.agentRuntime.Run(context.Background(), prompt)
 				m.agentRunning = true
 				m.refresh()
 				return m, waitForAgentEvent(m.agentEvents), true
@@ -351,6 +357,10 @@ func (m *model) runPlanExecution(line string) tea.Cmd {
 	line = strings.TrimSpace(line)
 	if line == "" {
 		line = "Execute the approved plan."
+	}
+	if m.agentRuntime != nil && m.agentRuntime.Mode == "plan" {
+		_ = m.agentRuntime.SetMode("build")
+		m.showPlan = true
 	}
 	m.pendingExecuteLine = ""
 	m.history = append(m.history, m.theme.SeparatorLine(m.width-4))

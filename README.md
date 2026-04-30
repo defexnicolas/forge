@@ -15,7 +15,7 @@ Written in Go. Runs against LM Studio, Ollama (via any OpenAI-compatible endpoin
 | **TUI** | Bubble Tea, 30fps flush, inline diff, Glamour markdown | OpenTUI, 60fps, syntax highlighting broken ([#12301](https://github.com/sst/opencode/issues/12301)) | Rich terminal, REPL-style |
 | **Parallel subagents** | Live multi-lane with `EventSubagentProgress` | Sequential despite appearing parallel ([#14195](https://github.com/sst/opencode/issues/14195)) | None |
 | **Plan mode** | Two artifacts (plan doc + checklist), phase indicator, delegates to builder subagent | Tool-restricted agent swap | None (commit-loop style) |
-| **Claude Code plugins** | Reads `.claude/plugins` + `.claude-plugin/plugin.json` natively | Partial | No |
+| **Claude Code plugins** | Discovers `.claude/plugins` + `.claude-plugin/plugin.json`, loads commands/agents/hooks/MCP | Partial | No |
 | **MCP servers** | Full stdio + SSE transport from `.mcp.json` | Full | Partial |
 | **Skills ecosystem** | `skills.sh` directory via `/skills` browser, install-scoped to project | No | No |
 | **Local-first** | Designed against LM Studio; YARN profiles sized for 2B/4B/9B/14B/26B | Cloud-first, local possible | Cloud-first |
@@ -180,7 +180,7 @@ All registered in `internal/tools/builtin.go`:
 | Search | `search_text`, `search_files` |
 | Git | `git_status`, `git_diff` |
 | Shell | `run_command`, `powershell_command` (auto-selected on Windows) |
-| Web | `web_fetch` (HTML → text via `golang.org/x/net/html`), `web_search` *(stub, pending)* |
+| Web | `web_fetch` (HTML → text via `golang.org/x/net/html`), `web_search` *(beta DDG HTML parser)* |
 | Plan/Task | `plan_write`, `plan_get`, `todo_write`, `task_create`, `task_list`, `task_get`, `task_update`, `execute_task` |
 | Subagents | `spawn_subagent`, `spawn_subagents` (max_concurrency 1–8) |
 | Interactive | `ask_user` (up to 3 suggested answers) |
@@ -234,7 +234,7 @@ summarizer = "qwen3-4b"
 
 ## Claude Code Plugin Compatibility
 
-Forge natively reads both `.forge/plugins/` and `.claude/plugins/` (project + user scope). If a directory contains a `.claude-plugin/plugin.json` manifest, Forge loads it with the same contract Claude Code uses — commands, hooks, skills, and agents all transfer over.
+Forge natively reads both `.forge/plugins/` and `.claude/plugins/` (project + user scope). If a directory contains a `.claude-plugin/plugin.json` manifest, Forge loads the plugin metadata and currently supports the Claude-compatible subset for commands, agents, hooks, and `.mcp.json`.
 
 ```toml
 [plugins]
@@ -535,7 +535,7 @@ See `docs/ARCHITECTURE.md` for a deeper walkthrough (Spanish).
 ## Coming Soon
 
 - **Patronus** — cloud model as advisor. A Patronus hook will route specific checkpoints (plan review, risky approval, critical refactor) through a cloud model (Claude Opus / GPT-5) as a second-opinion layer, while the main loop stays on your local model. Latency is amortized by making the advisor calls async — you keep coding; Patronus surfaces its flags in the plan panel when they're ready. Target: opt-in via `[advisor]` config block.
-- **`web_search` tool** — currently a stub, implementation in progress.
+- **`web_search` tool** — implemented as a beta DuckDuckGo HTML parser; useful, but still parser-fragile compared with API-backed search.
 - **LSP integration** — `internal/lsp/` has the client interface; wiring into the context builder for symbol-aware injection is on the roadmap.
 
 ---

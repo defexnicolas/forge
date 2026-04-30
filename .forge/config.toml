@@ -15,16 +15,27 @@ supports_tools = true
 
 [providers.lmstudio]
 type = 'openai-compatible'
-base_url = 'http://localhost:9099/v1'
+base_url = 'http://localhost:1234/v1'
 api_key = 'lm-studio'
 api_key_env = ''
 default_model = 'local-model'
-supports_tools = false
+supports_tools = true
 
 [context]
 engine = 'yarn'
 budget_tokens = 12000
 auto_compact = true
+
+[context.task]
+budget_tokens = 12000
+max_file_bytes = 30000
+history_events = 12
+
+[runtime]
+request_timeout_seconds = 1800
+subagent_timeout_seconds = 3600
+task_timeout_seconds = 7200
+retry_on_provider_timeout = true
 
 [skills]
 cli = 'npx'

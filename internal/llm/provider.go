@@ -4,7 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
+	"net/url"
+	"strings"
 	"sync"
+	"syscall"
 )
 
 type Message struct {
@@ -40,7 +44,7 @@ type ChatRequest struct {
 	Model       string    `json:"model"`
 	Messages    []Message `json:"messages"`
 	Tools       []ToolDef `json:"tools,omitempty"`
-	Temperature float64   `json:"temperature,omitempty"`
+	Temperature *float64  `json:"temperature,omitempty"`
 }
 
 type ChatResponse struct {
@@ -125,3 +129,60 @@ func (r *Registry) Names() []string {
 
 var ErrProviderNotConfigured = errors.New("provider is not configured")
 var ErrNotSupported = errors.New("operation not supported by this provider")
+
+func IsProviderTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded")
+}
+
+func IsProviderUnavailable(err error) bool {
+	if err == nil || IsProviderTimeout(err) {
+		return false
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Err != nil {
+		err = urlErr.Err
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		if errors.Is(opErr.Err, syscall.ECONNREFUSED) {
+			return true
+		}
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "actively refused") ||
+		strings.Contains(msg, "no such host") ||
+		strings.Contains(msg, "server misbehaving")
+}
+
+func IsToolCallingUnsupported(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	hasToolHint := strings.Contains(msg, "tools") ||
+		strings.Contains(msg, "tool_calls") ||
+		strings.Contains(msg, "tool calls") ||
+		strings.Contains(msg, "function calling") ||
+		strings.Contains(msg, "functions")
+	if !hasToolHint {
+		return false
+	}
+	return strings.Contains(msg, "unsupported") ||
+		strings.Contains(msg, "not supported") ||
+		strings.Contains(msg, "does not support") ||
+		strings.Contains(msg, "unknown field") ||
+		strings.Contains(msg, "invalid field") ||
+		strings.Contains(msg, "unrecognized field")
+}

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"strings"
 	"testing"
 
 	"forge/internal/config"
@@ -9,7 +10,7 @@ import (
 )
 
 func TestAllModesExist(t *testing.T) {
-	for _, name := range []string{"plan", "explore"} {
+	for _, name := range []string{"plan", "build", "explore"} {
 		mode, ok := GetMode(name)
 		if !ok {
 			t.Fatalf("mode %s should exist", name)
@@ -26,18 +27,12 @@ func TestAllModesExist(t *testing.T) {
 	}
 }
 
-func TestBuildModeRemoved(t *testing.T) {
-	if _, ok := GetMode("build"); ok {
-		t.Fatal("build mode was removed; execution now runs via the builder subagent dispatched by plan mode")
-	}
-}
-
 func TestModeNames(t *testing.T) {
 	names := ModeNames()
-	if len(names) != 2 {
-		t.Fatalf("expected 2 modes (plan + explore), got %d: %v", len(names), names)
+	if len(names) != 3 {
+		t.Fatalf("expected 3 modes (plan + build + explore), got %d: %v", len(names), names)
 	}
-	expected := []string{"explore", "plan"}
+	expected := []string{"build", "explore", "plan"}
 	for i, name := range expected {
 		if names[i] != name {
 			t.Fatalf("expected mode %d to be %s, got %s (full: %v)", i, name, names[i], names)
@@ -47,17 +42,38 @@ func TestModeNames(t *testing.T) {
 
 func TestPlanModeDeniesEdits(t *testing.T) {
 	mode, _ := GetMode("plan")
-	for _, tool := range []string{"edit_file", "write_file", "apply_patch", "run_command"} {
+	for _, tool := range []string{"edit_file", "write_file", "apply_patch", "run_command", "execute_task", "spawn_subagent", "spawn_subagents"} {
 		decision, _ := mode.Policy.Decision(tool)
 		if decision != ToolDeny {
 			t.Fatalf("plan mode should deny %s, got %s", tool, decision)
 		}
 	}
-	// But allows reads + the delegation primitives.
-	for _, tool := range []string{"read_file", "search_text", "plan_write", "plan_get", "todo_write", "spawn_subagents", "execute_task"} {
+	for _, tool := range []string{"read_file", "search_text", "plan_write", "plan_get", "todo_write", "task_list", "task_update", "ask_user"} {
 		decision, _ := mode.Policy.Decision(tool)
 		if decision != ToolAllow {
 			t.Fatalf("plan mode should allow %s, got %s", tool, decision)
+		}
+	}
+}
+
+func TestBuildModeAllowsEditsUnderApproval(t *testing.T) {
+	mode, _ := GetMode("build")
+	for _, tool := range []string{"edit_file", "write_file", "apply_patch", "run_command", "powershell_command"} {
+		decision, _ := mode.Policy.Decision(tool)
+		if decision != ToolAsk {
+			t.Fatalf("build mode should require approval for %s, got %s", tool, decision)
+		}
+	}
+	for _, tool := range []string{"read_file", "list_files", "search_text", "plan_get", "task_list", "task_update"} {
+		decision, _ := mode.Policy.Decision(tool)
+		if decision != ToolAllow {
+			t.Fatalf("build mode should allow %s, got %s", tool, decision)
+		}
+	}
+	for _, tool := range []string{"plan_write", "todo_write", "execute_task", "spawn_subagent", "spawn_subagents"} {
+		decision, _ := mode.Policy.Decision(tool)
+		if decision != ToolDeny {
+			t.Fatalf("build mode should deny %s (executor must not re-plan or recurse), got %s", tool, decision)
 		}
 	}
 }
@@ -90,12 +106,17 @@ func TestSetModeValid(t *testing.T) {
 	if runtime.Mode != "explore" {
 		t.Fatalf("expected explore, got %s", runtime.Mode)
 	}
-	// Legacy "build" requests re-map silently to "plan" for backwards compat.
 	if err := runtime.SetMode("build"); err != nil {
 		t.Fatal(err)
 	}
+	if runtime.Mode != "build" {
+		t.Fatalf("SetMode(build) should switch to build, got %s", runtime.Mode)
+	}
+	if err := runtime.SetMode("plan"); err != nil {
+		t.Fatal(err)
+	}
 	if runtime.Mode != "plan" {
-		t.Fatalf("SetMode(build) should re-map to plan, got %s", runtime.Mode)
+		t.Fatalf("expected plan, got %s", runtime.Mode)
 	}
 }
 
@@ -111,5 +132,41 @@ func TestUnknownModeNotFound(t *testing.T) {
 	_, ok := GetMode("nonexistent")
 	if ok {
 		t.Fatal("nonexistent mode should not be found")
+	}
+}
+
+func TestSystemPromptIncludesBuildModeInstructions(t *testing.T) {
+	for _, native := range []bool{true, false} {
+		sp := systemPrompt(native, "build", NewBuildPolicy())
+		if !strings.Contains(sp, "You are in build mode") {
+			t.Fatalf("native=%v: build-mode prompt missing build-mode instructions:\n%s", native, sp)
+		}
+		if !strings.Contains(sp, "task_update") {
+			t.Fatalf("native=%v: build-mode prompt should mention task_update", native)
+		}
+		if !strings.Contains(sp, "Do NOT call execute_task") {
+			t.Fatalf("native=%v: build-mode prompt should forbid execute_task", native)
+		}
+	}
+}
+
+func TestSystemPromptHidesDeniedToolExamplesInBuildMode(t *testing.T) {
+	sp := systemPrompt(false, "build", NewBuildPolicy())
+	for _, denied := range []string{`"name":"plan_write"`, `"name":"todo_write"`, `"name":"task_create"`, `"name":"spawn_subagent"`} {
+		if strings.Contains(sp, denied) {
+			t.Fatalf("build-mode prompt should not advertise %s (build denies it):\n%s", denied, sp)
+		}
+	}
+}
+
+func TestSystemPromptKeepsExamplesInPlanMode(t *testing.T) {
+	sp := systemPrompt(false, "plan", NewPlanPolicy())
+	for _, allowed := range []string{`"name":"plan_write"`, `"name":"task_create"`, `"name":"task_update"`} {
+		if !strings.Contains(sp, allowed) {
+			t.Fatalf("plan-mode prompt should still show %s example:\n%s", allowed, sp)
+		}
+	}
+	if !strings.Contains(sp, "Use todo_write only when starting from scratch") {
+		t.Fatal("plan-mode prompt should keep the todo_write usage note")
 	}
 }

@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"forge/internal/config"
+	"forge/internal/gitops"
 	"forge/internal/llm"
 	"forge/internal/plans"
 	"forge/internal/tools"
@@ -55,7 +57,17 @@ func (f *batchFakeProvider) Chat(ctx context.Context, req llm.ChatRequest) (*llm
 	return &llm.ChatResponse{Content: content}, nil
 }
 func (f *batchFakeProvider) Stream(ctx context.Context, req llm.ChatRequest) (<-chan llm.ChatEvent, error) {
-	return nil, nil
+	resp, err := f.Chat(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	ch := make(chan llm.ChatEvent, 2)
+	if resp.Content != "" {
+		ch <- llm.ChatEvent{Type: "text", Text: resp.Content}
+	}
+	ch <- llm.ChatEvent{Type: "done"}
+	close(ch)
+	return ch, nil
 }
 func (f *batchFakeProvider) ListModels(ctx context.Context) ([]llm.ModelInfo, error) {
 	return nil, nil
@@ -68,6 +80,136 @@ func (f *batchFakeProvider) LoadModel(ctx context.Context, id string, cfg llm.Lo
 	defer f.mu.Unlock()
 	f.loads = append(f.loads, id)
 	return nil
+}
+
+type blockingProvider struct {
+	requests []llm.ChatRequest
+	name     string
+}
+
+func (p *blockingProvider) Name() string {
+	if p.name != "" {
+		return p.name
+	}
+	return "fake"
+}
+func (p *blockingProvider) Chat(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
+	p.requests = append(p.requests, req)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+func (p *blockingProvider) Stream(ctx context.Context, req llm.ChatRequest) (<-chan llm.ChatEvent, error) {
+	p.requests = append(p.requests, req)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+func (p *blockingProvider) ListModels(ctx context.Context) ([]llm.ModelInfo, error) {
+	return nil, nil
+}
+func (p *blockingProvider) ProbeModel(ctx context.Context, id string) (*llm.ModelInfo, error) {
+	return nil, nil
+}
+func (p *blockingProvider) LoadModel(ctx context.Context, id string, cfg llm.LoadConfig) error {
+	return nil
+}
+
+type streamOnlyProvider struct {
+	requests []llm.ChatRequest
+}
+
+func (p *streamOnlyProvider) Name() string { return "fake" }
+func (p *streamOnlyProvider) Chat(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
+	return nil, fmt.Errorf("Chat should not be used")
+}
+func (p *streamOnlyProvider) Stream(ctx context.Context, req llm.ChatRequest) (<-chan llm.ChatEvent, error) {
+	p.requests = append(p.requests, req)
+	ch := make(chan llm.ChatEvent, 2)
+	ch <- llm.ChatEvent{Type: "text", Text: `{"status":"completed","summary":"streamed ok"}`}
+	ch <- llm.ChatEvent{Type: "done"}
+	close(ch)
+	return ch, nil
+}
+func (p *streamOnlyProvider) ListModels(ctx context.Context) ([]llm.ModelInfo, error) {
+	return nil, nil
+}
+func (p *streamOnlyProvider) ProbeModel(ctx context.Context, id string) (*llm.ModelInfo, error) {
+	return nil, nil
+}
+func (p *streamOnlyProvider) LoadModel(ctx context.Context, id string, cfg llm.LoadConfig) error {
+	return nil
+}
+
+// midStreamErrorProvider emits a valid tool_calls event followed by an error
+// event — the same pattern LM Studio produces when the SSE connection drops
+// after the model has already committed to a tool call. The Builder must
+// process the partial progress instead of discarding it.
+type midStreamErrorProvider struct {
+	requests []llm.ChatRequest
+}
+
+func (p *midStreamErrorProvider) Name() string { return "fake" }
+func (p *midStreamErrorProvider) Chat(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
+	return nil, fmt.Errorf("Chat should not be used")
+}
+func (p *midStreamErrorProvider) Stream(ctx context.Context, req llm.ChatRequest) (<-chan llm.ChatEvent, error) {
+	p.requests = append(p.requests, req)
+	ch := make(chan llm.ChatEvent, 3)
+	if len(p.requests) == 1 {
+		ch <- llm.ChatEvent{Type: "tool_calls", ToolCalls: []llm.ToolCall{{
+			ID:   "tc-1",
+			Type: "function",
+			Function: llm.FunctionCall{
+				Name:      "task_update",
+				Arguments: `{"id":"plan-1","status":"completed","summary":"done via partial stream"}`,
+			},
+		}}}
+		ch <- llm.ChatEvent{Type: "error", Error: context.DeadlineExceeded}
+	} else {
+		ch <- llm.ChatEvent{Type: "text", Text: `{"status":"completed","summary":"final result"}`}
+		ch <- llm.ChatEvent{Type: "done"}
+	}
+	close(ch)
+	return ch, nil
+}
+func (p *midStreamErrorProvider) ListModels(ctx context.Context) ([]llm.ModelInfo, error) {
+	return nil, nil
+}
+func (p *midStreamErrorProvider) ProbeModel(ctx context.Context, id string) (*llm.ModelInfo, error) {
+	return nil, nil
+}
+func (p *midStreamErrorProvider) LoadModel(ctx context.Context, id string, cfg llm.LoadConfig) error {
+	return nil
+}
+
+func TestStreamSubagentResponsePreservesToolCallOnMidStreamError(t *testing.T) {
+	cwd := t.TempDir()
+	cfg := config.Defaults()
+	cfg.Providers.Default.Name = "fake"
+	registry := tools.NewRegistry()
+	tools.RegisterBuiltins(registry)
+	providers := llm.NewRegistry()
+	provider := &midStreamErrorProvider{}
+	providers.Register(provider)
+	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+
+	tasksList, err := runtime.Tasks.ReplacePlan([]string{"plan-1 task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, _ := json.Marshal(map[string]any{"task_id": tasksList[0].ID})
+	result, observation := runtime.executeExecuteTask(context.Background(), input)
+	if result == nil {
+		t.Fatal("expected execute_task result")
+	}
+	// The first stream errored mid-flight after a valid tool_call; the second
+	// completes normally. Without the resilience patch the very first error
+	// would propagate as a subagent failure (no "builder completed task").
+	if !strings.Contains(observation, "builder completed task") {
+		t.Fatalf("expected builder to recover from mid-stream error, got: %s", observation)
+	}
+	if len(provider.requests) < 2 {
+		t.Fatalf("expected Builder to follow up with a second request after the partial tool call, got %d", len(provider.requests))
+	}
 }
 
 func TestBuilderSubagentExists(t *testing.T) {
@@ -94,6 +236,32 @@ func TestBuilderSubagentExists(t *testing.T) {
 	}
 }
 
+func TestRunSubagentUsesStreamWhenAvailable(t *testing.T) {
+	cwd := t.TempDir()
+	cfg := config.Defaults()
+	cfg.Providers.Default.Name = "fake"
+	registry := tools.NewRegistry()
+	tools.RegisterBuiltins(registry)
+	providers := llm.NewRegistry()
+	provider := &streamOnlyProvider{}
+	providers.Register(provider)
+	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+
+	result, err := runtime.RunSubagent(context.Background(), SubagentRequest{
+		Agent:  "builder",
+		Prompt: "small context",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result.Summary, "streamed ok") {
+		t.Fatalf("expected streamed summary, got %#v", result)
+	}
+	if len(provider.requests) == 0 {
+		t.Fatal("expected Stream to be used")
+	}
+}
+
 func TestExecuteTaskPassesOnlyTaskAsContext(t *testing.T) {
 	cwd := t.TempDir()
 	cfg := config.Defaults()
@@ -104,6 +272,11 @@ func TestExecuteTaskPassesOnlyTaskAsContext(t *testing.T) {
 	providers := llm.NewRegistry()
 	providers.Register(provider)
 	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+	runtime.SetGitSessionState(gitops.SessionState{
+		RepoInitialized: true,
+		DirtyWorktree:   true,
+		BaselinePresent: true,
+	})
 
 	// Save a plan document with details that MUST NOT leak to the builder,
 	// and a task whose title is what SHOULD appear in the builder prompt.
@@ -128,6 +301,9 @@ func TestExecuteTaskPassesOnlyTaskAsContext(t *testing.T) {
 	if len(provider.requests) == 0 {
 		t.Fatal("expected subagent to have invoked the provider")
 	}
+	if provider.requests[0].Temperature != nil {
+		t.Fatalf("expected builder request to omit temperature override, got %#v", *provider.requests[0].Temperature)
+	}
 	userMsg := provider.requests[0].Messages[1].Content
 	if !strings.Contains(userMsg, "BUILDER_TASK_TITLE") {
 		t.Fatalf("expected task title in builder prompt, got:\n%s", userMsg)
@@ -138,6 +314,9 @@ func TestExecuteTaskPassesOnlyTaskAsContext(t *testing.T) {
 	}
 	if !strings.Contains(userMsg, "a.go") || !strings.Contains(userMsg, "b.go") {
 		t.Fatalf("expected relevant_files in builder context, got:\n%s", userMsg)
+	}
+	if !strings.Contains(userMsg, "Git state: Git: initialized, dirty worktree. Baseline: present.") {
+		t.Fatalf("expected git state in builder context, got:\n%s", userMsg)
 	}
 }
 
@@ -158,6 +337,49 @@ func TestExecuteTaskRejectsMissingTaskID(t *testing.T) {
 	}
 	if !strings.Contains(observation, "task_id is required") {
 		t.Fatalf("expected task_id required error, got %s", observation)
+	}
+}
+
+func TestExecuteTaskTimeoutReturnsStructuredFailure(t *testing.T) {
+	cwd := t.TempDir()
+	cfg := config.Defaults()
+	cfg.Providers.Default.Name = "lmstudio"
+	cfg.Providers.LMStudio.BaseURL = "http://localhost:1234/v1"
+	cfg.Runtime.RequestTimeoutSeconds = 1
+	cfg.Runtime.TaskTimeoutSeconds = 1
+	registry := tools.NewRegistry()
+	tools.RegisterBuiltins(registry)
+	providers := llm.NewRegistry()
+	providers.Register(&blockingProvider{name: "lmstudio"})
+	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+
+	tasksList, err := runtime.Tasks.ReplacePlan([]string{"Ship the task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, _ := json.Marshal(map[string]any{"task_id": tasksList[0].ID})
+	result, observation := runtime.executeExecuteTask(context.Background(), input)
+	if result == nil {
+		t.Fatal("expected execute_task result")
+	}
+	if !strings.Contains(observation, "builder failed task") {
+		t.Fatalf("expected builder failure observation, got %s", observation)
+	}
+	meta, ok := parseExecuteTaskFailureMeta(result)
+	if !ok {
+		t.Fatalf("expected structured failure metadata, got %#v", result)
+	}
+	if meta.TaskID != tasksList[0].ID || meta.FailureKind != "timeout" || !meta.TimedOut {
+		t.Fatalf("unexpected execute_task failure metadata: %#v", meta)
+	}
+	if meta.Provider != "lmstudio" || meta.BaseURL != "http://localhost:1234/v1" || meta.Model != "local-model" {
+		t.Fatalf("expected provider details in failure metadata, got %#v", meta)
+	}
+	if meta.ModelRole == "" || meta.Cause == "" || meta.Summary == "" {
+		t.Fatalf("expected model role/cause/summary in failure metadata, got %#v", meta)
+	}
+	if !strings.Contains(meta.Summary, "timeout while waiting for provider response") {
+		t.Fatalf("expected timeout summary, got %q", meta.Summary)
 	}
 }
 
@@ -259,6 +481,7 @@ func TestBuilderSubagentGetsHigherStepBudget(t *testing.T) {
 	cwd := t.TempDir()
 	cfg := config.Defaults()
 	cfg.Providers.Default.Name = "fake"
+	cfg.Runtime.MaxBuilderReadLoops = 8
 	registry := tools.NewRegistry()
 	tools.RegisterBuiltins(registry)
 	if err := os.WriteFile(filepath.Join(cwd, "notes.txt"), []byte("builder context"), 0o644); err != nil {

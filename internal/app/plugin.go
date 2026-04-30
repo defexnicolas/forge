@@ -229,14 +229,10 @@ func newPluginInspectCommand() *cobra.Command {
 				if p.Description != "" {
 					info["description"] = p.Description
 				}
-				// Check for components.
-				components := []string{}
-				for _, c := range []string{"skills", "commands", "agents", "hooks", ".mcp.json", "bin", "output-styles"} {
-					if _, err := os.Stat(filepath.Join(p.Path, c)); err == nil {
-						components = append(components, c)
-					}
-				}
-				info["components"] = strings.Join(components, ", ")
+				info["compatibility"] = p.CompatibilityStatus()
+				info["supported_components"] = strings.Join(p.SupportedComponents(), ", ")
+				info["pending_components"] = strings.Join(p.PendingComponents(), ", ")
+				info["components"] = strings.Join(p.Components(), ", ")
 
 				enc := json.NewEncoder(cmd.OutOrStdout())
 				enc.SetIndent("", "  ")

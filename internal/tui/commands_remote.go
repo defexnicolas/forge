@@ -82,15 +82,9 @@ func (m *model) startRemote(fields []string) string {
 	}
 	hub := remote.NewHub()
 	srv, err := remote.New(remote.Config{
-		Port: port,
-		Hub:  hub,
-		SessionFn: func() any {
-			return map[string]any{
-				"cwd":   m.options.CWD,
-				"mode":  m.agentRuntime.Mode,
-				"model": currentModelName(*m),
-			}
-		},
+		Port:      port,
+		Hub:       hub,
+		SessionFn: func() any { return m.remoteSessionSnapshot() },
 	})
 	if err != nil {
 		return t.ErrorStyle.Render("remote: " + err.Error())
@@ -157,4 +151,33 @@ func pumpRemoteInputs(ctx context.Context, inputs <-chan remote.Input) tea.Cmd {
 			return remoteInputMsg{Kind: in.Kind, Text: in.Text}
 		}
 	}
+}
+
+func (m model) remoteSessionSnapshot() map[string]any {
+	return map[string]any{
+		"cwd":        m.options.CWD,
+		"mode":       m.agentRuntime.Mode,
+		"model":      currentModelName(m),
+		"status":     stripAnsi(m.statusLineView()),
+		"history":    m.remoteHistoryLines(),
+		"streaming":  m.streaming,
+		"activeRole": m.activeModelRole(),
+	}
+}
+
+func (m model) remoteHistoryLines() []string {
+	lines := append([]string(nil), m.history...)
+	if m.streaming && m.streamingStartIdx >= 0 {
+		streamingLine := indentBlock(formatStreamingText(m.streamingRaw.String(), m.thinkEnabled, m.theme), "    ")
+		if m.streamingStartIdx < len(lines) {
+			lines[m.streamingStartIdx] = streamingLine
+		} else {
+			lines = append(lines, streamingLine)
+		}
+	}
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		out = append(out, stripAnsi(line))
+	}
+	return out
 }

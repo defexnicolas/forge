@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"forge/internal/config"
+	"forge/internal/gitops"
 	"forge/internal/skills"
 	"forge/internal/tools"
 	"forge/internal/yarn"
@@ -33,6 +34,21 @@ func TestBuildWithoutAgentsMD(t *testing.T) {
 	snapshot := builder.Build("hello")
 	if len(snapshot.Items) != 0 {
 		t.Fatalf("expected no items, got %#v", snapshot.Items)
+	}
+}
+
+func TestBuildIncludesGitStateInStableContext(t *testing.T) {
+	cwd := t.TempDir()
+	builder := NewBuilder(cwd, config.Defaults(), tools.NewRegistry())
+	builder.GitState = &gitops.SessionState{
+		RepoInitialized: true,
+		DirtyWorktree:   true,
+		BaselinePresent: true,
+	}
+	snapshot := builder.Build("hello")
+	rendered := snapshot.RenderStable()
+	if !strings.Contains(rendered, "Git: initialized, dirty worktree. Baseline: present.") {
+		t.Fatalf("expected git fact in stable render, got:\n%s", rendered)
 	}
 }
 

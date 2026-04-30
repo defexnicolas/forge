@@ -38,8 +38,10 @@ func (s *Service) EnsureSnapshot(ctx context.Context, cwd string) (Snapshot, err
 	root := filepath.ToSlash(abs)
 
 	if snap, ok, err := s.store.Get(root); err == nil && ok {
-		s.set(snap)
-		return snap, nil
+		if head := currentGitHead(abs); head == "" || snap.GitHead == "" || head == snap.GitHead {
+			s.set(snap)
+			return snap, nil
+		}
 	} else if err != nil {
 		return Snapshot{}, fmt.Errorf("projectstate get: %w", err)
 	}
@@ -53,6 +55,11 @@ func (s *Service) EnsureSnapshot(ctx context.Context, cwd string) (Snapshot, err
 	}
 	s.set(snap)
 	return snap, nil
+}
+
+func currentGitHead(cwd string) string {
+	_, head, _ := gitInfo(cwd)
+	return head
 }
 
 // Rescan forces a fresh scan and overwrites the cache.

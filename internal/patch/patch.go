@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"forge/internal/gitops"
 )
 
 type Operation struct {
@@ -24,6 +26,7 @@ type Snapshot struct {
 	Path    string
 	Exists  bool
 	Content []byte
+	Patch   string
 }
 
 func ExactReplace(cwd, relPath, oldText, newText string) (Plan, error) {
@@ -134,9 +137,16 @@ func Diff(plan Plan) string {
 	for _, op := range plan.Operations {
 		oldLines := splitLines(op.OldText)
 		newLines := splitLines(op.NewText)
-		fmt.Fprintf(&b, "--- %s\n", op.Path)
-		fmt.Fprintf(&b, "+++ %s\n", op.Path)
-		fmt.Fprintf(&b, "@@ -1,%d +1,%d @@\n", max(1, len(oldLines)), max(1, len(newLines)))
+		fmt.Fprintf(&b, "diff --git a/%s b/%s\n", op.Path, op.Path)
+		if op.NewFile {
+			fmt.Fprintf(&b, "new file mode 100644\n")
+			fmt.Fprintf(&b, "--- /dev/null\n")
+			fmt.Fprintf(&b, "+++ b/%s\n", op.Path)
+		} else {
+			fmt.Fprintf(&b, "--- a/%s\n", op.Path)
+			fmt.Fprintf(&b, "+++ b/%s\n", op.Path)
+		}
+		fmt.Fprintf(&b, "@@ -%d,%d +%d,%d @@\n", hunkStart(oldLines), len(oldLines), hunkStart(newLines), len(newLines))
 		lcs := longestCommonSubsequence(oldLines, newLines)
 		oldIdx, newIdx := 0, 0
 		for _, pair := range lcs {
@@ -161,30 +171,15 @@ func Diff(plan Plan) string {
 			newIdx++
 		}
 	}
-	return strings.TrimRight(b.String(), "\n")
+	return b.String()
 }
 
 func Apply(cwd string, plan Plan) ([]Snapshot, error) {
 	if len(plan.Operations) == 0 {
-		fmt.Fprintf(os.Stderr, "patch.Apply: plan has 0 operations — nothing to write\n")
+		fmt.Fprintf(os.Stderr, "patch.Apply: plan has 0 operations - nothing to write\n")
 		return nil, nil
 	}
-	snapshots := make([]Snapshot, 0, len(plan.Operations))
-	for _, op := range plan.Operations {
-		path, err := WorkspacePath(cwd, op.Path)
-		if err != nil {
-			return nil, err
-		}
-		snapshot := Snapshot{Path: op.Path}
-		data, err := os.ReadFile(path)
-		if err == nil {
-			snapshot.Exists = true
-			snapshot.Content = append([]byte(nil), data...)
-		} else if !os.IsNotExist(err) {
-			return nil, err
-		}
-		snapshots = append(snapshots, snapshot)
-	}
+	diff := Diff(plan)
 	for _, op := range plan.Operations {
 		path, err := WorkspacePath(cwd, op.Path)
 		if err != nil {
@@ -193,15 +188,17 @@ func Apply(cwd string, plan Plan) ([]Snapshot, error) {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			return nil, err
 		}
-		if err := os.WriteFile(path, []byte(op.NewText), 0o644); err != nil {
-			return nil, err
-		}
-		fmt.Fprintf(os.Stderr, "patch.Apply: wrote %s (%d bytes)\n", path, len(op.NewText))
 	}
-	return snapshots, nil
+	if err := gitops.ApplyPatch(cwd, diff); err != nil {
+		return nil, err
+	}
+	return []Snapshot{{Patch: diff}}, nil
 }
 
 func Undo(cwd string, snapshots []Snapshot) error {
+	if len(snapshots) == 1 && strings.TrimSpace(snapshots[0].Patch) != "" {
+		return gitops.ReversePatch(cwd, snapshots[0].Patch)
+	}
 	for i := len(snapshots) - 1; i >= 0; i-- {
 		snapshot := snapshots[i]
 		path, err := WorkspacePath(cwd, snapshot.Path)
@@ -371,6 +368,13 @@ func joinLines(lines []string) string {
 		return ""
 	}
 	return strings.Join(lines, "\n") + "\n"
+}
+
+func hunkStart(lines []string) int {
+	if len(lines) == 0 {
+		return 0
+	}
+	return 1
 }
 
 type lcsPair struct {

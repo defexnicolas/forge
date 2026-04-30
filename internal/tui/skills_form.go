@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -222,14 +223,19 @@ func (f skillsForm) Update(msg tea.Msg) (skillsForm, tea.Cmd) {
 				}
 				var err error
 				var installed skills.Skill
-				if skill.Source == "skills-cli" {
+				if usesBuiltinSkillInstaller(skill) {
+					err = skills.InstallBuiltin(f.cwd, skill.Name)
+					if err != nil {
+						err = fmt.Errorf("built-in skill install failed: %w", err)
+					} else {
+						installed, _ = f.manager.FindInstalled(skill.Name)
+					}
+				} else {
 					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 					installed, err = f.manager.InstallAndVerify(ctx, skill)
 					cancel()
-				} else {
-					err = skills.InstallBuiltin(f.cwd, skill.Name)
-					if err == nil {
-						installed, _ = f.manager.FindInstalled(skill.Name)
+					if err != nil {
+						err = fmt.Errorf("skills CLI install failed: %w", err)
 					}
 				}
 				if err != nil {
@@ -362,6 +368,14 @@ func fallbackSkills(mgr *skills.Manager) []skills.Skill {
 	all := local
 	all = append(all, skills.SearchAvailable("", installed)...)
 	return all
+}
+
+func usesBuiltinSkillInstaller(skill skills.Skill) bool {
+	source := strings.TrimSpace(skill.Source)
+	if source == "builtin" {
+		return true
+	}
+	return source == "" && strings.TrimSpace(skill.Repo) == ""
 }
 
 const skillsVisibleRows = 12

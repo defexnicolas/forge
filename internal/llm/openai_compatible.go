@@ -49,15 +49,7 @@ func (p *OpenAICompatible) Chat(ctx context.Context, req ChatRequest) (*ChatResp
 		req.Model = p.cfg.DefaultModel
 	}
 
-	payload := map[string]any{
-		"model":       req.Model,
-		"messages":    req.Messages,
-		"temperature": req.Temperature,
-		"stream":      false,
-	}
-	if len(req.Tools) > 0 {
-		payload["tools"] = req.Tools
-	}
+	payload := buildChatPayload(req, false)
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
@@ -116,15 +108,7 @@ func (p *OpenAICompatible) Stream(ctx context.Context, req ChatRequest) (<-chan 
 		req.Model = p.cfg.DefaultModel
 	}
 
-	payload := map[string]any{
-		"model":       req.Model,
-		"messages":    req.Messages,
-		"temperature": req.Temperature,
-		"stream":      true,
-	}
-	if len(req.Tools) > 0 {
-		payload["tools"] = req.Tools
-	}
+	payload := buildChatPayload(req, true)
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
@@ -157,7 +141,15 @@ func (p *OpenAICompatible) Stream(ctx context.Context, req ChatRequest) (<-chan 
 	go func() {
 		defer close(events)
 		defer resp.Body.Close()
-		p.readSSE(resp.Body, events)
+		var reader io.Reader = resp.Body
+		if logPath := strings.TrimSpace(os.Getenv("FORGE_SSE_LOG")); logPath != "" {
+			if f, ferr := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); ferr == nil {
+				defer f.Close()
+				fmt.Fprintf(f, "\n=== %s | %s | model=%s ===\n", time.Now().Format(time.RFC3339Nano), p.name, req.Model)
+				reader = io.TeeReader(resp.Body, f)
+			}
+		}
+		p.readSSE(reader, events)
 	}()
 	return events, nil
 }
@@ -191,8 +183,9 @@ func (p *OpenAICompatible) readSSE(body io.Reader, events chan<- ChatEvent) {
 			Usage   *TokenUsage `json:"usage,omitempty"`
 			Choices []struct {
 				Delta struct {
-					Content   string          `json:"content"`
-					ToolCalls []toolCallDelta `json:"tool_calls"`
+					Content          string          `json:"content"`
+					ReasoningContent string          `json:"reasoning_content"`
+					ToolCalls        []toolCallDelta `json:"tool_calls"`
 				} `json:"delta"`
 			} `json:"choices"`
 		}
@@ -207,6 +200,9 @@ func (p *OpenAICompatible) readSSE(body io.Reader, events chan<- ChatEvent) {
 		}
 		delta := chunk.Choices[0].Delta
 
+		if delta.ReasoningContent != "" {
+			events <- ChatEvent{Type: "reasoning", Text: delta.ReasoningContent}
+		}
 		if delta.Content != "" {
 			events <- ChatEvent{Type: "text", Text: delta.Content}
 		}
@@ -257,6 +253,21 @@ func mergeToolCallDelta(calls []ToolCall, delta toolCallDelta) []ToolCall {
 		tc.Function.Arguments += delta.Function.Arguments
 	}
 	return calls
+}
+
+func buildChatPayload(req ChatRequest, stream bool) map[string]any {
+	payload := map[string]any{
+		"model":    req.Model,
+		"messages": req.Messages,
+		"stream":   stream,
+	}
+	if len(req.Tools) > 0 {
+		payload["tools"] = req.Tools
+	}
+	if req.Temperature != nil {
+		payload["temperature"] = *req.Temperature
+	}
+	return payload
 }
 
 func (p *OpenAICompatible) ListModels(ctx context.Context) ([]ModelInfo, error) {

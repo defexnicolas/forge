@@ -10,6 +10,7 @@ import (
 
 	"forge/internal/config"
 	"forge/internal/db"
+	"forge/internal/gitops"
 	"forge/internal/hooks"
 	"forge/internal/llm"
 	"forge/internal/mcp"
@@ -53,15 +54,31 @@ func NewRootCommand() *cobra.Command {
 					fmt.Fprintln(cmd.OutOrStdout(), "Aborted.")
 					return nil
 				}
-				// Auto-init.
-				if err := os.MkdirAll(forgeDir, 0o755); err != nil {
+				if err := ensureProjectScaffold(cwd, cmd.OutOrStdout(), false); err != nil {
 					return err
 				}
-				for _, sub := range []string{"sessions", "yarn", "tools", "skills", "plugins", filepath.Join("cache", "skills")} {
-					_ = os.MkdirAll(filepath.Join(forgeDir, sub), 0o755)
-				}
-				_ = os.MkdirAll(filepath.Join(cwd, ".agents", "skills"), 0o755)
 				fmt.Fprintf(cmd.OutOrStdout(), "Initialized .forge/ in %s\n\n", cwd)
+			}
+
+			if err := ensureProjectScaffold(cwd, cmd.OutOrStdout(), false); err != nil {
+				return err
+			}
+
+			cfg, err := config.Load(cwd)
+			if err != nil {
+				return err
+			}
+			gitState, err := gitops.InspectSessionState(
+				cwd,
+				cfg.Git.AutoInit,
+				cfg.Git.RequireCleanOrSnapshot,
+				cfg.Git.BaselineCommitMessage,
+			)
+			if err != nil {
+				return err
+			}
+			if gitState.AutoInitialized {
+				fmt.Fprintf(cmd.OutOrStdout(), "Initialized git repository in %s\n", cwd)
 			}
 
 			// Redirect stderr to .forge/forge.log BEFORE any work that may
@@ -71,11 +88,6 @@ func NewRootCommand() *cobra.Command {
 			// process — no close hook needed, the OS reclaims the fd at
 			// exit.
 			_ = redirectStderrToLog(cwd)
-
-			cfg, err := config.Load(cwd)
-			if err != nil {
-				return err
-			}
 
 			registry := tools.NewRegistry()
 			tools.RegisterBuiltins(registry)
@@ -150,9 +162,10 @@ func NewRootCommand() *cobra.Command {
 					Copy:         cfg.Skills.Copy,
 					Installer:    cfg.Skills.Installer,
 				}),
-				Plugins: pluginMgr,
-				MCP:     mcpManager,
-				Hooks:   hookRunner,
+				Plugins:  pluginMgr,
+				MCP:      mcpManager,
+				Hooks:    hookRunner,
+				GitState: gitState,
 			})
 
 			return app.Run(context.Background())

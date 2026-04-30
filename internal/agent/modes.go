@@ -12,11 +12,12 @@ type Mode struct {
 
 // DefaultModes returns the agent operating modes.
 //
-// Historically there were three modes (plan/build/explore). BUILD was removed:
-// execution is now delegated from PLAN to the "builder" subagent via
-// execute_task. The planner (typically Gemma) orchestrates, the builder
-// executes one task at a time with user approval on every mutation. Sessions
-// persisted with mode="build" are silently re-mapped to "plan" in SetMode.
+// plan: design + write the plan + checklist, then hand off. No editing.
+// build: execute the approved checklist directly (read + edit_file/write_file/
+//
+//	apply_patch under approval). No subagent dispatch.
+//
+// explore: read-only.
 //
 // commit, debug, docs, reviewer, tester, refactorer, summarizer are subagents,
 // not modes.
@@ -24,17 +25,30 @@ func DefaultModes() map[string]Mode {
 	return map[string]Mode{
 		"plan": {
 			Name:        "plan",
-			Description: "Planner. Designs the work, writes the plan, and dispatches builder subagents per task.",
+			Description: "Planner. Designs the work and writes the plan + checklist. Does not edit files.",
 			Policy:      NewPlanPolicy(),
-			Prompt: "You are in plan mode. You are the orchestrator: design the work, write the plan, then DELEGATE each task to the builder subagent via execute_task. You never edit files directly.\n" +
+			Prompt: "You are in plan mode. You design the work and produce the plan + checklist. You do NOT edit files and you do NOT execute tasks — execution happens in build mode.\n" +
 				"STEP 1: If the user's request leaves scope, constraints, tech choices, or success criteria ambiguous, call ask_user (3-6 focused questions, one per call) BEFORE anything else. Wait for the answers. Only skip this step when the user's request is already fully specified OR a prior plan already answers these questions.\n" +
 				"When calling ask_user, ALWAYS include an `options` array with exactly 3 short, mutually-exclusive suggested answers the user can pick with arrow keys. Example: {\"question\":\"Which CSS framework?\",\"options\":[\"Vanilla CSS\",\"Tailwind\",\"Bootstrap\"]}. The TUI adds a 'Write my own' row automatically, so do not include one.\n" +
-				"STEP 2: Call plan_write with the full plan document — summary, context, assumptions, approach, possible stubs, risks, and validation.\n" +
-				"STEP 3: Call todo_write with a fresh executable checklist (or task_* tools for incremental changes). The checklist is not the full plan.\n" +
-				"STEP 4: For each task in the checklist, call execute_task with {\"task_id\":\"plan-N\",\"relevant_files\":[\"path1\",\"path2\"]}. relevant_files is the MINIMAL list of paths the builder needs — do NOT pass the plan document, the full checklist, or wide globs. The builder runs under its own model (editor role) with user approval for every edit. After the builder returns, read the result, mark the task with task_update(status=\"completed\") if successful, or ajust and retry. Then proceed to the next task. Do not ask the user for confirmation between tasks — the approval system fires per edit.\n" +
+				"STEP 2: Call plan_write with the full plan document - summary, context, assumptions, approach, possible stubs, risks, and validation.\n" +
+				"STEP 3: Call todo_write with a fresh executable checklist (or task_* tools for incremental changes). The checklist is not the full plan. Keep tasks small and self-contained: one file or one cohesive section per task. For genuinely large new files, decompose by structure (scaffold / sections / polish) so each task fits in a few edits.\n" +
+				"STEP 4: After todo_write, your turn ends. Do NOT call execute_task or spawn_subagent. The runtime will tell the user to switch to build mode (`/mode build`) to execute the checklist.\n" +
 				"If a prior plan or tasks exist, read them first with plan_get / task_list and preserve what still applies.\n" +
-				"If the user is asking to execute an EXISTING approved plan, do NOT create a new plan and do NOT rewrite the checklist. Read the existing plan/checklist, execute only the remaining pending tasks, and stop once the checklist is complete.\n" +
-				"After steps 2 and 3 are both done in the same turn, give a one-sentence summary before you start dispatching execute_task.",
+				"FILE SIZE LIMIT (maintainability): keep every produced file at or below ~600 lines. If a feature would require a single file >600 lines, split it into multiple PHYSICAL modules in the checklist (separate files with clear responsibilities, e.g. core / helpers / types / tests), not into multiple sections of one giant file. Only deviate when the file's nature genuinely demands it (generated data, large fixtures, dense JSON/CSV) and call that out in the plan document.\n" +
+				"After plan_write and todo_write are both done in the same turn, give a one-sentence summary and stop.",
+		},
+		"build": {
+			Name:        "build",
+			Description: "Executor. Reads the approved plan and checklist and works through tasks directly with editor tools.",
+			Policy:      NewBuildPolicy(),
+			Prompt: "You are in build mode. There is an approved plan and a checklist of tasks; your job is to execute them directly.\n" +
+				"STEP 1: If you have not seen the plan/checklist yet this turn, call plan_get and task_list once to load them.\n" +
+				"STEP 2: Pick the next pending task in order. Mark it in_progress with task_update before you start the work.\n" +
+				"STEP 3: Do the work directly with editor tools — read_file the files you need, then call edit_file / write_file / apply_patch. Each mutation will prompt the user for approval; do NOT batch edits across multiple files in one tool call.\n" +
+				"STEP 4: When the task is finished, call task_update(status=\"completed\") with a short summary of what you changed. Then move to the next pending task.\n" +
+				"Do NOT call execute_task, spawn_subagent, plan_write, or todo_write — you are the executor, not the planner. If the plan needs to change, stop and tell the user to switch back to plan mode.\n" +
+				"FILE SIZE LIMIT: keep every produced file at or below ~600 lines. If a single task implies a file >600 lines, stop, tell the user the checklist needs to be re-split, and switch them back to plan mode.\n" +
+				"Stop when there are no pending tasks left, and give a brief summary of what was done.",
 		},
 		"explore": {
 			Name:        "explore",

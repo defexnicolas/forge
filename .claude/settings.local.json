@@ -37,7 +37,10 @@
       "WebFetch(domain:github.com)",
       "WebFetch(domain:opencode.ai)",
       "Bash(git add *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "Bash(cp forge.exe \"C:/Users/nicod/Downloads/snake29/forge.exe\")",
+      "Read(//c/Users/nicod/Downloads/snake29/**)",
+      "Bash(xargs basename *)"
     ]
   }
 }

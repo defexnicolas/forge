@@ -11,6 +11,7 @@ import (
 
 	"forge/internal/config"
 	contextbuilder "forge/internal/context"
+	"forge/internal/gitops"
 	"forge/internal/hooks"
 	"forge/internal/llm"
 	"forge/internal/patch"
@@ -39,13 +40,16 @@ const (
 // in the multi-lane view. Status values: "pending", "running", "completed",
 // "error".
 type SubagentProgress struct {
-	BatchID string
-	Index   int
-	Total   int
-	Agent   string
-	Status  string
-	Summary string
-	Error   string
+	BatchID   string
+	Index     int
+	Total     int
+	Agent     string
+	Status    string
+	Phase     string
+	StepsUsed int
+	TimedOut  bool
+	Summary   string
+	Error     string
 }
 
 type Event struct {
@@ -77,14 +81,15 @@ type ModelProgress struct {
 }
 
 type ApprovalRequest struct {
-	ID       string
-	ToolName string
-	Input    json.RawMessage
-	Summary  string
-	Diff     string
-	Response chan ApprovalResponse
-	plan     patch.Plan
-	command  *ToolCall
+	ID          string
+	ToolName    string
+	Input       json.RawMessage
+	Summary     string
+	Diff        string
+	Response    chan ApprovalResponse
+	plan        patch.Plan
+	command     *ToolCall
+	beforeApply func() error
 }
 
 type ApprovalResponse struct {
@@ -189,6 +194,10 @@ type Runtime struct {
 	// (e.g. the builder via execute_task) read it so they can raise approval
 	// prompts for their own mutating tool calls. Nil when no turn is active.
 	activeEvents chan<- Event
+	// activeBuilderTask carries the currently executing builder task metadata
+	// so mutation approval can enforce per-task file strategies.
+	activeBuilderTask *builderTaskGuard
+	gitState          gitops.SessionState
 }
 
 type preflightCacheEntry struct {
@@ -199,7 +208,7 @@ type preflightCacheEntry struct {
 const preflightCacheTTL = 10 * time.Minute
 
 func NewRuntime(cwd string, cfg config.Config, registry *tools.Registry, providers *llm.Registry) *Runtime {
-	return &Runtime{
+	runtime := &Runtime{
 		CWD:       cwd,
 		Config:    cfg,
 		Tools:     registry,
@@ -214,6 +223,8 @@ func NewRuntime(cwd string, cfg config.Config, registry *tools.Registry, provide
 		Subagents: DefaultSubagents(),
 		Parsers:   DefaultParsers(),
 	}
+	runtime.RefreshGitSessionState()
+	return runtime
 }
 
 // SetChatModel updates the active chat model and caches the parser that
@@ -288,6 +299,8 @@ func (r *Runtime) modelRoleForMode() string {
 	switch r.Mode {
 	case "plan":
 		return "planner"
+	case "build":
+		return "editor"
 	case "explore":
 		return "explorer"
 	default:
@@ -321,6 +334,37 @@ func (r *Runtime) SharedTaskContext(userMessage string) string {
 	}
 	snapshot := r.buildTaskSnapshot(userMessage, "explorer")
 	return snapshot.Render()
+}
+
+type PromptPreview struct {
+	System           string
+	User             string
+	SupportsTools    bool
+	ArtifactStrategy string
+	Snapshot         contextbuilder.Snapshot
+}
+
+func (r *Runtime) PreviewPrompt(userMessage string) (PromptPreview, error) {
+	if r == nil {
+		return PromptPreview{}, fmt.Errorf("runtime is nil")
+	}
+	_, supportsTools, err := r.resolveProvider()
+	if err != nil {
+		return PromptPreview{}, err
+	}
+	role := r.modelRoleForMode()
+	roleConfig := r.configForRole(role)
+	if r.Mode == "explore" {
+		roleConfig = config.ConfigForTaskRole(r.Config, role, r.roleModel(role))
+	}
+	snapshot := r.buildSnapshot(userMessage, roleConfig)
+	return PromptPreview{
+		System:           r.cachedSystemPrompt(supportsTools),
+		User:             userPrompt(snapshot, userMessage, r.planContextBlock(userMessage, ""), r.Mode, "", "", ""),
+		SupportsTools:    supportsTools,
+		ArtifactStrategy: inferDefaultFileStrategy(userMessage, ""),
+		Snapshot:         snapshot,
+	}, nil
 }
 
 func (r *Runtime) EnsureRoleModelLoaded(ctx context.Context, provider llm.Provider, role string) error {
@@ -493,10 +537,6 @@ func (r *Runtime) Close() error {
 // compatibility with persisted sessions, SetMode("build") silently re-maps
 // to "plan" and logs a one-line notice to stderr.
 func (r *Runtime) SetMode(name string) error {
-	if name == "build" {
-		fmt.Fprintln(os.Stderr, "build mode deprecated; remapped to plan — the planner now dispatches execute_task to the builder subagent")
-		name = "plan"
-	}
 	mode, ok := GetMode(name)
 	if !ok {
 		return fmt.Errorf("unknown mode: %s (available: %s)", name, strings.Join(ModeNames(), ", "))
@@ -623,6 +663,7 @@ func (r *Runtime) UndoLast() (string, error) {
 	if err := patch.Undo(r.CWD, entry.Snapshots); err != nil {
 		return "", err
 	}
+	r.RefreshGitSessionState()
 	return entry.Summary, nil
 }
 
@@ -690,6 +731,21 @@ func looksLikePlanExecutionIntent(message string) bool {
 	return false
 }
 
+func looksLikePlanRefinementIntent(message string) bool {
+	lower := strings.ToLower(message)
+	for _, phrase := range []string{
+		"refine", "adjust", "update the plan", "modify the plan", "change the plan",
+		"add to the plan", "remove from the plan", "tweak", "revise",
+		"refina", "ajusta", "ajusta el plan", "actualiza el plan", "modifica el plan",
+		"cambia el plan", "agrega al plan", "quita del plan", "revisa el plan",
+	} {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
 // ToolSupporter is implemented by providers that may support native tool calling.
 type ToolSupporter interface {
 	SupportsTools() bool
@@ -715,8 +771,12 @@ func (r *Runtime) resolveProvider() (llm.Provider, bool, error) {
 func (r *Runtime) planContextBlock(userMessage, switchedFrom string) string {
 	var lines []string
 	planSummary := ""
+	var planDoc plans.Document
+	hasPlanDoc := false
 	if r.Plans != nil {
 		if doc, ok, err := r.Plans.Current(); err == nil && ok {
+			planDoc = doc
+			hasPlanDoc = true
 			planSummary = strings.TrimSpace(doc.Summary)
 			if planSummary == "" {
 				planSummary = "(no summary)"
@@ -749,23 +809,124 @@ func (r *Runtime) planContextBlock(userMessage, switchedFrom string) string {
 		if planSummary != "" {
 			lines = append(lines, fmt.Sprintf("Plan document exists: %s. Call plan_get to read it before refining. Keep the executable checklist separate.", planSummary))
 		}
+		if digest := compactPlanDigest(planDoc, taskList); hasPlanDoc && digest != "" {
+			lines = append(lines, digest)
+		}
+		if planSummary != "" && !executeIntent {
+			if looksLikePlanRefinementIntent(userMessage) || strings.TrimSpace(userMessage) != "" {
+				lines = append(lines, "Default to refining the existing plan and checklist. Do NOT start over unless the user explicitly asks for a fresh plan. Prefer task_list + task_update/task_create for incremental checklist changes; use todo_write only for an explicit reset.")
+				lines = append(lines, "For small follow-ups, use the plan/checklist digest below as context and avoid extra plan_get/task_list calls unless the digest is insufficient.")
+			}
+		}
 		if executeIntent {
 			if activeTasks {
-				lines = append(lines, "Execution intent detected. Do NOT call plan_write or todo_write unless the user explicitly asks to re-plan. Read the existing checklist with task_list, execute only the remaining pending tasks via execute_task, and keep the checklist as-is.")
+				lines = append(lines, "Execution intent detected. The plan and checklist already exist. Tell the user to run /mode build to execute the remaining pending tasks; do NOT re-plan or rewrite the checklist.")
 			} else if len(taskList) > 0 {
-				lines = append(lines, "Execution intent detected, but the current checklist is already complete. Do NOT create a new plan or rewrite the checklist. Tell the user execution is already complete unless they explicitly ask to refine or re-plan.")
+				lines = append(lines, "Execution intent detected, but the current checklist is already complete. Tell the user execution is already complete unless they explicitly ask to refine or re-plan.")
 			}
 		}
 		if len(taskList) > 0 {
 			if activeTasks {
-				lines = append(lines, fmt.Sprintf("Active checklist: %d pending, %d in progress, %d done. Call task_list to read it. Dispatch pending tasks one-by-one to the builder subagent via execute_task (pass only the minimal relevant_files). Use task_update after the builder returns. Use todo_write only when starting a fresh checklist.", pending, inProgress, done))
+				lines = append(lines, fmt.Sprintf("Active checklist: %d pending, %d in progress, %d done. Plan mode does not execute — once the checklist is ready the user runs /mode build to work it.", pending, inProgress, done))
 			} else {
 				lines = append(lines, fmt.Sprintf("Previous checklist complete (%d tasks done). If refining, call task_list before deciding whether to preserve or replace it.", len(taskList)))
 			}
 		}
+	case "build":
+		if planSummary != "" {
+			lines = append(lines, fmt.Sprintf("Approved plan in scope: %s. If you have not loaded it yet this turn, call plan_get once.", planSummary))
+		}
+		if digest := compactPlanDigest(planDoc, taskList); hasPlanDoc && digest != "" {
+			lines = append(lines, digest)
+		}
+		switch {
+		case activeTasks:
+			lines = append(lines, fmt.Sprintf("Checklist: %d pending, %d in progress, %d done. Take the next pending task in order, mark it in_progress with task_update, do the work directly with read_file + edit_file/write_file/apply_patch (each mutation requires user approval), then task_update(status=\"completed\"). Repeat until no pending tasks remain.", pending, inProgress, done))
+		case len(taskList) > 0:
+			lines = append(lines, "Checklist already complete. Tell the user there is nothing pending and stop.")
+		default:
+			lines = append(lines, "No checklist found. Tell the user to switch back to plan mode (/mode plan) to draft a plan first.")
+		}
 	}
 
 	return strings.Join(lines, "\n")
+}
+
+func compactPlanDigest(doc plans.Document, taskList []tasks.Task) string {
+	if strings.TrimSpace(doc.Summary) == "" && strings.TrimSpace(doc.Approach) == "" && len(doc.Validation) == 0 && len(taskList) == 0 {
+		return ""
+	}
+	var parts []string
+	if summary := strings.TrimSpace(doc.Summary); summary != "" {
+		parts = append(parts, "summary="+truncatePlanDigest(summary, 120))
+	}
+	if approach := strings.TrimSpace(doc.Approach); approach != "" {
+		parts = append(parts, "approach="+truncatePlanDigest(firstDigestLine(approach), 140))
+	}
+	if len(doc.Validation) > 0 {
+		parts = append(parts, "validation="+truncatePlanDigest(strings.Join(doc.Validation[:minInt(len(doc.Validation), 2)], "; "), 120))
+	}
+	if preview := compactChecklistPreview(taskList); preview != "" {
+		parts = append(parts, "tasks="+preview)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "Plan digest: " + strings.Join(parts, " | ")
+}
+
+func compactChecklistPreview(taskList []tasks.Task) string {
+	var active []string
+	doneCount := 0
+	for _, task := range taskList {
+		switch task.Status {
+		case "pending", "in_progress":
+			if len(active) < 3 {
+				active = append(active, fmt.Sprintf("%s:%s", task.Status, truncatePlanDigest(strings.TrimSpace(task.Title), 48)))
+			}
+		case "completed", "done":
+			doneCount++
+		}
+	}
+	if len(active) == 0 && doneCount == 0 {
+		return ""
+	}
+	preview := strings.Join(active, "; ")
+	if doneCount > 0 {
+		if preview != "" {
+			preview += "; "
+		}
+		preview += fmt.Sprintf("done:%d", doneCount)
+	}
+	return preview
+}
+
+func firstDigestLine(text string) string {
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			return line
+		}
+	}
+	return ""
+}
+
+func truncatePlanDigest(text string, limit int) string {
+	text = strings.TrimSpace(text)
+	if len(text) <= limit || limit <= 0 {
+		return text
+	}
+	if limit <= 3 {
+		return text[:limit]
+	}
+	return text[:limit-3] + "..."
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Event) {
@@ -779,6 +940,26 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 		r.mu.Unlock()
 		r.LastTurnDuration = time.Since(turnStart)
 	}()
+
+	// Plan -> Build auto-handoff: if the user is in plan mode, has an
+	// approved plan with active tasks, and expresses execution intent
+	// ("yes", "execute", "run the plan", etc.), switch into build mode and
+	// continue the turn there. This avoids the "plan keeps asking 'execute
+	// this plan?' in a loop" trap when the user types confirmations the
+	// planner cannot act on.
+	if r.Mode == "plan" && looksLikePlanExecutionIntent(userMessage) {
+		hasPlanDoc := false
+		if r.Plans != nil {
+			if _, ok, err := r.Plans.Current(); err == nil && ok {
+				hasPlanDoc = true
+			}
+		}
+		hasActive := r.hasActiveChecklistTasks()
+		if hasPlanDoc && hasActive {
+			_ = r.SetMode("build")
+			events <- Event{Type: EventAssistantText, Text: "Auto-switched to build mode to execute the approved plan."}
+		}
+	}
 
 	provider, supportsTools, err := r.resolveProvider()
 	if err != nil {
@@ -810,7 +991,6 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 	// overwrite bug. Just tell it how many tasks exist and what state.
 	switchedFrom := r.ModeSwitchedFrom
 	planBlock := r.planContextBlock(userMessage, switchedFrom)
-	executeIntent := r.Mode == "plan" && looksLikePlanExecutionIntent(userMessage)
 
 	// Mode handoff: when the user just switched modes, give the model an
 	// explicit one-turn signal so it adapts.
@@ -818,9 +998,12 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 	if switchedFrom != "" && switchedFrom != r.Mode {
 		handoff = fmt.Sprintf("MODE SWITCHED: %s → %s. ", strings.ToUpper(switchedFrom), strings.ToUpper(r.Mode))
 		if r.Mode == "plan" {
-			handoff += "Focus on plan_write for the full plan and todo_write/task_* for the executable checklist. Do not edit files directly — dispatch each task to the builder subagent via execute_task. " +
+			handoff += "Focus on plan_write for the full plan and todo_write/task_* for the executable checklist. Do not edit files directly. After plan_write and todo_write your turn ends and the user runs /mode build to execute. " +
 				"If the user's request leaves scope, constraints, or success criteria ambiguous, start by calling ask_user (3-6 focused questions) before drafting the plan. " +
 				"After the interview, call plan_write AND todo_write in the same turn so the user ends with both artifacts."
+		}
+		if r.Mode == "build" {
+			handoff += "You are the executor: read the plan and checklist, take the next pending task, and edit files directly with edit_file/write_file/apply_patch (each prompts for approval). After each task call task_update(status=\"completed\"). Do NOT call execute_task, plan_write, or todo_write."
 		}
 		r.ModeSwitchedFrom = ""
 	}
@@ -829,10 +1012,9 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 		explorerHandoff = r.PendingExplorerContext
 		r.PendingExplorerContext = ""
 	}
-	// BUILD mode is deprecated (the planner now dispatches execute_task to the
-	// builder subagent), so PendingBuildPreflight is ignored even if legacy
-	// callers still set it. Drop it here so it can't accidentally leak into a
-	// future turn.
+	// PendingBuildPreflight is reserved for future build-mode warm-up data
+	// (e.g. relevant_files hints from a preflight scan). For now we just
+	// drop it so it can't leak across turns.
 	buildPreflight := ""
 	if strings.TrimSpace(r.PendingBuildPreflight) != "" {
 		r.PendingBuildPreflight = ""
@@ -892,10 +1074,15 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 		maxRetries = 2
 	}
 	parseFailures := 0
+	emptyResponses := 0
+	noProgressSteps := 0
 	lastFailedTool := ""
 	consecutiveToolFailures := 0
 	consecutiveReadOnly := 0
 	planModeReprompts := 0
+	taskAttempts := map[string]int{}
+	blockedTaskRetries := map[string]bool{}
+	lastExecuteTaskFailure := map[string]executeTaskFailureMeta{}
 
 	// Step loop: ask_user turns do NOT count toward maxSteps since they are
 	// blocked on human input, not model work. See the post-dispatch decrement
@@ -930,12 +1117,19 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 
 		// Handle empty responses from local models.
 		if strings.TrimSpace(accumulated) == "" && len(toolCalls) == 0 {
+			emptyResponses++
+			if emptyResponses >= r.maxEmptyResponses() {
+				events <- Event{Type: EventError, Error: fmt.Errorf("stopped: %d empty model responses in a row", emptyResponses)}
+				events <- Event{Type: EventDone}
+				return
+			}
 			messages = append(messages,
 				llm.Message{Role: "assistant", Content: ""},
 				llm.Message{Role: "user", Content: "You returned an empty response. Please provide an answer or use a tool to gather information."},
 			)
 			continue
 		}
+		emptyResponses = 0
 
 		if supportsTools && len(toolCalls) > 0 {
 			// Native tool calling path.
@@ -959,14 +1153,28 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 				if result != nil {
 					events <- Event{Type: EventToolResult, ToolName: agentCall.Name, Result: result, Text: result.Summary}
 				}
+				if agentCall.Name == "execute_task" && result != nil {
+					taskID := executeTaskIDFromInput(agentCall.Input)
+					if meta, ok := parseExecuteTaskFailureMeta(result); ok {
+						lastExecuteTaskFailure[meta.TaskID] = meta
+					} else if taskID != "" {
+						delete(lastExecuteTaskFailure, taskID)
+					}
+				}
 
 				// Track consecutive failures.
-				nativeToolFailed := result != nil && (strings.Contains(result.Summary, "not found") ||
-					strings.Contains(result.Summary, "error") ||
-					strings.Contains(result.Summary, "denied"))
+				nativeToolFailed := result != nil && isToolFailureSummary(result.Summary)
 				if nativeToolFailed && agentCall.Name == lastFailedTool {
 					consecutiveToolFailures++
-					if consecutiveToolFailures >= 3 {
+					if consecutiveToolFailures >= r.maxSameToolFailures() {
+						if agentCall.Name == "execute_task" {
+							taskID := executeTaskIDFromInput(agentCall.Input)
+							if meta, ok := lastExecuteTaskFailure[taskID]; ok {
+								events <- Event{Type: EventError, Error: fmt.Errorf("tool execute_task failed %d times - stopping: %s", consecutiveToolFailures, formatExecuteTaskRetryError(meta))}
+								events <- Event{Type: EventDone}
+								return
+							}
+						}
 						events <- Event{Type: EventError, Error: fmt.Errorf("tool %s failed %d times — stopping", agentCall.Name, consecutiveToolFailures)}
 						events <- Event{Type: EventDone}
 						return
@@ -979,10 +1187,25 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 					consecutiveToolFailures = 0
 				}
 
-				// In plan mode, stop after todo_write.
+				// In plan mode, stop after todo_write — plan mode never executes.
 				if r.Mode == "plan" && agentCall.Name == "todo_write" {
+					msg := "Plan saved."
 					if result != nil && strings.TrimSpace(result.Summary) != "" {
-						events <- Event{Type: EventAssistantText, Text: "Plan created and saved.\n" + result.Summary}
+						msg += "\n" + result.Summary
+					}
+					msg += "\n\nReady to execute? Run /mode build to switch to build mode and work the checklist."
+					events <- Event{Type: EventAssistantText, Text: msg}
+					events <- Event{Type: EventDone}
+					return
+				}
+				// In build mode, after every task_update that completes the
+				// checklist, surface a final summary and stop the turn so the
+				// LLM doesn't keep looping for more work.
+				if r.Mode == "build" && agentCall.Name == "task_update" && !r.hasActiveChecklistTasks() {
+					if result != nil && strings.TrimSpace(result.Summary) != "" {
+						events <- Event{Type: EventAssistantText, Text: "All checklist tasks complete. " + result.Summary}
+					} else {
+						events <- Event{Type: EventAssistantText, Text: "All checklist tasks complete."}
 					}
 					events <- Event{Type: EventDone}
 					return
@@ -1058,7 +1281,13 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 					events <- Event{Type: EventDone}
 					return
 				}
-				if planModeReprompts < 2 {
+				noProgressSteps++
+				if noProgressSteps >= r.maxNoProgressSteps() {
+					events <- Event{Type: EventError, Error: fmt.Errorf("stopped: %d planner step(s) with no actionable progress", noProgressSteps)}
+					events <- Event{Type: EventDone}
+					return
+				}
+				if planModeReprompts < r.maxPlannerSummarySteps() {
 					planModeReprompts++
 					messages = append(messages,
 						llm.Message{Role: "assistant", Content: accumulated},
@@ -1077,6 +1306,27 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 		events <- Event{Type: EventClearStreaming, Text: parsed.Before}
 		if parsed.Before != "" {
 			events <- Event{Type: EventAssistantText, Text: parsed.Before}
+		}
+		if r.Mode == "plan" && parsed.Call.Name == "execute_task" {
+			taskID := executeTaskIDFromInput(parsed.Call.Input)
+			if taskID != "" && taskAttempts[taskID] > 0 {
+				if blockedTaskRetries[taskID] {
+					if meta, ok := lastExecuteTaskFailure[taskID]; ok {
+						events <- Event{Type: EventError, Error: fmt.Errorf("task %s already failed in this turn; refusing repeated execute_task retry: %s", taskID, formatExecuteTaskRetryError(meta))}
+					} else {
+						events <- Event{Type: EventError, Error: fmt.Errorf("task %s already failed in this turn due to timeout/no progress; refusing repeated execute_task retry", taskID)}
+					}
+					events <- Event{Type: EventDone}
+					return
+				}
+				blockedTaskRetries[taskID] = true
+				noProgressSteps++
+				messages = append(messages,
+					llm.Message{Role: "assistant", Content: accumulated},
+					llm.Message{Role: "user", Content: fmt.Sprintf("Task %s already failed in this turn. Do not retry it. Report the blocker or choose a different remaining task.", taskID)},
+				)
+				continue
+			}
 		}
 		events <- Event{Type: EventToolCall, ToolName: parsed.Call.Name, Input: parsed.Call.Input}
 
@@ -1100,22 +1350,42 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 		// those signals an aimless loop; stop so the cap isn't burned.
 		if isMutatingToolCall(parsed.Call.Name) || parsed.Call.Name == "execute_task" {
 			consecutiveReadOnly = 0
+			noProgressSteps = 0
 		} else if isReadOnlyExploration(parsed.Call.Name) {
 			consecutiveReadOnly++
-			if consecutiveReadOnly >= 10 {
-				events <- Event{Type: EventError, Error: fmt.Errorf("stopped: 10 consecutive read-only tool calls with no edits — dispatch execute_task, call plan_write / todo_write, or answer the user directly")}
+			if consecutiveReadOnly >= r.maxConsecutiveReadOnly() {
+				events <- Event{Type: EventError, Error: fmt.Errorf("stopped: %d consecutive read-only tool calls with no edits — dispatch execute_task, call plan_write / todo_write, or answer the user directly", consecutiveReadOnly)}
 				events <- Event{Type: EventDone}
 				return
 			}
 		}
 
+		if parsed.Call.Name == "execute_task" && result != nil {
+			taskID := executeTaskIDFromInput(parsed.Call.Input)
+			if meta, ok := parseExecuteTaskFailureMeta(result); ok {
+				lastExecuteTaskFailure[meta.TaskID] = meta
+				switch meta.FailureKind {
+				case "timeout", "no_progress":
+					taskAttempts[meta.TaskID]++
+				}
+			} else if taskID != "" {
+				delete(lastExecuteTaskFailure, taskID)
+			}
+		}
+
 		// Track consecutive failures of the same tool to break infinite loops.
-		toolFailed := result != nil && (strings.Contains(result.Summary, "not found") ||
-			strings.Contains(result.Summary, "error") ||
-			strings.Contains(result.Summary, "denied"))
+		toolFailed := result != nil && isToolFailureSummary(result.Summary)
 		if toolFailed && parsed.Call.Name == lastFailedTool {
 			consecutiveToolFailures++
-			if consecutiveToolFailures >= 3 {
+			if consecutiveToolFailures >= r.maxSameToolFailures() {
+				if parsed.Call.Name == "execute_task" {
+					taskID := executeTaskIDFromInput(parsed.Call.Input)
+					if meta, ok := lastExecuteTaskFailure[taskID]; ok {
+						events <- Event{Type: EventError, Error: fmt.Errorf("tool execute_task failed %d times in a row - stopping to avoid infinite loop: %s", consecutiveToolFailures, formatExecuteTaskRetryError(meta))}
+						events <- Event{Type: EventDone}
+						return
+					}
+				}
 				events <- Event{Type: EventError, Error: fmt.Errorf("tool %s failed %d times in a row — stopping to avoid infinite loop", parsed.Call.Name, consecutiveToolFailures)}
 				events <- Event{Type: EventDone}
 				return
@@ -1128,31 +1398,27 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 			consecutiveToolFailures = 0
 		}
 
-		// In plan mode, stop after todo_write — the plan is ready for user review.
+		// In plan mode, stop after todo_write — plan mode never executes.
+		// Use a hardcoded handoff message (not another LLM call) so the
+		// planner cannot keep asking "execute this plan?" in a loop while
+		// staying in plan mode.
 		if r.Mode == "plan" && parsed.Call.Name == "todo_write" {
-			// Let the model give a final summary by doing one more LLM call without tools.
-			messages = append(messages,
-				llm.Message{Role: "assistant", Content: accumulated},
-				llm.Message{Role: "user", Content: observation + "\n\nThe plan has been created. Provide a brief summary of the plan to the user. Do not call any more tools."},
-			)
-			summaryAcc, _, summaryUsage, err := r.streamResponse(ctx, provider, llm.ChatRequest{Model: model, Messages: messages}, step+1, events)
-			r.recordResponseUsage(summaryAcc, summaryUsage)
-			if err != nil {
-				events <- Event{Type: EventError, Error: err}
+			msg := "Plan saved."
+			if result != nil && strings.TrimSpace(result.Summary) != "" {
+				msg += "\n" + result.Summary
 			}
+			msg += "\n\nReady to execute? Run /mode build (or type 'execute the plan') to switch to build mode and work the checklist."
+			events <- Event{Type: EventAssistantText, Text: msg}
 			events <- Event{Type: EventDone}
 			return
 		}
-		if r.Mode == "plan" && executeIntent && parsed.Call.Name == "execute_task" && !r.hasActiveChecklistTasks() {
-			messages = append(messages,
-				llm.Message{Role: "assistant", Content: accumulated},
-				llm.Message{Role: "user", Content: observation + "\n\nAll checklist tasks are now complete. Do not call plan_write, todo_write, or execute_task again. Give a brief completion summary to the user and stop."},
-			)
-			summaryAcc, _, summaryUsage, err := r.streamResponse(ctx, provider, llm.ChatRequest{Model: model, Messages: messages}, step+1, events)
-			r.recordResponseUsage(summaryAcc, summaryUsage)
-			if err != nil {
-				events <- Event{Type: EventError, Error: err}
+		// In build mode, stop once the checklist is fully complete.
+		if r.Mode == "build" && parsed.Call.Name == "task_update" && !r.hasActiveChecklistTasks() {
+			msg := "All checklist tasks complete."
+			if result != nil && strings.TrimSpace(result.Summary) != "" {
+				msg += " " + result.Summary
 			}
+			events <- Event{Type: EventAssistantText, Text: msg}
 			events <- Event{Type: EventDone}
 			return
 		}
@@ -1382,12 +1648,29 @@ func (r *Runtime) streamResponseWithInput(ctx context.Context, provider llm.Prov
 		}}
 	}
 
-	emitProgress("waiting", false)
-	stream, err := provider.Stream(ctx, req)
+	emitProgress("waiting_on_provider", false)
+	requestCtx, cancel := withOptionalTimeout(ctx, r.requestTimeout())
+	defer cancel()
+	stream, err := provider.Stream(requestCtx, req)
 	if err != nil {
+		if len(req.Tools) > 0 && llm.IsToolCallingUnsupported(err) {
+			fallbackReq := req
+			fallbackReq.Tools = nil
+			return r.streamResponseWithInput(ctx, provider, fallbackReq, step, estimateRequestTokens(fallbackReq), events)
+		}
+		if !r.retryOnProviderTimeout() && (llm.IsProviderTimeout(err) || llm.IsProviderUnavailable(err)) {
+			return "", nil, nil, err
+		}
 		// Fallback to non-streaming Chat if Stream fails.
-		resp, chatErr := provider.Chat(ctx, req)
+		chatCtx, chatCancel := withOptionalTimeout(ctx, r.requestTimeout())
+		defer chatCancel()
+		resp, chatErr := provider.Chat(chatCtx, req)
 		if chatErr != nil {
+			if len(req.Tools) > 0 && llm.IsToolCallingUnsupported(chatErr) {
+				fallbackReq := req
+				fallbackReq.Tools = nil
+				return r.streamResponseWithInput(ctx, provider, fallbackReq, step, estimateRequestTokens(fallbackReq), events)
+			}
 			return "", nil, nil, chatErr
 		}
 		text.WriteString(resp.Content)

@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"forge/internal/gitops"
+
 	"github.com/pelletier/go-toml/v2"
 )
 
@@ -15,8 +17,10 @@ type Config struct {
 	ApprovalProfile string             `toml:"approval_profile"`
 	Providers       Providers          `toml:"providers"`
 	Context         ContextConfig      `toml:"context"`
+	Runtime         RuntimeConfig      `toml:"runtime"`
 	Skills          SkillsConfig       `toml:"skills"`
 	Plugins         PluginsConfig      `toml:"plugins"`
+	Git             GitConfig          `toml:"git"`
 	Models          map[string]string  `toml:"models"`
 	ModelLoading    ModelLoadingConfig `toml:"model_loading"`
 	Build           BuildConfig        `toml:"build"`
@@ -88,6 +92,30 @@ type ContextConfig struct {
 	Task                TaskContextConfig          `toml:"task"`
 	Detected            *DetectedContext           `toml:"detected,omitempty"`
 	DetectedByRole      map[string]DetectedContext `toml:"detected_by_role,omitempty"`
+}
+
+type RuntimeConfig struct {
+	RequestTimeoutSeconds  int  `toml:"request_timeout_seconds"`
+	SubagentTimeoutSeconds int  `toml:"subagent_timeout_seconds"`
+	TaskTimeoutSeconds     int  `toml:"task_timeout_seconds"`
+	MaxNoProgressSteps     int  `toml:"max_no_progress_steps"`
+	MaxEmptyResponses      int  `toml:"max_empty_responses"`
+	MaxSameToolFailures    int  `toml:"max_same_tool_failures"`
+	MaxConsecutiveReadOnly int  `toml:"max_consecutive_read_only"`
+	MaxPlannerSummarySteps int  `toml:"max_planner_summary_steps"`
+	MaxBuilderReadLoops    int  `toml:"max_builder_read_loops"`
+	RetryOnProviderTimeout bool `toml:"retry_on_provider_timeout"`
+	InlineBuilder          bool `toml:"inline_builder"`
+}
+
+type GitConfig struct {
+	AutoInit               bool   `toml:"auto_init"`
+	CreateBaselineCommit   bool   `toml:"create_baseline_commit"`
+	RequireCleanOrSnapshot bool   `toml:"require_clean_or_snapshot"`
+	AutoStageMutations     bool   `toml:"auto_stage_mutations"`
+	AutoCommit             bool   `toml:"auto_commit"`
+	BaselineCommitMessage  string `toml:"baseline_commit_message"`
+	SnapshotCommitMessage  string `toml:"snapshot_commit_message"`
 }
 
 type TaskContextConfig struct {
@@ -201,7 +229,7 @@ func Defaults() Config {
 				BaseURL:       "http://localhost:1234/v1",
 				APIKey:        "lm-studio",
 				DefaultModel:  "local-model",
-				SupportsTools: false,
+				SupportsTools: true,
 			},
 		},
 		Context: ContextConfig{
@@ -228,6 +256,26 @@ func Defaults() Config {
 				MaxFileBytes:  8000,
 				HistoryEvents: 4,
 			},
+		},
+		Runtime: RuntimeConfig{
+			RequestTimeoutSeconds:  45,
+			SubagentTimeoutSeconds: 90,
+			TaskTimeoutSeconds:     180,
+			MaxNoProgressSteps:     3,
+			MaxEmptyResponses:      2,
+			MaxSameToolFailures:    2,
+			MaxConsecutiveReadOnly: 6,
+			MaxPlannerSummarySteps: 2,
+			MaxBuilderReadLoops:    4,
+		},
+		Git: GitConfig{
+			AutoInit:               true,
+			CreateBaselineCommit:   true,
+			RequireCleanOrSnapshot: true,
+			AutoStageMutations:     true,
+			AutoCommit:             false,
+			BaselineCommitMessage:  gitops.DefaultBaselineCommitMessage,
+			SnapshotCommitMessage:  gitops.DefaultSnapshotCommitMessage,
 		},
 		Skills: SkillsConfig{
 			CLI:          "npx",
@@ -365,6 +413,39 @@ func Normalize(cfg *Config) {
 	}
 	if cfg.Context.Task.HistoryEvents <= 0 {
 		cfg.Context.Task.HistoryEvents = defaults.Context.Task.HistoryEvents
+	}
+	if cfg.Runtime.RequestTimeoutSeconds <= 0 {
+		cfg.Runtime.RequestTimeoutSeconds = defaults.Runtime.RequestTimeoutSeconds
+	}
+	if cfg.Runtime.SubagentTimeoutSeconds <= 0 {
+		cfg.Runtime.SubagentTimeoutSeconds = defaults.Runtime.SubagentTimeoutSeconds
+	}
+	if cfg.Runtime.TaskTimeoutSeconds <= 0 {
+		cfg.Runtime.TaskTimeoutSeconds = defaults.Runtime.TaskTimeoutSeconds
+	}
+	if cfg.Runtime.MaxNoProgressSteps <= 0 {
+		cfg.Runtime.MaxNoProgressSteps = defaults.Runtime.MaxNoProgressSteps
+	}
+	if cfg.Runtime.MaxEmptyResponses <= 0 {
+		cfg.Runtime.MaxEmptyResponses = defaults.Runtime.MaxEmptyResponses
+	}
+	if cfg.Runtime.MaxSameToolFailures <= 0 {
+		cfg.Runtime.MaxSameToolFailures = defaults.Runtime.MaxSameToolFailures
+	}
+	if cfg.Runtime.MaxConsecutiveReadOnly <= 0 {
+		cfg.Runtime.MaxConsecutiveReadOnly = defaults.Runtime.MaxConsecutiveReadOnly
+	}
+	if cfg.Runtime.MaxPlannerSummarySteps <= 0 {
+		cfg.Runtime.MaxPlannerSummarySteps = defaults.Runtime.MaxPlannerSummarySteps
+	}
+	if cfg.Runtime.MaxBuilderReadLoops <= 0 {
+		cfg.Runtime.MaxBuilderReadLoops = defaults.Runtime.MaxBuilderReadLoops
+	}
+	if cfg.Git.BaselineCommitMessage == "" {
+		cfg.Git.BaselineCommitMessage = defaults.Git.BaselineCommitMessage
+	}
+	if cfg.Git.SnapshotCommitMessage == "" {
+		cfg.Git.SnapshotCommitMessage = defaults.Git.SnapshotCommitMessage
 	}
 	if cfg.ModelLoading.ParallelSlots <= 0 {
 		cfg.ModelLoading.ParallelSlots = defaults.ModelLoading.ParallelSlots

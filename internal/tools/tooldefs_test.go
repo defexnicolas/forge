@@ -29,12 +29,38 @@ func TestToolDefsConvertsRegisteredTools(t *testing.T) {
 		if !json.Valid(def.Function.Parameters) {
 			t.Fatalf("tool %s has invalid parameters JSON", def.Function.Name)
 		}
+		var schema map[string]any
+		if err := json.Unmarshal(def.Function.Parameters, &schema); err != nil {
+			t.Fatalf("tool %s parameters did not unmarshal: %v", def.Function.Name, err)
+		}
+		if kind, _ := schema["type"].(string); kind == "object" {
+			if _, ok := schema["properties"]; !ok {
+				t.Fatalf("tool %s object schema is missing properties: %s", def.Function.Name, string(def.Function.Parameters))
+			}
+		}
 		found[def.Function.Name] = true
 	}
 
 	for _, expected := range []string{"read_file", "list_files", "search_text", "edit_file", "run_command"} {
 		if !found[expected] {
 			t.Fatalf("expected tool %s in ToolDefs output", expected)
+		}
+	}
+}
+
+func TestToolDefsNormalizesObjectSchemasWithoutProperties(t *testing.T) {
+	registry := NewRegistry()
+	registry.Register(gitStatusTool{})
+	registry.Register(noopTool{name: "stub_tool", description: "stub"})
+
+	defs := registry.ToolDefs(nil)
+	for _, def := range defs {
+		var schema map[string]any
+		if err := json.Unmarshal(def.Function.Parameters, &schema); err != nil {
+			t.Fatalf("tool %s parameters did not unmarshal: %v", def.Function.Name, err)
+		}
+		if _, ok := schema["properties"]; !ok {
+			t.Fatalf("tool %s schema missing properties after normalization: %s", def.Function.Name, string(def.Function.Parameters))
 		}
 	}
 }

@@ -148,6 +148,18 @@ func (m model) describeStatus() string {
 	if m.streaming {
 		agentState = "streaming"
 	}
+	gitState := m.agentRuntime.GitSessionState()
+	gitStatus := "unknown"
+	switch {
+	case !gitState.RepoInitialized:
+		gitStatus = "not initialized"
+	case gitState.SnapshotRequiredBeforeMutate:
+		gitStatus = "dirty worktree"
+	case gitState.AutoInitialized || gitState.BaselineCreatedThisSession:
+		gitStatus = "baseline created this session"
+	default:
+		gitStatus = "initialized, clean"
+	}
 	rows := [][]string{
 		{"cwd", m.options.CWD},
 		{"mode", m.agentRuntime.Mode},
@@ -158,6 +170,7 @@ func (m model) describeStatus() string {
 		{"build_subagents", fmt.Sprintf("%t/concurrency=%d", m.options.Config.Build.Subagents.Enabled, m.options.Config.Build.Subagents.Concurrency)},
 		{"model_roles", formatModelRoles(m.options.Config.Models)},
 		{"session", sessionID},
+		{"git", gitStatus},
 		{"command_profile", commandProfileName(m.agentRuntime.Commands)},
 		{"context_engine", m.options.Config.Context.Engine},
 		{"context_budget", fmt.Sprintf("%d", m.options.Config.Context.BudgetTokens)},
@@ -323,6 +336,15 @@ func planInterviewPrompt(goal string, cleared bool) string {
 	return "PLAN MODE ENTERED. " + base + " If a prior plan exists, first confirm whether the user wants to refine it or start fresh before interviewing."
 }
 
+func planRefinementPrompt(goal string) string {
+	base := "Refine the existing plan and checklist for the user's latest request. Read the current plan with plan_get and the current checklist with task_list before changing anything. " +
+		"Preserve completed work, prefer incremental task_* updates over todo_write, and use todo_write only if the user explicitly asked to replace the checklist from scratch."
+	if strings.TrimSpace(goal) == "" {
+		return base
+	}
+	return "PLAN REFINEMENT REQUEST: " + goal + "\n\n" + base
+}
+
 func (m *model) handlePlanCommand(fields []string) string {
 	if len(fields) == 1 {
 		m.showPlan = !m.showPlan
@@ -376,9 +398,9 @@ func (m *model) handlePlanCommand(fields []string) string {
 		_ = m.agentRuntime.SetMode("plan")
 		m.showPlan = true
 		m.recalcLayout()
-		prompt := "Refine the existing plan document for the user's current goal, then derive the executable checklist. Read existing plan/checklist first if present."
+		prompt := planRefinementPrompt("")
 		if len(fields) > 2 {
-			prompt = strings.Join(fields[2:], " ")
+			prompt = planRefinementPrompt(strings.Join(fields[2:], " "))
 		}
 		m.agentEvents = m.agentRuntime.Run(context.Background(), prompt)
 		m.agentRunning = true
@@ -560,7 +582,7 @@ func (m model) describePermissions() string {
 	}
 	return t.FormatTable([]string{" ", "Profile", "Description"}, rows) +
 		"\n\n" + m.agentRuntime.Commands.Describe() +
-		"\n\n" + t.Muted.Render("These profiles affect run_command only. File edits and patches still require approval in build mode.") +
+		"\n\n" + t.Muted.Render("These profiles affect run_command only. Commands stay inside the workspace by default and can optionally reuse the managed .forge/venv.") +
 		"\n" + t.Muted.Render("Use /permissions set <profile> to change.")
 }
 
@@ -675,9 +697,17 @@ func (m model) describePlugins() string {
 	t := m.theme
 	rows := make([][]string, 0, len(found))
 	for _, p := range found {
-		rows = append(rows, []string{p.Name, p.Source, p.Path})
+		supported := strings.Join(p.SupportedComponents(), ", ")
+		if supported == "" {
+			supported = "-"
+		}
+		pending := strings.Join(p.PendingComponents(), ", ")
+		if pending == "" {
+			pending = "-"
+		}
+		rows = append(rows, []string{p.Name, p.Source, p.CompatibilityStatus(), supported, pending})
 	}
-	return t.FormatTable([]string{"Plugin", "Source", "Path"}, rows)
+	return t.FormatTable([]string{"Plugin", "Source", "Compat", "Supported", "Pending"}, rows)
 }
 
 func (m model) describeMode() string {
@@ -720,6 +750,11 @@ func (m *model) setMode(name, goal string) string {
 	if name == "explore" && m.showPlan {
 		m.showPlan = false
 		m.recalcLayout()
+	}
+	if name == "build" {
+		m.showPlan = true
+		m.recalcLayout()
+		return m.theme.Success.Render("Build mode entered — execution will work through the approved checklist and still ask approval for each edit.")
 	}
 	// Mode shown in status bar; no inline message.
 	return ""

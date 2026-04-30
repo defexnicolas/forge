@@ -13,11 +13,14 @@ import (
 // Rendered as a single row in the inline lane block; updated in place as
 // EventSubagentProgress events arrive.
 type lane struct {
-	Index   int
-	Agent   string
-	Status  string
-	Summary string
-	Error   string
+	Index     int
+	Agent     string
+	Status    string
+	Phase     string
+	StepsUsed int
+	TimedOut  bool
+	Summary   string
+	Error     string
 }
 
 // laneGroup owns the slice of lanes for one in-flight batch and remembers
@@ -48,6 +51,15 @@ func (g *laneGroup) applyProgress(p *agent.SubagentProgress) bool {
 	}
 	if p.Status != "" {
 		ln.Status = p.Status
+	}
+	if p.Phase != "" {
+		ln.Phase = p.Phase
+	}
+	if p.StepsUsed > 0 {
+		ln.StepsUsed = p.StepsUsed
+	}
+	if p.TimedOut {
+		ln.TimedOut = true
 	}
 	if p.Summary != "" {
 		ln.Summary = p.Summary
@@ -94,6 +106,22 @@ func renderLaneRow(ln lane, theme Theme, agentWidth, vpWidth int) string {
 	detail := ln.Summary
 	if ln.Error != "" {
 		detail = ln.Error
+	}
+	if ln.TimedOut {
+		detail = "timeout"
+		if ln.Error != "" {
+			detail += ": " + ln.Error
+		}
+	} else if ln.Phase != "" && ln.Status == "running" {
+		detail = ln.Phase
+		if ln.StepsUsed > 0 {
+			detail += fmt.Sprintf(" step:%d", ln.StepsUsed)
+		}
+	} else if ln.Phase != "" && ln.Status == "error" {
+		detail = ln.Phase
+		if ln.Error != "" {
+			detail += ": " + ln.Error
+		}
 	}
 	// Leave room for: 4 indent + marker (2) + "[N] " + agentCell + " " +
 	// statusCell + " " + detail. detail gets whatever's left.

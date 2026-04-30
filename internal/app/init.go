@@ -2,9 +2,11 @@ package app
 
 import (
 	"fmt"
+	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
+
+	"forge/internal/gitops"
 
 	"github.com/spf13/cobra"
 )
@@ -22,69 +24,19 @@ func newInitCommand() *cobra.Command {
 			}
 
 			out := cmd.OutOrStdout()
-
-			// Create .forge directory structure.
-			dirs := []string{
-				".forge",
-				filepath.Join(".forge", "sessions"),
-				filepath.Join(".forge", "yarn"),
-				filepath.Join(".forge", "tools"),
-				filepath.Join(".forge", "skills"),
-				filepath.Join(".forge", "cache", "skills"),
-				filepath.Join(".forge", "plugins"),
-				filepath.Join(".agents", "skills"),
-			}
-			for _, dir := range dirs {
-				fullPath := filepath.Join(cwd, dir)
-				if err := os.MkdirAll(fullPath, 0o755); err != nil {
-					return err
-				}
-				fmt.Fprintf(out, "  created %s/\n", dir)
-			}
-
-			// Write config.toml if it doesn't exist.
-			configPath := filepath.Join(cwd, ".forge", "config.toml")
-			if _, err := os.Stat(configPath); os.IsNotExist(err) {
-				if err := os.WriteFile(configPath, []byte(defaultConfigTOML), 0o644); err != nil {
-					return err
-				}
-				fmt.Fprintf(out, "  created .forge/config.toml\n")
-			} else {
-				fmt.Fprintf(out, "  exists  .forge/config.toml\n")
-			}
-
-			// Write .forge/.gitignore to exclude ephemeral data.
-			forgeGitignorePath := filepath.Join(cwd, ".forge", ".gitignore")
-			if _, err := os.Stat(forgeGitignorePath); os.IsNotExist(err) {
-				if err := os.WriteFile(forgeGitignorePath, []byte(forgeGitignore), 0o644); err != nil {
-					return err
-				}
-				fmt.Fprintf(out, "  created .forge/.gitignore\n")
-			}
-
-			// Write AGENTS.md at root if it doesn't exist.
-			agentsPath := filepath.Join(cwd, "AGENTS.md")
-			if _, err := os.Stat(agentsPath); os.IsNotExist(err) {
-				if err := os.WriteFile(agentsPath, []byte(defaultAgentsMD), 0o644); err != nil {
-					return err
-				}
-				fmt.Fprintf(out, "  created AGENTS.md\n")
-			} else {
-				fmt.Fprintf(out, "  exists  AGENTS.md\n")
+			if err := ensureProjectScaffold(cwd, out, true); err != nil {
+				return err
 			}
 
 			// Optionally initialize git.
 			if initGit {
-				gitDir := filepath.Join(cwd, ".git")
-				if _, err := os.Stat(gitDir); os.IsNotExist(err) {
-					gitCmd := exec.Command("git", "init")
-					gitCmd.Dir = cwd
-					gitCmd.Stdout = out
-					gitCmd.Stderr = cmd.ErrOrStderr()
-					if err := gitCmd.Run(); err != nil {
-						fmt.Fprintf(out, "  warning: git init failed: %s\n", err)
-					} else {
-						fmt.Fprintf(out, "  initialized git repository\n")
+				result, err := gitops.EnsureRepo(cwd, gitops.DefaultBaselineCommitMessage)
+				if err != nil {
+					fmt.Fprintf(out, "  warning: git init failed: %s\n", err)
+				} else if result.Initialized {
+					fmt.Fprintf(out, "  initialized git repository\n")
+					if result.BaselineCreated {
+						fmt.Fprintf(out, "  created baseline commit %s\n", result.BaselineCommitID)
 					}
 				} else {
 					fmt.Fprintf(out, "  exists  .git/ (already a git repo)\n")
@@ -98,7 +50,7 @@ func newInitCommand() *cobra.Command {
 	}
 
 	var showEnv bool
-	cmd.Flags().BoolVar(&initGit, "git", false, "also run git init if not already a repo")
+	cmd.Flags().BoolVar(&initGit, "git", true, "initialize git and create a baseline commit when needed")
 	cmd.Flags().BoolVar(&showEnv, "env", false, "print instructions to add forge to PATH")
 
 	cmd.PostRunE = func(cmd *cobra.Command, args []string) error {
@@ -132,6 +84,56 @@ func newInitCommand() *cobra.Command {
 	return cmd
 }
 
+func ensureProjectScaffold(cwd string, out io.Writer, verbose bool) error {
+	dirs := []string{
+		".forge",
+		filepath.Join(".forge", "sessions"),
+		filepath.Join(".forge", "yarn"),
+		filepath.Join(".forge", "tools"),
+		filepath.Join(".forge", "skills"),
+		filepath.Join(".forge", "cache", "skills"),
+		filepath.Join(".forge", "plugins"),
+		filepath.Join(".agents", "skills"),
+	}
+	for _, dir := range dirs {
+		fullPath := filepath.Join(cwd, dir)
+		if err := os.MkdirAll(fullPath, 0o755); err != nil {
+			return err
+		}
+		if verbose {
+			fmt.Fprintf(out, "  created %s/\n", dir)
+		}
+	}
+	if err := ensureFile(filepath.Join(cwd, ".forge", "config.toml"), defaultConfigTOML, out, verbose, ".forge/config.toml"); err != nil {
+		return err
+	}
+	if err := ensureFile(filepath.Join(cwd, ".forge", ".gitignore"), forgeGitignore, out, verbose, ".forge/.gitignore"); err != nil {
+		return err
+	}
+	if err := ensureFile(filepath.Join(cwd, "AGENTS.md"), defaultAgentsMD, out, verbose, "AGENTS.md"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func ensureFile(path, content string, out io.Writer, verbose bool, label string) error {
+	if _, err := os.Stat(path); err == nil {
+		if verbose {
+			fmt.Fprintf(out, "  exists  %s\n", label)
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		return err
+	}
+	if verbose {
+		fmt.Fprintf(out, "  created %s\n", label)
+	}
+	return nil
+}
+
 const defaultConfigTOML = `default_agent = "build"
 approval_profile = "normal"
 
@@ -150,7 +152,7 @@ type = "openai-compatible"
 base_url = "http://localhost:1234/v1"
 api_key = "lm-studio"
 default_model = "local-model"
-supports_tools = false
+supports_tools = true
 
 [context]
 engine = "yarn"
@@ -174,6 +176,27 @@ budget_tokens = 4000
 max_nodes = 6
 max_file_bytes = 8000
 history_events = 4
+
+[runtime]
+request_timeout_seconds = 45
+subagent_timeout_seconds = 90
+task_timeout_seconds = 180
+max_no_progress_steps = 3
+max_empty_responses = 2
+max_same_tool_failures = 2
+max_consecutive_read_only = 6
+max_planner_summary_steps = 2
+max_builder_read_loops = 4
+retry_on_provider_timeout = false
+
+[git]
+auto_init = true
+create_baseline_commit = true
+require_clean_or_snapshot = true
+auto_stage_mutations = true
+auto_commit = false
+baseline_commit_message = "chore: initialize forge workspace baseline"
+snapshot_commit_message = "chore: snapshot workspace before forge mutation"
 
 [model_loading]
 enabled = false

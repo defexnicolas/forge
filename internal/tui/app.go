@@ -12,6 +12,7 @@ import (
 
 	"forge/internal/agent"
 	"forge/internal/config"
+	"forge/internal/gitops"
 	"forge/internal/hooks"
 	"forge/internal/llm"
 	"forge/internal/mcp"
@@ -38,6 +39,7 @@ type Options struct {
 	MCP          *mcp.Manager
 	Hooks        *hooks.Runner
 	ProjectState *projectstate.Service
+	GitState     gitops.SessionState
 }
 
 type App struct{ options Options }
@@ -205,6 +207,7 @@ func newModel(options Options) model {
 	runtime.Builder.Skills = options.Skills
 	runtime.Builder.ProjectState = options.ProjectState
 	runtime.Hooks = options.Hooks
+	runtime.SetGitSessionState(options.GitState)
 
 	sessionName := "new"
 	if options.Session != nil {
@@ -478,6 +481,7 @@ func (m model) View() string {
 	t := m.theme
 	inputArea := m.inputAreaView()
 	statusLine := m.statusLineView()
+	gitBanner := m.gitBannerView()
 
 	// Approval takes over the chat area (not an overlay below) — the user
 	// asked for a momentary full-screen replacement so the decision is
@@ -548,14 +552,14 @@ func (m model) View() string {
 	}
 
 	if m.searching {
-		return chatArea + "\n" + m.searchMode.View(t) + "\n\n" + statusLine
+		return chatArea + gitBanner + "\n" + m.searchMode.View(t) + "\n\n" + statusLine
 	}
 
 	// Render autocomplete suggestions below input — flow horizontally, wrapping by width.
 	if len(m.suggestions) > 0 {
-		return chatArea + inputArea + "\n" + m.suggestionView() + "\n\n" + statusLine
+		return chatArea + gitBanner + inputArea + "\n" + m.suggestionView() + "\n\n" + statusLine
 	}
-	return chatArea + inputArea + "\n\n" + statusLine
+	return chatArea + gitBanner + inputArea + "\n\n" + statusLine
 }
 
 func (m model) safeWidth() int {
@@ -574,6 +578,18 @@ func (m model) inputAreaView() string {
 		return "\n" + progress + "\n" + m.inputBoxView()
 	}
 	return viewportInputGap() + m.inputBoxView()
+}
+
+func (m model) gitBannerView() string {
+	state := m.agentRuntime.GitSessionState()
+	if !state.SnapshotRequiredBeforeMutate {
+		return ""
+	}
+	text := strings.TrimSpace(state.BannerText())
+	if text == "" {
+		return ""
+	}
+	return "\n" + m.theme.Warning.Render("  ! "+text)
 }
 
 func (m model) modelProgressView() string {
@@ -655,8 +671,9 @@ func (m model) statusLineView() string {
 
 	tokensUsed := m.agentRuntime.LastTokensUsed
 	yarnBudget := m.agentRuntime.LastTokensBudget
-	modelWindow, _, _ := config.EffectiveBudgets(m.options.Config)
+	modelWindow, _, _ := config.EffectiveBudgets(m.activeRoleConfig())
 	contextInfo := t.Muted.Render("ctx:--")
+	gitInfo := t.Muted.Render("git:unknown")
 	// Denominator is the loaded model window — what the user actually cares
 	// about ("how much room do I have left before the model clamps?"). The
 	// self-imposed BudgetTokens cap used to show here, but that's a soft
@@ -687,6 +704,17 @@ func (m model) statusLineView() string {
 		}
 		contextInfo = ctxStyle.Render(fmt.Sprintf("yarn:%s/%dk", formatTokenCount(tokensUsed), yarnBudget/1000))
 	}
+	gitState := m.agentRuntime.GitSessionState()
+	switch {
+	case !gitState.RepoInitialized:
+		gitInfo = t.Warning.Render("git:none")
+	case gitState.SnapshotRequiredBeforeMutate:
+		gitInfo = t.Warning.Render("git:dirty")
+	case gitState.AutoInitialized || gitState.BaselineCreatedThisSession:
+		gitInfo = t.StatusActive.Render("git:baseline")
+	default:
+		gitInfo = t.Muted.Render("git:clean")
+	}
 
 	thinkLabel := t.Muted.Render("Think:OFF")
 	if m.thinkEnabled {
@@ -707,10 +735,45 @@ func (m model) statusLineView() string {
 		thinkLabel + sep +
 		modelMultiLabel + sep +
 		t.Accent.Render(provider) + sep +
+		gitInfo + sep +
 		status + sep +
 		contextInfo + sep +
 		t.Muted.Render(cwd)
 	return t.StatusBar.Render(bar)
+}
+
+func (m model) activeModelRole() string {
+	if !m.options.Config.ModelLoading.Enabled {
+		return "chat"
+	}
+	switch m.agentRuntime.Mode {
+	case "plan":
+		return "planner"
+	case "build":
+		return "editor"
+	case "explore":
+		return "explorer"
+	default:
+		return "chat"
+	}
+}
+
+func (m model) activeRoleModelID() string {
+	role := m.activeModelRole()
+	if model := strings.TrimSpace(m.options.Config.Models[role]); model != "" {
+		return model
+	}
+	if role == "explorer" {
+		if model := strings.TrimSpace(m.options.Config.Models["planner"]); model != "" {
+			return model
+		}
+	}
+	return strings.TrimSpace(m.options.Config.Models["chat"])
+}
+
+func (m model) activeRoleConfig() config.Config {
+	role := m.activeModelRole()
+	return config.ConfigForModelRole(m.options.Config, role, m.activeRoleModelID())
 }
 
 func (m model) suggestionView() string {
@@ -820,15 +883,18 @@ func (m *model) handleLine(line string) tea.Cmd {
 			}
 		}
 		if hasPlan && looksLikeExecute(line) {
-			m.agentEvents = m.agentRuntime.Run(context.Background(), "Execute the approved plan.")
-			m.agentRunning = true
-			return waitForAgentEvent(m.agentEvents)
+			return m.runPlanExecution("Execute the approved plan.")
 		}
-		if hasPlan {
+		if hasPlan && looksLikePlanReset(line) {
 			m.pendingPlanLine = line
 			m.activeForm = formConfirmPlanReset
 			m.confirmPlanReset = newConfirmFormWithDefault("A prior plan exists. Clear it and start fresh?", m.theme, false)
 			return nil
+		}
+		if hasPlan {
+			m.agentEvents = m.agentRuntime.Run(context.Background(), planRefinementPrompt(line))
+			m.agentRunning = true
+			return waitForAgentEvent(m.agentEvents)
 		}
 		m.agentEvents = m.agentRuntime.Run(context.Background(), planInterviewPrompt(line, true))
 		m.agentRunning = true
@@ -1230,6 +1296,22 @@ func looksLikeExecute(line string) bool {
 		"hazlo", "procede", "proceed", "do it", "go ahead",
 		"yes", "si", "dale", "adelante", "implementa",
 		"execute the plan", "run it", "let's go", "start",
+	}
+	for _, kw := range keywords {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikePlanReset(line string) bool {
+	lower := strings.TrimSpace(strings.ToLower(line))
+	keywords := []string{
+		"new plan", "start over", "start from scratch", "from scratch", "restart the plan",
+		"replan", "plan from scratch", "fresh plan",
+		"plan nuevo", "nuevo plan", "empecemos de cero", "empezar de cero", "desde cero",
+		"reinicia el plan", "rehaz el plan", "haz un plan nuevo",
 	}
 	for _, kw := range keywords {
 		if strings.Contains(lower, kw) {

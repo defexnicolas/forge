@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -99,6 +100,92 @@ func TestModelMultiOffDisablesMultiModelRouting(t *testing.T) {
 	}
 	if m.activeForm != formNone {
 		t.Fatalf("activeForm = %v, want formNone", m.activeForm)
+	}
+}
+
+func TestModelMultiKeepCurrentSkipsNextPlannerReload(t *testing.T) {
+	provider := &tuiFakeProvider{
+		models: []llm.ModelInfo{
+			{ID: "explore-model", LoadedContextLength: 16384},
+			{ID: "plan-model", LoadedContextLength: 32768},
+			{ID: "build-model", LoadedContextLength: 65536},
+		},
+		responses: []string{"planned"},
+	}
+	m := newModelMultiTestModel(t, provider)
+	if err := m.agentRuntime.SetMode("plan"); err != nil {
+		t.Fatal(err)
+	}
+
+	if out := m.handleCommand("/model-multi"); out == "" || m.activeForm != formModelMulti {
+		t.Fatalf("expected model-multi form, out=%q active=%v", out, m.activeForm)
+	}
+
+	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // strategy: single
+	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // explorer: first model
+	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // keep current
+	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyDown})  // plan reuse -> pick different
+	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // planner: second model
+	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // keep current
+	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // builder picker
+	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // builder: third model
+	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // keep current
+	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // reviewer reuse first
+	m = updateModelMultiTest(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // summarizer reuse first
+
+	for range m.agentRuntime.Run(context.Background(), "plan it") {
+	}
+	if len(provider.loads) != 0 {
+		t.Fatalf("expected keep-current planner model to skip reload, got %#v", provider.loads)
+	}
+	if len(provider.requests) == 0 || provider.requests[0].Model != "plan-model" {
+		t.Fatalf("planner request model = %#v, want plan-model", provider.requests)
+	}
+}
+
+func TestConfirmExecuteStartsBuildModeImmediately(t *testing.T) {
+	provider := &tuiFakeProvider{responses: []string{"built"}}
+	m := newModelMultiTestModel(t, provider)
+	if err := m.agentRuntime.SetMode("plan"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.agentRuntime.Tasks.ReplacePlan([]string{"Ship the change"}); err != nil {
+		t.Fatal(err)
+	}
+	m.activeForm = formConfirmExecute
+	m.confirmExecute = newConfirmForm("Execute this approved plan now?", m.theme)
+	m.pendingExecuteLine = "Execute the approved plan."
+
+	updated, cmd, handled := m.handleFormUpdate(tea.KeyMsg{Type: tea.KeyEnter})
+	if !handled {
+		t.Fatal("expected confirm execute form to handle Enter")
+	}
+	ptr, ok := updated.(*model)
+	if !ok {
+		t.Fatalf("handleFormUpdate returned %T", updated)
+	}
+	if ptr.agentRuntime.Mode != "build" {
+		t.Fatalf("mode = %q, want build", ptr.agentRuntime.Mode)
+	}
+	if cmd == nil {
+		t.Fatal("expected build execution command")
+	}
+
+	finalModel := drainAgentEvents(t, *ptr, cmd)
+	if finalModel.agentRuntime.Mode != "build" {
+		t.Fatalf("final mode = %q, want build", finalModel.agentRuntime.Mode)
+	}
+	if len(provider.requests) == 0 {
+		t.Fatal("expected build request")
+	}
+	if !strings.Contains(provider.requests[0].Messages[0].Content, "You are in build mode") {
+		t.Fatalf("expected build-mode system prompt, got:\n%s", provider.requests[0].Messages[0].Content)
 	}
 }
 

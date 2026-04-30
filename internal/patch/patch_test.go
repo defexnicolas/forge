@@ -2,10 +2,18 @@ package patch
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func requireGit(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+}
 
 func TestExactReplace(t *testing.T) {
 	cwd := t.TempDir()
@@ -48,6 +56,7 @@ func TestNewFileRejectsExisting(t *testing.T) {
 }
 
 func TestUnifiedDiffApply(t *testing.T) {
+	requireGit(t)
 	cwd := t.TempDir()
 	if err := os.WriteFile(filepath.Join(cwd, "file.txt"), []byte("one\ntwo\nthree\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -100,7 +109,7 @@ func TestDiffRendering(t *testing.T) {
 		t.Fatal(err)
 	}
 	diff := Diff(plan)
-	if !strings.Contains(diff, "-hello world") || !strings.Contains(diff, "+hello forge") {
+	if !strings.Contains(diff, "diff --git a/file.txt b/file.txt") || !strings.Contains(diff, "-hello world") || !strings.Contains(diff, "+hello forge") {
 		t.Fatalf("unexpected diff:\n%s", diff)
 	}
 }

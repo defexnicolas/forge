@@ -20,19 +20,22 @@ El repositorio ya contiene un MVP funcional de `forge`:
 - CLI con `cobra` en `cmd/forge` e inicializacion de `.forge/`.
 - TUI con `bubbletea`, `bubbles` y `lipgloss`.
 - Runtime de agente con streaming, modo nativo de tool calling cuando el proveedor lo soporta, y fallback textual con bloques `<tool_call>`.
-- Providers OpenAI Compatible y LM Studio configurables desde `.forge/config.toml`.
-- Tools nativas para lectura, listado, busqueda, git status/diff, comandos, edicion, escritura y patches.
+- Providers OpenAI Compatible y LM Studio configurables desde `.forge/config.toml`, con probing/carga de modelos y routing por rol.
+- Tools nativas para lectura, listado, busqueda, git status/diff, comandos, edicion, escritura, patches, plan/tasks y skills.
 - Permisos por perfil (`safe`, `normal`, `fast`, `yolo`) para comandos; los cambios de archivos siguen pasando por approvals del runtime de agente.
-- Subagents iniciales: `explorer`, `reviewer` y `tester`.
-- Context builder con `AGENTS.md`, menciones `@`, pins, historial de sesion y YARN simple.
-- Persistencia basada en archivos JSON/JSONL dentro de `.forge/`, no SQLite.
-- MCP basico por `stdio`: carga `.mcp.json`, hace handshake, descubre tools y ejecuta `tools/call`.
-- Discovery basico de plugins Forge/Claude-compatible, commands y agents Markdown.
+- Modos principales actuales: `plan`, `build` y `explore`.
+- Subagents actuales: `explorer`, `reviewer`, `tester`, `summarizer`, `refactorer`, `docs`, `commit`, `debug` y `builder`.
+- Context builder con `AGENTS.md`, menciones `@`, pins, historial de sesion, skills instaladas, project snapshot y YARN.
+- Persistencia mixta: SQLite en varias capas (`session`, `yarn`, `db`) y archivos bajo `.forge/` para sesiones, artifacts, config y caches.
+- MCP por `stdio`, `sse` y `http`: carga `.mcp.json`, hace handshake, descubre tools y ejecuta `tools/call`.
+- Discovery de plugins Forge/Claude-compatible, con estado persistido de enable/disable e integracion parcial de commands, agents, hooks y MCP.
 - Skills via directory global de `skills.sh`, Skills CLI (`npx skills`) para repos directos, instalacion para `codex` y fallback built-in/local para uso offline.
-- Hooks basicos desde `.forge/hooks.json`.
+- `run_skill` existe como tool real de carga/ejecucion local de `SKILL.md`, aunque todavia no cubre un runtime de skills mas avanzado.
+- Hooks basicos desde `.forge/hooks.json` y carga parcial desde plugins.
+- Git session management con baseline/snapshot previo a mutaciones y `remote-control` para exponer la sesion por LAN.
 - LSP existe solo como interfaz/stub; diagnostics y symbols reales estan pendientes.
 
-Prueba de salud actual: `go test ./...` pasa.
+Comando de salud esperado del proyecto: `go test ./...`.
 
 ## Objetivos
 
@@ -73,6 +76,7 @@ Comandos internos actuales principales:
 /dir
 /theme
 /model
+/model-multi
 /provider
 /mode
 /agents
@@ -97,6 +101,7 @@ Comandos internos actuales principales:
 /session
 /sessions
 /resume
+/remote-control
 /think
 /copy
 /status
@@ -201,9 +206,10 @@ Responsabilidades:
 
 Persistencia:
 
-- Estado actual: archivos JSON/JSONL en `.forge/sessions/`, `.forge/tasks/`, `.forge/context/` y `.forge/yarn/`.
-- Objetivo: SQLite para sesiones, mensajes, tool calls, approvals, metadata, tasks, context items, agents y skills.
-- Archivos en `.forge/sessions/` para snapshots grandes, diffs y artifacts cuando no convenga guardarlos en SQLite.
+- Estado actual: persistencia mixta. Hay SQLite para sesiones y algunos stores internos, pero `.forge/` sigue siendo la ubicacion principal para config, caches, artifacts, sesiones legibles y estado auxiliar.
+- Estado actual: conviven `sessions.db`/SQLite con archivos como `.forge/sessions/`, `.forge/yarn/`, `.forge/plugins.json`, caches de skills y configs TOML/JSON.
+- Objetivo: seguir moviendo metadata estructurada a SQLite cuando simplifique consultas o consistencia, sin forzar que todo artifact pesado salga de `.forge/`.
+- Archivos en `.forge/sessions/` y `.forge/` siguen siendo validos para snapshots grandes, diffs, exports y artifacts donde SQLite no aporte valor.
 
 Tablas sugeridas para la migracion a SQLite:
 
@@ -227,12 +233,11 @@ Modos actuales:
 - `plan`: analiza y propone, sin editar.
 - `build`: edita, ejecuta tools permitidas y verifica.
 - `explore`: read-only para entender el repo.
-- `review`: revisa diff y cambios.
 
 Modos objetivo:
 
-- `debug`: reproduce fallos y busca causa.
-- `commit`: prepara resumen, mensaje y staging opcional.
+- Mantener `plan`, `build` y `explore` como modos principales pequenos y estables.
+- Evaluar agregar modos nuevos solo si aportan una politica distinta; hoy `debug`, `commit`, `docs` y `review` viven mejor como subagents/comandos especializados.
 
 Loop base:
 
@@ -269,12 +274,18 @@ Subagents actuales:
 - `explorer`: busca archivos, simbolos y rutas relevantes. Read-only.
 - `reviewer`: revisa diffs y propone hallazgos. Read-only.
 - `tester`: ejecuta comandos de test permitidos y resume fallos.
-
-Subagents objetivo:
-
+- `summarizer`: compacta transcript/contexto a resumenes utiles para YARN.
 - `refactorer`: aplica cambios mecanicos acotados.
-- `docs`: actualiza documentos y changelog.
-- `summarizer`: compacta contexto y transcript.
+- `docs`: actualiza documentacion y changelog.
+- `commit`: prepara diff, staging y resumen de commit.
+- `debug`: reproduce fallos y busca causa.
+- `builder`: ejecuta una tarea concreta del checklist con contexto acotado y approvals.
+
+Subagents/roles que siguen en evolucion:
+
+- endurecer limites de contexto por rol;
+- mejorar prompts y contratos de salida;
+- seguir afinando la frontera entre `build` como modo principal y `builder` como worker de tarea unica.
 
 Politicas de contexto:
 
@@ -378,11 +389,12 @@ budget_tokens = 6000
 
 Implementacion inicial:
 
-- Estado actual: guardar nodos en `.forge/yarn/nodes.jsonl`.
+- Estado actual: guardar nodos en `.forge/yarn/nodes.jsonl` y contar con store SQLite para evolucion posterior.
 - Estado actual: crear nodos desde archivos directos/mencionados, `AGENTS.md`, pins y resumen reciente de sesion.
 - Estado actual: seleccionar nodos con scoring simple por terminos y presupuesto aproximado de tokens.
 - Estado actual: inspeccionar YARN con `/yarn`, `/yarn graph`, `/yarn inspect` y `/context yarn`.
-- Objetivo: migrar nodos YARN a SQLite.
+- Estado actual: compactar transcript a YARN desde la TUI y ajustar presupuesto/ventana segun deteccion de contexto del modelo.
+- Objetivo: decidir cuanto del store dual JSONL/SQLite conviene consolidar y cuanto debe seguir como artifact local inspeccionable.
 - Objetivo: guardar contenido pesado como snapshots en `.forge/yarn/objects/`.
 - Objetivo: crear nodos automaticamente al ejecutar tests, aplicar patches o tomar decisiones.
 - Objetivo: crear summaries con un modelo pequeno.
@@ -410,6 +422,8 @@ type Provider interface {
     Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error)
     Stream(ctx context.Context, req ChatRequest) (<-chan ChatEvent, error)
     ListModels(ctx context.Context) ([]ModelInfo, error)
+    ProbeModel(ctx context.Context, modelID string) (*ModelInfo, error)
+    LoadModel(ctx context.Context, modelID string, cfg LoadConfig) error
 }
 ```
 
@@ -446,14 +460,15 @@ type = "openai-compatible"
 base_url = "http://localhost:1234/v1"
 api_key = "lm-studio"
 default_model = "local-model"
-supports_tools = false
+supports_tools = true
 ```
 
 Requisitos especificos:
 
 - Descubrir modelos con `/v1/models` cuando este disponible.
-- Permitir cambiar modelo desde `/model`.
-- Soportar modelos sin tool calling nativo.
+- Permitir cambiar modelo desde `/model` y configurar multi-model routing desde `/model-multi`.
+- Soportar modelos con y sin tool calling nativo.
+- Aplicar `parallel_slots`, probing de contexto real y cargas por rol cuando el backend lo permita.
 - Reducir contexto automaticamente segun ventana declarada.
 - Exponer diagnostics claros si LM Studio no esta corriendo.
 
@@ -498,17 +513,21 @@ Tools actuales:
 - `run_command`
 - `write_file` solo para archivos nuevos o casos aprobados.
 - `spawn_subagent`
+- `spawn_subagents`
 - `todo_write`
 - `task_create`
 - `task_list`
 - `task_get`
 - `task_update`
+- `plan_write`
+- `plan_get`
+- `execute_task`
+- `run_skill`
 - tools externas desde `.forge/tools/<name>/tool.toml`
-- tools MCP descubiertas desde `.mcp.json` cuando el servidor usa `stdio`.
+- tools MCP descubiertas desde `.mcp.json` cuando el servidor usa `stdio`, `sse` o `http`.
 
 Tools registradas como stubs o pendientes de implementacion completa:
 
-- `run_skill`
 - `list_mcp_resources`
 - `read_mcp_resource`
 - `lsp`
@@ -732,11 +751,10 @@ MCP es la ruta principal para compatibilidad real con tools externas de Claude C
 Soporte requerido:
 
 - Estado actual: leer `.mcp.json` del repo.
-- Estado actual: soportar servidores `stdio`.
+- Estado actual: soportar servidores `stdio`, `sse` y `http`.
 - Estado actual: hacer handshake MCP, ejecutar `tools/list`, registrar tools y ejecutar `tools/call`.
 - Estado actual: mostrar MCP servers/tools en `/mcp` y registrar tools descubiertas en `/tools`.
 - Objetivo: leer `.mcp.json` dentro de plugins.
-- Objetivo: soportar servidores `sse` y `http`.
 - Objetivo: expandir variables como `${CLAUDE_PLUGIN_ROOT}` y variables de entorno permitidas.
 - Objetivo: exponer MCP resources en `@` mentions.
 - Objetivo: exponer MCP prompts como slash commands cuando sea posible.
@@ -752,12 +770,13 @@ Estado actual:
 - Lee metadata basica desde `.claude-plugin/plugin.json`.
 - Autodetecta directorios compatibles como `skills/`, `commands/`, `agents/`, `hooks/`, `output-styles/`, `bin/`, `.mcp.json`, `.lsp.json`, `settings.json` y `.forge/plugin.toml`.
 - Puede listar commands y agents Markdown desde plugins.
+- Puede persistir estado enabled/disabled por proyecto.
+- Puede cargar hooks y `.mcp.json` de plugins habilitados desde el arranque de la app.
 
 Pendiente:
 
-- Habilitar/deshabilitar plugins.
 - Instalar/remover plugins desde marketplace.
-- Cargar hooks, MCP, LSP servers, output styles y settings desde plugins de forma integrada.
+- Cargar LSP servers, output styles y settings desde plugins de forma integrada.
 - Resolver variables como `${CLAUDE_PLUGIN_ROOT}`, `${FORGE_PLUGIN_ROOT}` y `${user_config.KEY}`.
 - Registrar plugins instalados en SQLite.
 
@@ -906,7 +925,7 @@ Estado actual:
 Pendiente:
 
 - Registrar skills en SQLite.
-- Ejecutar `run_skill` como tool real.
+- Expandir `run_skill` desde carga local de `SKILL.md` a una ejecucion mas rica con workflow/control de herramientas.
 - Soportar update/search a traves de la UI.
 
 Comandos de Skills CLI usados por Forge:
@@ -1141,8 +1160,8 @@ Config:
 
 Persistencia:
 
-- Estado actual: archivos JSON/JSONL bajo `.forge/`.
-- Objetivo: SQLite con `modernc.org/sqlite` o `github.com/mattn/go-sqlite3`.
+- Estado actual: combinacion de SQLite (`modernc.org/sqlite`) y archivos bajo `.forge/`.
+- Objetivo: seguir consolidando solo los stores donde SQLite simplifique operaciones o consistencia.
 - `.forge/` para artifacts, snapshots, skills, tools y plugins.
 
 LLM:
@@ -1177,8 +1196,7 @@ Tools:
 - Tools externas por proceso con JSON stdin/stdout.
 - Tools Python mediante runtime `process` y SDK `forge-tool`.
 - Tools Node mediante runtime `process` y SDK `@forge/tool`.
-- Estado actual: MCP `stdio` como runtime de tools.
-- Objetivo: MCP SSE/HTTP como runtime de tools.
+- Estado actual: MCP `stdio`, `sse` y `http` como runtime de tools.
 - Importacion de `.mcp.json` compatible con Claude Code.
 - Aliases Claude Code para tools de archivo, shell, subagents, tasks, skills, MCP, LSP, web, notebooks y PowerShell.
 
@@ -1187,8 +1205,8 @@ Plugins:
 - Plugin discovery propio en Go.
 - Soporte de `.claude-plugin/plugin.json` opcional.
 - Autodiscovery de `skills/`, `commands/`, `agents/`, `hooks/`, `.mcp.json`, `.lsp.json`, `output-styles/`, `bin/` y `settings.json`.
-- Estado actual: carga/listado basico de commands y agents Markdown.
-- Objetivo: importacion de skills, hooks, MCP servers y LSP servers desde plugins Claude-compatible.
+- Estado actual: carga/listado parcial de commands, agents, hooks y MCP desde plugins Claude-compatible.
+- Objetivo: importacion mas completa de skills, LSP servers, output styles y settings desde plugins Claude-compatible.
 - Objetivo: marketplace local o remoto con approval antes de instalar.
 
 Logging:
@@ -1216,18 +1234,23 @@ internal/app/       comandos cobra e inicializacion
 internal/tui/       TUI, forms, commands, diff render, plan panel
 internal/agent/     runtime, modos, policies, subagents, tool calls
 internal/context/   builder, mentions, pins/context tray
-internal/yarn/      store JSONL y seleccion simple de nodos
+internal/yarn/      store YARN JSONL/SQLite y seleccion simple de nodos
+internal/db/        utilidades base de SQLite
+internal/gitops/    baseline, snapshot y estado git de sesion
 internal/llm/       providers OpenAI Compatible y streaming
 internal/tools/     registry, builtins, external process tools
-internal/mcp/       MCP stdio basico
-internal/session/   sesiones JSONL
-internal/tasks/     plan/tasks JSON
+internal/mcp/       MCP stdio + SSE/HTTP
+internal/session/   sesiones y transcript
+internal/plans/     documento de plan
+internal/tasks/     checklist/tareas
 internal/permissions/
 internal/patch/
 internal/skills/
 internal/plugins/
 internal/hooks/
 internal/lsp/       interfaz/stub
+internal/remote/    viewer/control remoto por LAN
+internal/projectstate/
 ```
 
 Estructura objetivo/propuesta para evolucionar el MVP:
@@ -1324,7 +1347,7 @@ El MVP actual ya apunta a sentirse como una herramienta interactiva real. Estado
 
 - Hecho: `forge` abre la TUI.
 - Hecho: chat streaming.
-- Hecho: `/model`, `/permissions`, `/context`, `/diff`, `/undo`, `/skills`, `/tools`, `/mcp`, `/plugins`, `/status`, `/config`, `/review`.
+- Hecho: `/model`, `/model-multi`, `/permissions`, `/context`, `/diff`, `/undo`, `/skills`, `/tools`, `/mcp`, `/plugins`, `/status`, `/config`, `/review`, `/remote-control`.
 - Hecho: soporte OpenAI Compatible.
 - Hecho: soporte LM Studio.
 - Hecho: `AGENTS.md`.
@@ -1333,17 +1356,19 @@ El MVP actual ya apunta a sentirse como una herramienta interactiva real. Estado
 - Hecho: `run_command` con allow/ask/deny.
 - Hecho: context tray con pin/drop.
 - Hecho: plan visible via tasks/todos.
-- Hecho: sesiones persistentes en JSONL.
+- Hecho parcial: sesiones persistentes en archivos y SQLite segun store.
 - Hecho parcial: skills via `npx skills add <repo> --list/install` con fallback built-in/local.
+- Hecho parcial: `run_skill` existe, pero su ejecucion todavia es una carga local simple del skill instalado.
 - Hecho parcial: tools nativas y externas por proceso. Los SDKs Python/Node siguen siendo objetivo.
 - Hecho parcial: aliases compatibles con tools Claude Code. Algunos aliases existen como stubs o rutas interceptadas por el runtime.
-- Hecho parcial: carga de `.mcp.json` para MCP `stdio`.
-- Hecho parcial: discovery basico de plugins Claude-compatible.
+- Hecho parcial: carga de `.mcp.json` para MCP `stdio`, `sse` y `http`.
+- Hecho parcial: discovery de plugins Claude-compatible con hooks/MCP y enable/disable; faltan mas componentes de plugin.
 
 Brechas inmediatas del MVP:
 
 - Mantener la TUI en ASCII estable para evitar mojibake en Windows/PowerShell.
-- Hacer evolucionar tools stub (`run_skill`, LSP, MCP resources, monitor) a implementaciones reales cuando entren al sprint.
+- Hacer evolucionar tools stub (`list_mcp_resources`, `read_mcp_resource`, LSP, monitor) a implementaciones reales cuando entren al sprint.
+- Decidir si `run_skill` se queda como loader local o se convierte en un runtime de workflow mas estructurado.
 - Decidir si la busqueda se queda en Go o si `rg` pasa a ser backend preferido.
 - Mantener `go test ./...` como comando de salud del proyecto.
 
@@ -1357,32 +1382,33 @@ Brechas inmediatas del MVP:
 - Hecho: tools basicas.
 - Hecho parcial: tools por proceso desde `.forge/tools/`.
 - Hecho parcial: aliases Claude Code para tools basicas.
-- Hecho parcial: importacion `.mcp.json` para servidores `stdio`.
+- Hecho: importacion `.mcp.json` para servidores `stdio`.
 - Hecho: permissions.
 - Hecho: `AGENTS.md`.
 - Hecho: diff view basico.
-- Hecho: sesiones JSONL.
+- Hecho parcial: sesiones persistentes con mezcla de archivos y SQLite.
 - Pendiente: mantener hardening de TUI y decidir backend de busqueda.
 
 ### v0.2
 
-- Hecho parcial: YARN Context inicial con JSONL.
-- Hecho: subagents `explorer`, `reviewer`, `tester`.
+- Hecho parcial: YARN Context inicial con JSONL/SQLite y compactacion desde TUI.
+- Hecho: subagents base y expansion a workers especializados, incluyendo `builder`.
 - Hecho parcial: `/skills` con Skills CLI y fallback built-in/local.
 - Hecho parcial: tools externas.
 - Hecho parcial: plugin discovery Claude-compatible.
-- Hecho parcial: importacion/listado de commands y agents de plugins.
+- Hecho parcial: importacion/listado de commands, agents, hooks y MCP de plugins.
 - Hecho: hooks basicos desde `.forge/hooks.json`.
-- Pendiente: ejecutar skills como tool real, cargar hooks/MCP/LSP desde plugins e introducir enable/disable.
+- Hecho: enable/disable de plugins por proyecto.
+- Pendiente: enriquecer `run_skill`, cargar LSP/settings/output styles desde plugins y endurecer la integracion MCP/resources.
 
 ### v0.3
 
 - Skills con frontmatter completo.
 - Context compaction avanzada.
-- MCP avanzado: resources, prompts, SSE/HTTP.
+- MCP avanzado: resources y prompts.
 - LSP diagnostics.
 - Fuzzy symbol search.
-- Migracion a SQLite si el modelo de archivos empieza a limitar sesiones, YARN o plugins.
+- Consolidar que stores deben migrar a SQLite y cuales deben seguir como artifacts en `.forge/`.
 
 ### v0.4
 

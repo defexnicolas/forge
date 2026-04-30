@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -137,12 +138,7 @@ func (r *Runtime) executeSubagents(ctx context.Context, input json.RawMessage) (
 // the editor-role prompt lean so a smaller/faster model can execute while the
 // planner (Gemma) keeps the high-level state.
 func (r *Runtime) executeExecuteTask(ctx context.Context, input json.RawMessage) (*tools.Result, string) {
-	var req struct {
-		TaskID        string   `json:"task_id"`
-		ID            string   `json:"id"` // tolerant alias
-		RelevantFiles []string `json:"relevant_files"`
-		Notes         string   `json:"notes"`
-	}
+	var req executeTaskDispatchRequest
 	if err := json.Unmarshal(input, &req); err != nil {
 		result := tools.Result{Title: "execute_task", Summary: err.Error()}
 		return &result, "Tool result for execute_task: error: " + err.Error()
@@ -173,6 +169,7 @@ func (r *Runtime) executeExecuteTask(ctx context.Context, input json.RawMessage)
 	if strings.TrimSpace(req.Notes) != "" {
 		prompt += "\n\nAdditional guidance:\n" + strings.TrimSpace(req.Notes)
 	}
+	guard := deriveBuilderTaskGuard(task, req)
 	contextPayload := map[string]any{
 		"task": map[string]string{
 			"id":     task.ID,
@@ -181,8 +178,20 @@ func (r *Runtime) executeExecuteTask(ctx context.Context, input json.RawMessage)
 			"notes":  task.Notes,
 		},
 	}
+	if gitFact := strings.TrimSpace(r.GitSessionState().PromptFact()); gitFact != "" {
+		contextPayload["git_state"] = gitFact
+	}
 	if len(req.RelevantFiles) > 0 {
 		contextPayload["relevant_files"] = req.RelevantFiles
+	}
+	if guard.TargetFile != "" {
+		contextPayload["target_file"] = guard.TargetFile
+	}
+	if guard.FileStrategy != "" {
+		contextPayload["file_strategy"] = guard.FileStrategy
+	}
+	if guard.SectionGoal != "" {
+		contextPayload["section_goal"] = guard.SectionGoal
 	}
 	contextJSON, _ := json.Marshal(contextPayload)
 	subReq := SubagentRequest{
@@ -190,8 +199,17 @@ func (r *Runtime) executeExecuteTask(ctx context.Context, input json.RawMessage)
 		Prompt:  prompt,
 		Context: contextJSON,
 	}
-	result, err := r.RunSubagent(ctx, subReq)
+	taskCtx, cancel := withOptionalTimeout(ctx, r.taskTimeout())
+	defer cancel()
+	r.setActiveBuilderTask(&guard)
+	defer r.setActiveBuilderTask(nil)
+	result, err := r.RunSubagent(taskCtx, subReq)
 	if err != nil {
+		var runErr *subagentRunError
+		if errors.As(err, &runErr) {
+			out := buildExecuteTaskFailureResult(task.ID, runErr)
+			return &out, "Tool result for execute_task: error: " + out.Summary
+		}
 		out := tools.Result{Title: "execute_task", Summary: err.Error()}
 		return &out, "Tool result for execute_task: error: " + err.Error()
 	}
@@ -226,6 +244,7 @@ func (r *Runtime) executeTodoWrite(input json.RawMessage) (*tools.Result, string
 			}
 		}
 	}
+	items = normalizeChecklistItems(items)
 	plan, err := r.Tasks.ReplacePlan(items)
 	if err != nil {
 		result := tools.Result{Title: "todo_write", Summary: err.Error()}
@@ -532,14 +551,20 @@ func (r *Runtime) requestApproval(ctx context.Context, toolName string, input js
 		result := tools.Result{Title: toolName, Summary: err.Error()}
 		return &result, "Tool result for " + toolName + ": error: " + err.Error()
 	}
+	approvalDiff, beforeApply, err := r.prepareGitBackedMutation(summary, plan)
+	if err != nil {
+		result := tools.Result{Title: toolName, Summary: err.Error()}
+		return &result, "Tool result for " + toolName + ": error: " + err.Error()
+	}
 	request := &ApprovalRequest{
-		ID:       fmt.Sprintf("approval-%p", &plan),
-		ToolName: toolName,
-		Input:    input,
-		Summary:  summary,
-		Diff:     patch.Diff(plan),
-		Response: make(chan ApprovalResponse, 1),
-		plan:     plan,
+		ID:          fmt.Sprintf("approval-%p", &plan),
+		ToolName:    toolName,
+		Input:       input,
+		Summary:     summary,
+		Diff:        approvalDiff,
+		Response:    make(chan ApprovalResponse, 1),
+		plan:        plan,
+		beforeApply: beforeApply,
 	}
 	events <- Event{Type: EventApproval, ToolName: toolName, Input: input, Approval: request}
 	select {
@@ -561,12 +586,19 @@ func (r *Runtime) requestApproval(ctx context.Context, toolName string, input js
 			result := tools.Result{Title: toolName, Summary: msg}
 			return &result, "Tool result for " + toolName + ": " + msg
 		}
+		if request.beforeApply != nil {
+			if err := request.beforeApply(); err != nil {
+				result := tools.Result{Title: toolName, Summary: "prepare failed: " + err.Error()}
+				return &result, "Tool result for " + toolName + ": error: " + err.Error()
+			}
+		}
 		snapshots, err := patch.Apply(r.CWD, request.plan)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "approval-apply failed (%s): %v — plan had %d op(s)\n", toolName, err, len(request.plan.Operations))
 			result := tools.Result{Title: toolName, Summary: "apply failed: " + err.Error()}
 			return &result, "Tool result for " + toolName + ": error: " + err.Error()
 		}
+		r.RefreshGitSessionState()
 		r.mu.Lock()
 		r.undoStack = append(r.undoStack, UndoEntry{Summary: summary, Snapshots: snapshots})
 		r.mu.Unlock()
@@ -616,6 +648,9 @@ func (r *Runtime) prepareMutation(toolName string, input json.RawMessage) (patch
 		}
 		if content == "" {
 			content = req.Text
+		}
+		if err := r.validateWriteFileMutation(req.Path, content); err != nil {
+			return patch.Plan{}, "", err
 		}
 		plan, err := patch.NewFile(r.CWD, req.Path, content)
 		return plan, "create " + req.Path, err
@@ -849,8 +884,12 @@ func summarizeResult(result tools.Result) string {
 
 func systemPrompt(nativeToolCalling bool, modeName string, policy SprintPolicy) string {
 	modePrefix := ""
-	if mode, ok := GetMode(modeName); ok && modeName != "build" {
+	if mode, ok := GetMode(modeName); ok {
 		modePrefix = mode.Prompt + "\n\n"
+	}
+	allowedTool := func(name string) bool {
+		ok, _ := policy.Allowed(name)
+		return ok
 	}
 
 	if nativeToolCalling {
@@ -859,6 +898,8 @@ func systemPrompt(nativeToolCalling bool, modeName string, policy SprintPolicy) 
 You have access to tools via function calling. Use them to read files, search code, run commands, and make edits. Edits require user approval and should be small and reversible.
 
 For verification, use run_command with safe commands such as "go test ./..." or "git diff". Risky commands may require approval or be denied.
+
+For small self-contained artifacts, prefer one coherent runnable result over scaffold/layout/polish fragmentation. Only use section-by-section execution for genuinely large files or when the task context explicitly requires it.
 
 For one focused read-only worker task, use spawn_subagent. For multiple independent read-only/analysis tasks, use spawn_subagents with max_concurrency up to 8.
 
@@ -891,27 +932,46 @@ If you have enough information, answer normally without calling a tool.`)
 	if len(askTools) > 0 {
 		b.WriteString("For small edits, prefer:\n")
 		b.WriteString(`<tool_call>{"name":"edit_file","input":{"path":"file.txt","old_text":"exact old text","new_text":"replacement text"}}</tool_call>`)
-		b.WriteString("\n\nFor new files, use write_file. For patch-shaped output, use apply_patch. Edits require approval and should be small.\n\n")
+		b.WriteString("\n\nFor small self-contained artifacts, prefer one coherent write_file or apply_patch that leaves the artifact runnable. Use scaffold_then_patch only for genuinely large files or when task context explicitly asks for section-by-section work. Do not turn a simple new HTML/CSS/JS artifact into scaffold/layout/polish subtasks unless the task is clearly large.\n\n")
 		b.WriteString(`For verification, use run_command with safe commands such as "go test ./..." or "git diff". Risky commands may require approval or be denied.`)
 		b.WriteString("\n\n")
 	}
 
-	b.WriteString("For focused read-only worker tasks, use:\n")
-	b.WriteString(`<tool_call>{"name":"spawn_subagent","input":{"agent":"explorer","prompt":"find where tools are registered"}}</tool_call>`)
-	b.WriteString("\nFor multiple independent read-only/analysis tasks, use:\n")
-	b.WriteString(`<tool_call>{"name":"spawn_subagents","input":{"max_concurrency":3,"tasks":[{"agent":"explorer","prompt":"find where tools are registered"},{"agent":"reviewer","prompt":"inspect current diff for risks"}]}}</tool_call>`)
-	b.WriteString("\n\n")
+	if allowedTool("spawn_subagent") || allowedTool("spawn_subagents") {
+		b.WriteString("For focused read-only worker tasks, use:\n")
+		b.WriteString(`<tool_call>{"name":"spawn_subagent","input":{"agent":"explorer","prompt":"find where tools are registered"}}</tool_call>`)
+		b.WriteString("\nFor multiple independent read-only/analysis tasks, use:\n")
+		b.WriteString(`<tool_call>{"name":"spawn_subagents","input":{"max_concurrency":3,"tasks":[{"agent":"explorer","prompt":"find where tools are registered"},{"agent":"reviewer","prompt":"inspect current diff for risks"}]}}</tool_call>`)
+		b.WriteString("\n\n")
+	}
 
-	b.WriteString("For full plan documents, use:\n")
-	b.WriteString(`<tool_call>{"name":"plan_get","input":{}}</tool_call>` + "  read the current plan document\n")
-	b.WriteString(`<tool_call>{"name":"plan_write","input":{"summary":"goal","context":"repo facts","assumptions":["assumption"],"approach":"implementation strategy","stubs":["file/function stub"],"risks":["risk"],"validation":["go test ./..."]}}</tool_call>` + "  save the detailed plan\n\n")
+	if allowedTool("plan_get") || allowedTool("plan_write") {
+		b.WriteString("For full plan documents, use:\n")
+		if allowedTool("plan_get") {
+			b.WriteString(`<tool_call>{"name":"plan_get","input":{}}</tool_call>` + "  read the current plan document\n")
+		}
+		if allowedTool("plan_write") {
+			b.WriteString(`<tool_call>{"name":"plan_write","input":{"summary":"goal","context":"repo facts","assumptions":["assumption"],"approach":"implementation strategy","stubs":["file/function stub"],"risks":["risk"],"validation":["go test ./..."]}}</tool_call>` + "  save the detailed plan\n")
+		}
+		b.WriteString("\n")
+	}
 
-	b.WriteString("For executable checklist management, prefer incremental task tools:\n")
-	b.WriteString(`<tool_call>{"name":"task_list","input":{}}</tool_call>` + "  read current checklist\n")
-	b.WriteString(`<tool_call>{"name":"task_create","input":{"title":"Step 1: do X"}}</tool_call>` + "  add a task\n")
-	b.WriteString(`<tool_call>{"name":"task_update","input":{"id":"plan-1","status":"completed"}}</tool_call>` + "  mark progress\n")
-	b.WriteString("\nUse todo_write only when starting from scratch with the full checklist; it replaces the checklist and is rejected if called with an empty items array while tasks exist. items accepts strings (preferred) or {title, status?, notes?} objects.\n")
-	b.WriteString("When narrating progress in prose, ALWAYS use the exact IDs returned by task_list (e.g. plan-1, plan-2). Do NOT renumber tasks in your own narration — this confuses the user about which task you are working on.\n\n")
+	if allowedTool("task_list") || allowedTool("task_create") || allowedTool("task_update") {
+		b.WriteString("For executable checklist management, prefer incremental task tools:\n")
+		if allowedTool("task_list") {
+			b.WriteString(`<tool_call>{"name":"task_list","input":{}}</tool_call>` + "  read current checklist\n")
+		}
+		if allowedTool("task_create") {
+			b.WriteString(`<tool_call>{"name":"task_create","input":{"title":"Step 1: do X"}}</tool_call>` + "  add a task\n")
+		}
+		if allowedTool("task_update") {
+			b.WriteString(`<tool_call>{"name":"task_update","input":{"id":"plan-1","status":"completed"}}</tool_call>` + "  mark progress\n")
+		}
+		if allowedTool("todo_write") {
+			b.WriteString("\nUse todo_write only when starting from scratch with the full checklist; it replaces the checklist and is rejected if called with an empty items array while tasks exist. items accepts strings (preferred) or {title, status?, notes?} objects.\n")
+		}
+		b.WriteString("When narrating progress in prose, ALWAYS use the exact IDs returned by task_list (e.g. plan-1, plan-2). Do NOT renumber tasks in your own narration — this confuses the user about which task you are working on.\n\n")
+	}
 
 	b.WriteString("Allowed tools: " + strings.Join(allowedTools, ", ") + "\n")
 	if len(askTools) > 0 {

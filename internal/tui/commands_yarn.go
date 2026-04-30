@@ -177,6 +177,10 @@ func (m *model) yarnSettingsSet(key, value string) string {
 
 func (m model) yarnDryRun(prompt string) string {
 	snapshot := m.agentRuntime.Builder.BuildWithOptions(prompt, contextbuilder.BuildOptions{RecordYarn: false})
+	preview, err := m.agentRuntime.PreviewPrompt(prompt)
+	if err != nil {
+		return m.theme.ErrorStyle.Render("Prompt preview unavailable: " + err.Error())
+	}
 	rows := make([][]string, 0, len(snapshot.Items))
 	for _, item := range snapshot.Items {
 		source := item.Source
@@ -210,10 +214,32 @@ func (m model) yarnDryRun(prompt string) string {
 		m.options.Config.Context.ReserveOutputTokens,
 		warning,
 	)
-	if len(rows) == 0 {
-		return summary + "\n\n" + m.theme.Muted.Render("No context items selected.")
+	strategy := preview.ArtifactStrategy
+	if strategy == "" {
+		strategy = "none"
 	}
-	return summary + "\n\n" + m.theme.FormatTable([]string{"Kind", "Path", "Tokens", "Source", "Mode"}, rows)
+	summary += fmt.Sprintf("\nmode: %s\nnative tools: %t\nartifact strategy: %s", strings.ToUpper(m.agentRuntime.Mode), preview.SupportsTools, strategy)
+	if len(rows) == 0 {
+		return summary +
+			"\n\n" + m.theme.Muted.Render("No context items selected.") +
+			"\n\nSYSTEM PROMPT PREVIEW:\n" + truncatePreviewBlock(preview.System, 1400) +
+			"\n\nUSER PROMPT PREVIEW:\n" + truncatePreviewBlock(preview.User, 2200)
+	}
+	return summary +
+		"\n\n" + m.theme.FormatTable([]string{"Kind", "Path", "Tokens", "Source", "Mode"}, rows) +
+		"\n\nSYSTEM PROMPT PREVIEW:\n" + truncatePreviewBlock(preview.System, 1400) +
+		"\n\nUSER PROMPT PREVIEW:\n" + truncatePreviewBlock(preview.User, 2200)
+}
+
+func truncatePreviewBlock(text string, limit int) string {
+	text = strings.TrimSpace(text)
+	if limit <= 0 || len(text) <= limit {
+		return text
+	}
+	if limit <= 16 {
+		return text[:limit]
+	}
+	return text[:limit-16] + "\n[truncated...]"
 }
 
 func (m model) yarnGraph() string {
@@ -226,43 +252,14 @@ func (m model) yarnGraph() string {
 	if len(nodes) == 0 {
 		return t.Muted.Render("No YARN nodes.")
 	}
-	var b strings.Builder
-	b.WriteString(t.TableHeader.Render("YARN Graph") + "\n\n")
-	// Group by kind.
-	groups := map[string][]yarn.Node{}
-	var kinds []string
-	for _, node := range nodes {
-		if _, exists := groups[node.Kind]; !exists {
-			kinds = append(kinds, node.Kind)
-		}
-		groups[node.Kind] = append(groups[node.Kind], node)
+	path, err := writeYarnGraphHTML(m.options.CWD, nodes)
+	if err != nil {
+		return t.ErrorStyle.Render("YARN graph export failed: " + err.Error())
 	}
-	for _, kind := range kinds {
-		group := groups[kind]
-		b.WriteString(t.Accent.Render(kind) + "\n")
-		for i, node := range group {
-			prefix := "|-- "
-			if i == len(group)-1 {
-				prefix = "`-- "
-			}
-			label := node.ID
-			if node.Summary != "" {
-				label += " " + t.Muted.Render("("+truncate(node.Summary, 50)+")")
-			}
-			b.WriteString(t.TableRow.Render(prefix+label) + "\n")
-			for j, link := range node.Links {
-				linkPrefix := "|   |-> "
-				if i == len(group)-1 {
-					linkPrefix = "    |-> "
-				}
-				if j == len(node.Links)-1 {
-					linkPrefix = strings.Replace(linkPrefix, "|", "`", 1)
-				}
-				b.WriteString(t.Muted.Render(linkPrefix+link) + "\n")
-			}
-		}
+	if err := openYarnGraphPath(path); err != nil {
+		return t.Warning.Render("YARN graph generated, but browser open failed: "+err.Error()) + "\n" + path
 	}
-	return strings.TrimRight(b.String(), "\n")
+	return t.Success.Render("Opened YARN graph in browser.") + "\n" + path
 }
 
 func (m model) yarnInspect(id string) string {
@@ -329,8 +326,7 @@ func (m model) compactSession() string {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	resp, err := provider.Chat(ctx, llm.ChatRequest{
-		Model:       mdl,
-		Temperature: 0.1,
+		Model: mdl,
 		Messages: []llm.Message{
 			{Role: "system", Content: "Summarize this Forge coding-agent session for future context. Keep durable decisions, files discussed, commands, errors, and next steps. Be concise and factual."},
 			{Role: "user", Content: transcript},
@@ -370,7 +366,8 @@ func (m *model) yarnProbe() string {
 	if !ok {
 		return t.ErrorStyle.Render("Provider " + providerName + " not registered.")
 	}
-	modelID := m.options.Config.Models["chat"]
+	role := m.activeModelRole()
+	modelID := m.activeRoleModelID()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	info, err := provider.ProbeModel(ctx, modelID)
@@ -380,16 +377,20 @@ func (m *model) yarnProbe() string {
 	if info == nil || info.LoadedContextLength <= 0 {
 		return t.Warning.Render("Provider did not report loaded_context_length — profile caps in effect.")
 	}
-	m.options.Config.Context.Detected = &config.DetectedContext{
+	detected := &config.DetectedContext{
 		ModelID:             info.ID,
 		LoadedContextLength: info.LoadedContextLength,
 		MaxContextLength:    info.MaxContextLength,
 		ProbedAt:            time.Now().UTC(),
 	}
+	if role == "chat" {
+		m.options.Config.Context.Detected = detected
+	}
+	config.SetDetectedForRole(&m.options.Config, role, detected)
 	m.persistConfig()
 	m.syncRuntimeConfig()
-	_, budget, reserve := config.EffectiveBudgets(m.options.Config)
-	return t.Success.Render(fmt.Sprintf("Probed %s: loaded=%d max=%d", info.ID, info.LoadedContextLength, info.MaxContextLength)) +
+	_, budget, reserve := config.EffectiveBudgets(m.activeRoleConfig())
+	return t.Success.Render(fmt.Sprintf("Probed %s (%s): loaded=%d max=%d", info.ID, role, info.LoadedContextLength, info.MaxContextLength)) +
 		fmt.Sprintf("\nEffective YARN budget=%d reserve=%d", budget, reserve)
 }
 

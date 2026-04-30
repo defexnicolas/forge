@@ -4,11 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
 
+func requireGit(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+}
+
 func TestEditFileTool(t *testing.T) {
+	requireGit(t)
 	cwd := t.TempDir()
 	if err := os.WriteFile(filepath.Join(cwd, "file.txt"), []byte("hello world\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -47,6 +56,7 @@ func TestWriteFileToolRejectsExisting(t *testing.T) {
 }
 
 func TestWriteFileToolCreatesNewFile(t *testing.T) {
+	requireGit(t)
 	cwd := t.TempDir()
 	input, _ := json.Marshal(map[string]string{
 		"path":    "new.txt",
@@ -70,6 +80,7 @@ func TestWriteFileToolCreatesNewFile(t *testing.T) {
 }
 
 func TestApplyPatchTool(t *testing.T) {
+	requireGit(t)
 	cwd := t.TempDir()
 	if err := os.WriteFile(filepath.Join(cwd, "file.txt"), []byte("one\ntwo\n"), 0o644); err != nil {
 		t.Fatal(err)

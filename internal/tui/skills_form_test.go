@@ -162,6 +162,37 @@ func TestSkillsFormInstalledTabGlobalReadOnly(t *testing.T) {
 	}
 }
 
+func TestSkillsFormInstallsSkillsSHEntryViaCLI(t *testing.T) {
+	cwd := t.TempDir()
+	cli := fakeSkillsCLI(t, cwd)
+	manager := skills.NewManager(cwd, skills.Options{
+		CLI:          cli,
+		Repositories: []string{"owner/repo"},
+		Agent:        "codex",
+		InstallScope: "project",
+		Copy:         true,
+	})
+	form := skillsForm{
+		search:     textinput.New(),
+		allResults: []skills.Skill{{Name: "repo-skill", Repo: "owner/repo", Source: "skills.sh"}},
+		filtered:   []skills.Skill{{Name: "repo-skill", Repo: "owner/repo", Source: "skills.sh"}},
+		manager:    manager,
+		cwd:        cwd,
+		theme:      DefaultTheme(),
+	}
+
+	form, _ = form.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if form.errMsg != "" {
+		t.Fatalf("unexpected install error: %s", form.errMsg)
+	}
+	if form.installed != "repo-skill" {
+		t.Fatalf("expected installed skill, got %#v", form)
+	}
+	if _, err := os.Stat(filepath.Join(cwd, ".agents", "skills", "repo-skill", "SKILL.md")); err != nil {
+		t.Fatalf("expected installed SKILL.md, stat err=%v", err)
+	}
+}
+
 func TestSkillsFormFilterAppliesToActiveTab(t *testing.T) {
 	manager := skills.NewManager(t.TempDir(), skills.Options{})
 	search := textinput.New()
@@ -187,14 +218,35 @@ func fakeSkillsCLI(t *testing.T, dir string) string {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		path := filepath.Join(dir, "fake-skills.cmd")
-		script := "@echo off\r\nif \"%1\"==\"skills\" if \"%2\"==\"add\" if \"%4\"==\"--list\" echo - repo-skill - Repo listed skill\r\nexit /b 0\r\n"
+		script := "@echo off\r\n" +
+			"if \"%1\"==\"skills\" if \"%2\"==\"add\" if \"%4\"==\"--list\" echo - repo-skill - Repo listed skill\r\n" +
+			"if \"%1\"==\"skills\" if \"%2\"==\"add\" if \"%4\"==\"--skill\" (\r\n" +
+			"  mkdir .agents\\skills\\%5 2>nul\r\n" +
+			"  > .agents\\skills\\%5\\SKILL.md echo ---\r\n" +
+			"  >> .agents\\skills\\%5\\SKILL.md echo name: %5\r\n" +
+			"  >> .agents\\skills\\%5\\SKILL.md echo description: installed test skill\r\n" +
+			"  >> .agents\\skills\\%5\\SKILL.md echo ---\r\n" +
+			"  >> .agents\\skills\\%5\\SKILL.md echo Body.\r\n" +
+			")\r\n" +
+			"exit /b 0\r\n"
 		if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 			t.Fatal(err)
 		}
 		return path
 	}
 	path := filepath.Join(dir, "fake-skills")
-	script := "#!/bin/sh\nif [ \"$1\" = \"skills\" ] && [ \"$2\" = \"add\" ] && [ \"$4\" = \"--list\" ]; then\n  echo '- repo-skill - Repo listed skill'\n  exit 0\nfi\nexit 0\n"
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"skills\" ] && [ \"$2\" = \"add\" ] && [ \"$4\" = \"--list\" ]; then\n" +
+		"  echo '- repo-skill - Repo listed skill'\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [ \"$1\" = \"skills\" ] && [ \"$2\" = \"add\" ] && [ \"$4\" = \"--skill\" ]; then\n" +
+		"  mkdir -p ./.agents/skills/$5\n" +
+		"  cat <<'EOF' > ./.agents/skills/$5/SKILL.md\n" +
+		"---\nname: repo-skill\ndescription: installed test skill\n---\nBody.\nEOF\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 0\n"
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}

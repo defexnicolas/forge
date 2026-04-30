@@ -213,6 +213,62 @@ func TestPlanModeExecuteIntentBypassesPlanResetInterview(t *testing.T) {
 	}
 }
 
+func TestPlanModeFollowupRefinesExistingPlanWithoutResetPrompt(t *testing.T) {
+	provider := &tuiFakeProvider{responses: []string{"Refined the current plan."}}
+	m := newExplorerHandoffTestModel(t, provider)
+	if _, err := m.agentRuntime.Plans.Save(plans.Document{Summary: "existing plan"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.agentRuntime.Tasks.ReplacePlan([]string{"Implement the fix"}); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := m.handleLine("agrega tests y cambia la prioridad")
+	if m.activeForm == formConfirmPlanReset {
+		t.Fatal("follow-up refinement should not open the reset confirmation")
+	}
+	if !m.agentRunning {
+		t.Fatal("follow-up refinement should start a planner turn immediately")
+	}
+	finalModel := drainAgentEvents(t, m, cmd)
+
+	if len(provider.requests) == 0 {
+		t.Fatal("expected provider request")
+	}
+	userPrompt := provider.requests[0].Messages[1].Content
+	if !strings.Contains(userPrompt, "PLAN REFINEMENT REQUEST: agrega tests y cambia la prioridad") {
+		t.Fatalf("expected refinement prompt, got:\n%s", userPrompt)
+	}
+	if strings.Contains(userPrompt, "NEW PLAN GOAL:") {
+		t.Fatalf("refinement should not restart plan interview, got:\n%s", userPrompt)
+	}
+	if finalModel.activeForm == formConfirmPlanReset {
+		t.Fatal("refinement flow regressed back into the reset confirmation")
+	}
+}
+
+func TestPlanModeExplicitResetStillPromptsForConfirmation(t *testing.T) {
+	provider := &tuiFakeProvider{responses: []string{"unused"}}
+	m := newExplorerHandoffTestModel(t, provider)
+	if _, err := m.agentRuntime.Plans.Save(plans.Document{Summary: "existing plan"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.agentRuntime.Tasks.ReplacePlan([]string{"Implement the fix"}); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := m.handleLine("haz un plan nuevo desde cero")
+	if cmd != nil {
+		t.Fatal("explicit reset should pause on confirmation before running the agent")
+	}
+	if m.activeForm != formConfirmPlanReset {
+		t.Fatal("explicit reset should open the reset confirmation")
+	}
+	if m.agentRunning {
+		t.Fatal("agent should not start until the reset confirmation is resolved")
+	}
+}
+
 // Note: TestPlanModeCompletionOffersBuildExecutionDefaultNo and
 // TestPlanModeCompletionExecutesWhenUserPressesY were removed together with
 // the "build" mode. The planner now stays in plan mode and dispatches each

@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -153,11 +154,14 @@ func (r *Runtime) RunSubagent(ctx context.Context, request SubagentRequest) (too
 	if prompt == "" {
 		return tools.Result{}, fmt.Errorf("subagent prompt is required")
 	}
+	subCtx, cancel := withOptionalTimeout(ctx, r.subagentTimeout())
+	defer cancel()
 
 	providerName := r.Config.Providers.Default.Name
 	if providerName == "" {
 		providerName = "lmstudio"
 	}
+	baseURL := r.providerBaseURL(providerName)
 	provider, ok := r.Providers.Get(providerName)
 	if !ok {
 		return tools.Result{}, fmt.Errorf("provider %q is not registered", providerName)
@@ -172,8 +176,17 @@ func (r *Runtime) RunSubagent(ctx context.Context, request SubagentRequest) (too
 	if strategy != "parallel" {
 		effectiveRole = r.modelRoleForMode()
 	}
-	if err := r.EnsureRoleModelLoaded(ctx, provider, effectiveRole); err != nil {
-		return tools.Result{}, err
+	if err := r.EnsureRoleModelLoaded(subCtx, provider, effectiveRole); err != nil {
+		return tools.Result{}, &subagentRunError{
+			Agent:     worker.Name,
+			Kind:      classifyProviderFailure(err),
+			Phase:     "loading_model",
+			TimedOut:  llm.IsProviderTimeout(err),
+			Provider:  providerName,
+			BaseURL:   baseURL,
+			ModelRole: effectiveRole,
+			Cause:     err,
+		}
 	}
 	model := r.roleModel(effectiveRole)
 	if model == "" {
@@ -191,47 +204,233 @@ func (r *Runtime) RunSubagent(ctx context.Context, request SubagentRequest) (too
 
 	var trace []string
 	stepLimit := subagentStepLimit(worker)
+	lastPhase := "starting"
+	parseFailures := 0
+	emptyResponses := 0
+	consecutiveReadLoops := 0
 	for step := 0; step < stepLimit; step++ {
-		resp, err := provider.Chat(ctx, llm.ChatRequest{
-			Model:       model,
-			Messages:    messages,
-			Temperature: 0.1,
+		stepsUsed := step + 1
+		// Mirror the planner-loop compaction (runtime.go:1068) so prefill stays
+		// bounded as the Builder accumulates read_file results across steps.
+		compactOldToolResults(messages, 3)
+		reqCtx, reqCancel := withOptionalTimeout(subCtx, r.requestTimeout())
+		accumulated, toolCalls, err := r.streamSubagentResponse(reqCtx, provider, llm.ChatRequest{
+			Model:    model,
+			Messages: messages,
 		})
+		reqCancel()
 		if err != nil {
-			return tools.Result{}, err
+			return tools.Result{}, &subagentRunError{
+				Agent:     worker.Name,
+				Kind:      classifyProviderFailure(err),
+				Phase:     lastPhase,
+				StepsUsed: stepsUsed,
+				TimedOut:  llm.IsProviderTimeout(err),
+				Provider:  providerName,
+				BaseURL:   baseURL,
+				Model:     model,
+				ModelRole: effectiveRole,
+				Cause:     err,
+			}
 		}
-		parsed, err := ParseToolCall(resp.Content)
-		if err != nil {
+		if len(toolCalls) > 0 {
+			// Native tool-call path. Local providers like LM Studio with a
+			// function-calling model emit OpenAI-style tool_calls instead of
+			// the <tool_call>...</tool_call> text contract. Execute them
+			// through the same subagent gate as the text path so the Builder
+			// can make progress.
+			emptyResponses = 0
+			parseFailures = 0
+			messages = append(messages, llm.Message{
+				Role:      "assistant",
+				Content:   accumulated,
+				ToolCalls: toolCalls,
+			})
+			for _, tc := range toolCalls {
+				agentCall := FromNativeToolCall(tc)
+				if phase := builderPhaseForTool(agentCall.Name); phase != "" {
+					lastPhase = phase
+					if worker.Name == "builder" {
+						if phase == "reading" {
+							consecutiveReadLoops++
+							if consecutiveReadLoops >= r.maxBuilderReadLoops() {
+								return tools.Result{}, &subagentRunError{
+									Agent:     worker.Name,
+									Kind:      "no_progress",
+									Phase:     lastPhase,
+									StepsUsed: stepsUsed,
+									Provider:  providerName,
+									BaseURL:   baseURL,
+									Model:     model,
+									ModelRole: effectiveRole,
+									Cause:     fmt.Errorf("%d consecutive builder read loops", consecutiveReadLoops),
+								}
+							}
+						} else {
+							consecutiveReadLoops = 0
+						}
+					}
+				}
+				trace = append(trace, fmt.Sprintf("tool_call %s", agentCall.Name))
+				observation, err := r.executeSubagentTool(subCtx, worker, agentCall)
+				if err != nil {
+					observation = "Tool result for " + agentCall.Name + ": error: " + err.Error()
+				}
+				trace = append(trace, observation)
+				messages = append(messages, llm.Message{
+					Role:       "tool",
+					ToolCallID: tc.ID,
+					Content:    observation,
+				})
+			}
+			continue
+		}
+		if strings.TrimSpace(accumulated) == "" {
+			emptyResponses++
+			if emptyResponses >= r.maxEmptyResponses() {
+				return tools.Result{}, &subagentRunError{
+					Agent:     worker.Name,
+					Kind:      "no_progress",
+					Phase:     lastPhase,
+					StepsUsed: stepsUsed,
+					Provider:  providerName,
+					BaseURL:   baseURL,
+					Model:     model,
+					ModelRole: effectiveRole,
+					Cause:     fmt.Errorf("%d empty subagent responses", emptyResponses),
+				}
+			}
 			messages = append(messages,
-				llm.Message{Role: "assistant", Content: resp.Content},
+				llm.Message{Role: "assistant", Content: ""},
+				llm.Message{Role: "user", Content: "Your response was empty. Return a final JSON result or exactly one valid tool call."},
+			)
+			continue
+		}
+		emptyResponses = 0
+		parsed, err := ParseToolCall(accumulated)
+		if err != nil {
+			parseFailures++
+			if parseFailures >= r.maxNoProgressSteps() {
+				return tools.Result{}, &subagentRunError{
+					Agent:     worker.Name,
+					Kind:      "parse_failure",
+					Phase:     lastPhase,
+					StepsUsed: stepsUsed,
+					Provider:  providerName,
+					BaseURL:   baseURL,
+					Model:     model,
+					ModelRole: effectiveRole,
+					Cause:     err,
+				}
+			}
+			messages = append(messages,
+				llm.Message{Role: "assistant", Content: accumulated},
 				llm.Message{Role: "user", Content: "Tool call parse error: " + err.Error() + "\nReturn a final JSON result or a valid tool call."},
 			)
 			continue
 		}
+		parseFailures = 0
 		if !parsed.Found {
-			text := strings.TrimSpace(resp.Content)
+			text := strings.TrimSpace(accumulated)
 			return tools.Result{
 				Title:   "Subagent " + worker.Name,
 				Summary: oneLine(text, 240),
 				Content: []tools.ContentBlock{{Type: "text", Text: text}},
 			}, nil
 		}
+		if phase := builderPhaseForTool(parsed.Call.Name); phase != "" {
+			lastPhase = phase
+			if worker.Name == "builder" {
+				if phase == "reading" {
+					consecutiveReadLoops++
+					if consecutiveReadLoops >= r.maxBuilderReadLoops() {
+						return tools.Result{}, &subagentRunError{
+							Agent:     worker.Name,
+							Kind:      "no_progress",
+							Phase:     lastPhase,
+							StepsUsed: stepsUsed,
+							Provider:  providerName,
+							BaseURL:   baseURL,
+							Model:     model,
+							ModelRole: effectiveRole,
+							Cause:     fmt.Errorf("%d consecutive builder read loops", consecutiveReadLoops),
+						}
+					}
+				} else {
+					consecutiveReadLoops = 0
+				}
+			}
+		}
 		trace = append(trace, fmt.Sprintf("tool_call %s", parsed.Call.Name))
-		observation, err := r.executeSubagentTool(ctx, worker, parsed.Call)
+		observation, err := r.executeSubagentTool(subCtx, worker, parsed.Call)
 		if err != nil {
 			observation = "Tool result for " + parsed.Call.Name + ": error: " + err.Error()
 		}
 		trace = append(trace, observation)
 		messages = append(messages,
-			llm.Message{Role: "assistant", Content: resp.Content},
+			llm.Message{Role: "assistant", Content: accumulated},
 			llm.Message{Role: "user", Content: observation},
 		)
 	}
-	return tools.Result{
-		Title:   "Subagent " + worker.Name,
-		Summary: "subagent stopped after step limit",
-		Content: []tools.ContentBlock{{Type: "text", Text: strings.Join(trace, "\n\n")}},
-	}, nil
+	return tools.Result{}, &subagentRunError{
+		Agent:     worker.Name,
+		Kind:      "no_progress",
+		Phase:     lastPhase,
+		StepsUsed: stepLimit,
+		Provider:  providerName,
+		BaseURL:   baseURL,
+		Model:     model,
+		ModelRole: effectiveRole,
+		Cause:     fmt.Errorf("subagent stopped after step limit"),
+	}
+}
+
+func (r *Runtime) streamSubagentResponse(ctx context.Context, provider llm.Provider, req llm.ChatRequest) (string, []llm.ToolCall, error) {
+	stream, err := provider.Stream(ctx, req)
+	if err != nil {
+		if !errors.Is(err, llm.ErrNotSupported) {
+			return "", nil, err
+		}
+	}
+	if stream == nil {
+		resp, chatErr := provider.Chat(ctx, req)
+		if chatErr != nil {
+			return "", nil, chatErr
+		}
+		return resp.Content, resp.ToolCalls, nil
+	}
+
+	var text strings.Builder
+	var toolCalls []llm.ToolCall
+	for event := range stream {
+		switch event.Type {
+		case "text":
+			text.WriteString(event.Text)
+		case "tool_calls":
+			toolCalls = event.ToolCalls
+		case "error":
+			// If the stream errored AFTER a tool_call or parseable
+			// <tool_call> already arrived, treat the partial as success
+			// and let the step process it. Otherwise the Builder loses
+			// real progress every time LM Studio cuts the stream early.
+			if len(toolCalls) > 0 {
+				return text.String(), toolCalls, nil
+			}
+			if hasParseableToolCall(text.String()) {
+				return text.String(), nil, nil
+			}
+			return text.String(), toolCalls, event.Error
+		}
+	}
+	return text.String(), toolCalls, nil
+}
+
+func hasParseableToolCall(text string) bool {
+	if strings.TrimSpace(text) == "" {
+		return false
+	}
+	parsed, err := ParseToolCall(text)
+	return err == nil && parsed.Found
 }
 
 func (r *Runtime) RunSubagents(ctx context.Context, request SubagentBatchRequest) (tools.Result, error) {
@@ -257,7 +456,7 @@ func (r *Runtime) RunSubagents(ctx context.Context, request SubagentBatchRequest
 	batchID := fmt.Sprintf("batch-%p", &request)
 	total := len(request.Tasks)
 	events := r.currentEvents()
-	emit := func(idx int, agent, status, summary, errText string) {
+	emit := func(idx int, agent, status, phase string, stepsUsed int, timedOut bool, summary, errText string) {
 		if events == nil {
 			return
 		}
@@ -265,13 +464,16 @@ func (r *Runtime) RunSubagents(ctx context.Context, request SubagentBatchRequest
 		// a stalled consumer to deadlock the batch goroutines. On drop the
 		// lane view simply won't update — the final result is still captured.
 		prog := &SubagentProgress{
-			BatchID: batchID,
-			Index:   idx,
-			Total:   total,
-			Agent:   agent,
-			Status:  status,
-			Summary: summary,
-			Error:   errText,
+			BatchID:   batchID,
+			Index:     idx,
+			Total:     total,
+			Agent:     agent,
+			Status:    status,
+			Phase:     phase,
+			StepsUsed: stepsUsed,
+			TimedOut:  timedOut,
+			Summary:   summary,
+			Error:     errText,
 		}
 		select {
 		case events <- Event{Type: EventSubagentProgress, SubagentProgress: prog}:
@@ -286,7 +488,7 @@ func (r *Runtime) RunSubagents(ctx context.Context, request SubagentBatchRequest
 		if name == "" {
 			name = "explorer"
 		}
-		emit(i, name, "pending", "", "")
+		emit(i, name, "pending", "", 0, false, "", "")
 	}
 
 	items := make([]SubagentBatchItem, len(request.Tasks))
@@ -302,7 +504,7 @@ func (r *Runtime) RunSubagents(ctx context.Context, request SubagentBatchRequest
 				defer func() { <-sem }()
 			case <-ctx.Done():
 				items[i] = SubagentBatchItem{Index: i, Agent: strings.TrimSpace(task.Agent), Status: "error", Error: ctx.Err().Error()}
-				emit(i, strings.TrimSpace(task.Agent), "error", "", ctx.Err().Error())
+				emit(i, strings.TrimSpace(task.Agent), "error", "", 0, false, "", ctx.Err().Error())
 				return
 			}
 
@@ -313,19 +515,28 @@ func (r *Runtime) RunSubagents(ctx context.Context, request SubagentBatchRequest
 			worker, ok := r.Subagents.Get(agentName)
 			if !ok {
 				items[i] = SubagentBatchItem{Index: i, Agent: agentName, Status: "error", Error: "unknown subagent: " + agentName}
-				emit(i, agentName, "error", "", "unknown subagent: "+agentName)
+				emit(i, agentName, "error", "", 0, false, "", "unknown subagent: "+agentName)
 				return
 			}
 			if hasMutatingTools(worker.AllowedTools) {
 				items[i] = SubagentBatchItem{Index: i, Agent: agentName, Status: "error", Error: "parallel subagents do not allow mutating tools"}
-				emit(i, agentName, "error", "", "parallel subagents do not allow mutating tools")
+				emit(i, agentName, "error", "", 0, false, "", "parallel subagents do not allow mutating tools")
 				return
 			}
-			emit(i, agentName, "running", "", "")
+			emit(i, agentName, "running", "starting", 0, false, "", "")
 			result, err := r.RunSubagent(ctx, task)
 			if err != nil {
+				var runErr *subagentRunError
+				phase := ""
+				stepsUsed := 0
+				timedOut := false
+				if errors.As(err, &runErr) {
+					phase = runErr.Phase
+					stepsUsed = runErr.StepsUsed
+					timedOut = runErr.TimedOut
+				}
 				items[i] = SubagentBatchItem{Index: i, Agent: agentName, Status: "error", Error: err.Error()}
-				emit(i, agentName, "error", "", err.Error())
+				emit(i, agentName, "error", phase, stepsUsed, timedOut, "", err.Error())
 				return
 			}
 			items[i] = SubagentBatchItem{
@@ -335,7 +546,7 @@ func (r *Runtime) RunSubagents(ctx context.Context, request SubagentBatchRequest
 				Summary: result.Summary,
 				Result:  result,
 			}
-			emit(i, agentName, "completed", result.Summary, "")
+			emit(i, agentName, "completed", "completed", 0, false, result.Summary, "")
 		}()
 	}
 	wg.Wait()
@@ -469,6 +680,10 @@ func subagentSystemPrompt(worker Subagent, snapshot contextbuilder.Snapshot) str
 		rules.WriteString("You MAY read files, edit files, apply patches, run allowed verification commands, and update task state.\n")
 		rules.WriteString("Do not re-plan, do not rewrite the checklist, and do not call execute_task or spawn_subagent.\n")
 		rules.WriteString("Prefer this workflow: inspect task context -> read/search the minimal files -> apply the smallest viable edit -> verify if useful -> update the task if you changed its state -> return the final result.\n")
+		rules.WriteString("This task is one section of a larger plan. Aim to finish in <=3 tool calls.\n")
+		rules.WriteString("If the assigned section cannot be completed in <=3 tool calls, return findings='task_too_large' with a proposed sub-split and let the planner re-chunk. Do NOT try to deliver the whole feature in one task.\n")
+		rules.WriteString("For large new files under scaffold_then_patch, create only a minimal scaffold first. Then fill the file section-by-section with edit_file or apply_patch. Do not write the full file in one shot.\n")
+		rules.WriteString("File size limit: keep every produced file at or below ~600 lines. If the assigned task implies a single file >600 lines, stop, return findings='split_required' with a proposed multi-file split, and let the planner re-plan instead of writing one giant file. Exception: generated data, fixtures, or dense JSON/CSV may exceed the limit when the file's nature requires it — call that out in the result.\n")
 		rules.WriteString("Stop once the single task is completed or clearly blocked.\n")
 	} else if hasMutatingTools(worker.AllowedTools) {
 		rules.WriteString("You may edit files only when the assigned task requires it.\n")
@@ -495,7 +710,11 @@ Main context engine: ` + snapshot.ContextEngine)
 
 func subagentStepLimit(worker Subagent) int {
 	if worker.Name == "builder" {
-		return 12
+		// Tight budget on purpose: the planner is expected to chunk large
+		// work via normalizeChecklistItems, so each Builder run is one small
+		// section. If 6 steps are not enough, the right answer is to replan
+		// (return findings='task_too_large') rather than burn context here.
+		return 6
 	}
 	if hasMutatingTools(worker.AllowedTools) {
 		return 8
@@ -550,5 +769,37 @@ func renderSubagentContext(raw json.RawMessage) string {
 			}
 		}
 	}
+	var structured map[string]any
+	if err := json.Unmarshal(raw, &structured); err == nil && len(structured) > 0 {
+		return formatStructuredSubagentContext(structured)
+	}
 	return strings.TrimSpace(string(raw))
+}
+
+func formatStructuredSubagentContext(payload map[string]any) string {
+	var lines []string
+	if gitState, ok := payload["git_state"].(string); ok && strings.TrimSpace(gitState) != "" {
+		lines = append(lines, "Git state: "+strings.TrimSpace(gitState))
+	}
+	if task, ok := payload["task"]; ok {
+		if taskJSON, err := json.Marshal(task); err == nil {
+			lines = append(lines, "Task: "+string(taskJSON))
+		}
+	}
+	if files, ok := payload["relevant_files"]; ok {
+		if filesJSON, err := json.Marshal(files); err == nil {
+			lines = append(lines, "Relevant files: "+string(filesJSON))
+		}
+	}
+	for _, key := range []string{"target_file", "file_strategy", "section_goal"} {
+		if value, ok := payload[key]; ok {
+			if text := strings.TrimSpace(fmt.Sprintf("%v", value)); text != "" {
+				lines = append(lines, strings.ReplaceAll(key, "_", " ")+": "+text)
+			}
+		}
+	}
+	if len(lines) > 0 {
+		return strings.Join(lines, "\n")
+	}
+	return strings.TrimSpace(fmt.Sprintf("%v", payload))
 }

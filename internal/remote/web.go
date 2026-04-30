@@ -1,7 +1,7 @@
 package remote
 
-// indexHTML is a single-page client that streams session events over SSE and
-// POSTs prompts/commands back. No build step — vanilla JS, 0 dependencies.
+// indexHTML is a single-page client that hydrates the current visible TUI
+// history from /api/session, then follows the live SSE stream for updates.
 var indexHTML = []byte(`<!doctype html>
 <html lang="en">
 <head>
@@ -12,11 +12,13 @@ var indexHTML = []byte(`<!doctype html>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
   body { margin: 0; background: #0b0d10; color: #d4d7dc; font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
-  header { padding: 10px 14px; background: #12161b; border-bottom: 1px solid #1e242b; display: flex; gap: 10px; align-items: center; }
+  header { padding: 10px 14px; background: #12161b; border-bottom: 1px solid #1e242b; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
   header b { color: #7fb8ff; }
   header span.dot { width: 8px; height: 8px; border-radius: 50%; background: #555; display: inline-block; }
   header span.dot.on { background: #4ade80; }
-  #log { padding: 14px; white-space: pre-wrap; word-break: break-word; height: calc(100vh - 120px); overflow-y: auto; }
+  .meta { color: #8ea0b2; font-size: 12px; }
+  #log { padding: 14px; white-space: pre-wrap; word-break: break-word; height: calc(100vh - 150px); overflow-y: auto; }
+  .line { min-height: 1.2em; }
   .delta { color: #d4d7dc; }
   .tool { color: #ffb347; }
   .result { color: #8cd5ff; }
@@ -24,6 +26,7 @@ var indexHTML = []byte(`<!doctype html>
   .side { color: #888; }
   .user { color: #7fb8ff; margin-top: 10px; }
   .sep { color: #333; margin: 8px 0; }
+  .muted { color: #8ea0b2; }
   form { display: flex; gap: 8px; padding: 10px; background: #12161b; border-top: 1px solid #1e242b; position: sticky; bottom: 0; }
   input[type=text] { flex: 1; padding: 10px 12px; background: #0b0d10; border: 1px solid #1e242b; color: #d4d7dc; border-radius: 6px; font: inherit; }
   button { padding: 10px 16px; background: #1e4fa0; color: white; border: 0; border-radius: 6px; font: inherit; cursor: pointer; }
@@ -41,7 +44,12 @@ var indexHTML = []byte(`<!doctype html>
   var token = qs.get('t') || localStorage.getItem('forge_token') || '';
   if (token) localStorage.setItem('forge_token', token);
 
-  function h(tag, cls, text){ var e=document.createElement(tag); if(cls)e.className=cls; if(text!=null)e.textContent=text; return e; }
+  function h(tag, cls, text){
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
 
   if (!token) { renderAuth(); } else { renderApp(); }
 
@@ -67,81 +75,174 @@ var indexHTML = []byte(`<!doctype html>
   function renderApp(){
     var root = document.getElementById('root');
     root.innerHTML = '';
+
     var head = h('header');
     var dot = h('span','dot');
-    head.appendChild(dot);
-    head.appendChild(h('b', null, 'forge'));
-    head.appendChild(h('span', null, 'remote session'));
-    var clear = h('button', null, 'clear'); clear.style.marginLeft='auto';
+    var title = h('b', null, 'forge');
+    var name = h('span', null, 'remote session');
+    var meta = h('div', 'meta');
+    meta.id = 'sessionMeta';
+    var status = h('div', 'meta');
+    status.id = 'sessionStatus';
+    status.style.marginLeft = 'auto';
+    var clear = h('button', null, 'clear');
     clear.onclick = function(){ document.getElementById('log').innerHTML=''; };
-    head.appendChild(clear);
     var logout = h('button', null, 'logout');
     logout.onclick = function(){ localStorage.removeItem('forge_token'); location.search=''; };
+
+    head.appendChild(dot);
+    head.appendChild(title);
+    head.appendChild(name);
+    head.appendChild(meta);
+    head.appendChild(status);
+    head.appendChild(clear);
     head.appendChild(logout);
     root.appendChild(head);
+
     var log = h('div'); log.id='log'; root.appendChild(log);
     var form = document.createElement('form');
     var input = h('input'); input.type='text'; input.placeholder='Ask forge, or /command'; input.autofocus=true;
     var send = h('button', null, 'Send'); send.type='submit';
-    form.appendChild(input); form.appendChild(send);
+    form.appendChild(input);
+    form.appendChild(send);
     root.appendChild(form);
+
+    var currentDelta = null;
+    var syncPending = false;
+
+    function scrollToBottom() {
+      log.scrollTop = log.scrollHeight;
+    }
+
+    function appendLine(text, cls) {
+      var line = h('div', 'line' + (cls ? ' ' + cls : ''), text);
+      log.appendChild(line);
+      scrollToBottom();
+      return line;
+    }
+
+    function replaceHistory(lines) {
+      log.innerHTML = '';
+      (lines || []).forEach(function(line) {
+        appendLine(line, line === '--' ? 'sep' : '');
+      });
+    }
+
+    function scheduleSync() {
+      if (syncPending) return;
+      syncPending = true;
+      setTimeout(function() {
+        syncPending = false;
+        loadSession();
+      }, 40);
+    }
+
+    function loadSession() {
+      return fetch('/api/session?t=' + encodeURIComponent(token))
+        .then(function(r) {
+          if (r.status === 401) {
+            localStorage.removeItem('forge_token');
+            renderAuth();
+            throw new Error('unauthorized');
+          }
+          return r.json();
+        })
+        .then(function(payload) {
+          var session = payload.session || {};
+          var metaText = [];
+          if (session.cwd) metaText.push(session.cwd);
+          if (session.mode) metaText.push('mode=' + session.mode);
+          if (session.activeRole) metaText.push('role=' + session.activeRole);
+          if (session.model) metaText.push('model=' + session.model);
+          document.getElementById('sessionMeta').textContent = metaText.join(' | ');
+          document.getElementById('sessionStatus').textContent = session.status || '';
+          replaceHistory(session.history || []);
+          currentDelta = null;
+          if (session.streaming) {
+            currentDelta = appendLine('', 'delta');
+          }
+          return payload;
+        });
+    }
 
     form.onsubmit = function(e){
       e.preventDefault();
       var text = input.value.trim();
       if (!text) return;
-      appendUser(text);
+      appendLine('> ' + text, 'user');
       fetch('/api/input?t=' + encodeURIComponent(token), {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({type: text.charAt(0)=='/' ? 'command' : 'chat', text: text})
+        body: JSON.stringify({type: text.charAt(0) === '/' ? 'command' : 'chat', text: text})
       }).then(function(r){
-        if (r.status === 401) { localStorage.removeItem('forge_token'); renderAuth(); }
+        if (r.status === 401) {
+          localStorage.removeItem('forge_token');
+          renderAuth();
+          return;
+        }
+        if (!r.ok) {
+          appendLine('remote input failed: ' + r.status, 'error');
+        }
+      }).catch(function(err) {
+        appendLine('remote input failed: ' + err.message, 'error');
       });
       input.value = '';
     };
 
-    function appendUser(text){
-      var line = h('div','user','> '+text);
-      log.appendChild(line);
-      log.scrollTop = log.scrollHeight;
-    }
-
-    var currentDelta = null;
     function ingest(ev){
-      var cls = 'delta'; var text = ev.text || '';
-      if (ev.side) cls = 'side';
+      var text = ev.text || '';
       switch (ev.type) {
         case 'assistant_delta':
-          if (!currentDelta) { currentDelta = h('div', cls); log.appendChild(currentDelta); }
+          if (!currentDelta) currentDelta = appendLine('', ev.side ? 'side' : 'delta');
           currentDelta.textContent += text;
           break;
         case 'assistant_text':
           currentDelta = null;
-          if (text) log.appendChild(h('div', cls, text));
+          if (text) appendLine(text, ev.side ? 'side' : 'delta');
+          break;
+        case 'clear_streaming':
+          currentDelta = null;
+          scheduleSync();
           break;
         case 'tool_call':
           currentDelta = null;
-          log.appendChild(h('div','tool','* '+ev.tool_name));
+          appendLine('* ' + (ev.tool_name || 'tool'), 'tool');
           break;
         case 'tool_result':
-          log.appendChild(h('div','result','-> '+(ev.tool_name||'')+': '+(ev.summary||ev.text||'')));
+          appendLine('-> ' + (ev.tool_name || '') + ': ' + (ev.summary || ev.text || ''), 'result');
+          break;
+        case 'approval_required':
+          appendLine('? approval required: ' + (ev.summary || ev.text || ''), 'muted');
+          break;
+        case 'ask_user':
+          appendLine('? ' + (ev.summary || ev.text || ''), 'muted');
           break;
         case 'error':
-          log.appendChild(h('div','error', ev.error || 'error'));
+          currentDelta = null;
+          appendLine(ev.error || 'error', 'error');
+          scheduleSync();
           break;
         case 'done':
           currentDelta = null;
-          log.appendChild(h('div','sep','--'));
+          appendLine('--', 'sep');
+          scheduleSync();
+          break;
+        default:
+          if (ev.summary) appendLine(ev.summary, 'muted');
           break;
       }
-      log.scrollTop = log.scrollHeight;
     }
+
+    loadSession().catch(function(){});
 
     var es = new EventSource('/api/stream?t=' + encodeURIComponent(token));
     es.onopen = function(){ dot.classList.add('on'); };
     es.onerror = function(){ dot.classList.remove('on'); };
-    es.onmessage = function(m){ try { ingest(JSON.parse(m.data)); } catch(e){} };
+    es.onmessage = function(m){
+      try {
+        ingest(JSON.parse(m.data));
+      } catch (_) {}
+    };
   }
 })();
 </script>

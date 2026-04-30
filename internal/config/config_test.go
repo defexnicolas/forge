@@ -4,6 +4,9 @@ import "testing"
 
 func TestDefaultsUseRecommendedYarnProfile(t *testing.T) {
 	cfg := Defaults()
+	if !cfg.Providers.LMStudio.SupportsTools {
+		t.Fatal("providers.lmstudio.supports_tools should default to true")
+	}
 	if cfg.Models["explorer"] != "local-model" {
 		t.Fatalf("models.explorer = %q, want local-model", cfg.Models["explorer"])
 	}
@@ -40,6 +43,27 @@ func TestDefaultsUseRecommendedYarnProfile(t *testing.T) {
 		cfg.Context.Task.HistoryEvents != 4 {
 		t.Fatalf("unexpected task context defaults: %#v", cfg.Context.Task)
 	}
+	if cfg.Runtime.RequestTimeoutSeconds != 45 ||
+		cfg.Runtime.SubagentTimeoutSeconds != 90 ||
+		cfg.Runtime.TaskTimeoutSeconds != 180 ||
+		cfg.Runtime.MaxNoProgressSteps != 3 ||
+		cfg.Runtime.MaxEmptyResponses != 2 ||
+		cfg.Runtime.MaxSameToolFailures != 2 ||
+		cfg.Runtime.MaxConsecutiveReadOnly != 6 ||
+		cfg.Runtime.MaxPlannerSummarySteps != 2 ||
+		cfg.Runtime.MaxBuilderReadLoops != 4 ||
+		cfg.Runtime.RetryOnProviderTimeout {
+		t.Fatalf("unexpected runtime defaults: %#v", cfg.Runtime)
+	}
+	if !cfg.Git.AutoInit ||
+		!cfg.Git.CreateBaselineCommit ||
+		!cfg.Git.RequireCleanOrSnapshot ||
+		!cfg.Git.AutoStageMutations ||
+		cfg.Git.AutoCommit ||
+		cfg.Git.BaselineCommitMessage == "" ||
+		cfg.Git.SnapshotCommitMessage == "" {
+		t.Fatalf("unexpected git defaults: %#v", cfg.Git)
+	}
 }
 
 func TestNormalizeBackfillsMultiModelDefaults(t *testing.T) {
@@ -56,6 +80,12 @@ func TestNormalizeBackfillsMultiModelDefaults(t *testing.T) {
 	}
 	if cfg.Context.Task.BudgetTokens != 4000 || cfg.Context.Task.MaxNodes != 6 {
 		t.Fatalf("expected task context defaults, got %#v", cfg.Context.Task)
+	}
+	if cfg.Runtime.RequestTimeoutSeconds != 45 || cfg.Runtime.MaxBuilderReadLoops != 4 {
+		t.Fatalf("expected runtime defaults, got %#v", cfg.Runtime)
+	}
+	if cfg.Git.BaselineCommitMessage == "" || cfg.Git.SnapshotCommitMessage == "" {
+		t.Fatalf("expected git messages, got %#v", cfg.Git)
 	}
 	if cfg.Build.Subagents.Concurrency != 2 || len(cfg.Build.Subagents.Roles) == 0 {
 		t.Fatalf("expected build concurrency defaults, got %#v", cfg.Build.Subagents)

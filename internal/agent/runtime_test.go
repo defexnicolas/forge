@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,6 +13,13 @@ import (
 	"forge/internal/plans"
 	"forge/internal/tools"
 )
+
+func requireGit(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+}
 
 // fakeProvider simulates a text-based (non-tool-calling) provider.
 type fakeProvider struct {
@@ -59,8 +67,9 @@ func (f *fakeProvider) LoadModel(ctx context.Context, id string, cfg llm.LoadCon
 
 // fakeNativeProvider simulates a provider that supports native tool calling.
 type fakeNativeProvider struct {
-	steps []nativeStep
-	calls int
+	steps    []nativeStep
+	calls    int
+	requests []llm.ChatRequest
 }
 
 type nativeStep struct {
@@ -71,6 +80,7 @@ type nativeStep struct {
 func (f *fakeNativeProvider) Name() string        { return "fake" }
 func (f *fakeNativeProvider) SupportsTools() bool { return true }
 func (f *fakeNativeProvider) Chat(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
+	f.requests = append(f.requests, req)
 	if f.calls >= len(f.steps) {
 		return &llm.ChatResponse{Content: "done"}, nil
 	}
@@ -101,6 +111,98 @@ func (f *fakeNativeProvider) ProbeModel(ctx context.Context, id string) (*llm.Mo
 	return nil, nil
 }
 func (f *fakeNativeProvider) LoadModel(ctx context.Context, id string, cfg llm.LoadConfig) error {
+	return nil
+}
+
+type fakeNativeFallbackProvider struct {
+	requests []llm.ChatRequest
+}
+
+func (f *fakeNativeFallbackProvider) Name() string        { return "fake" }
+func (f *fakeNativeFallbackProvider) SupportsTools() bool { return true }
+func (f *fakeNativeFallbackProvider) Chat(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
+	f.requests = append(f.requests, req)
+	if len(req.Tools) > 0 {
+		return nil, os.ErrInvalid
+	}
+	return &llm.ChatResponse{Content: "fallback ok"}, nil
+}
+func (f *fakeNativeFallbackProvider) Stream(ctx context.Context, req llm.ChatRequest) (<-chan llm.ChatEvent, error) {
+	f.requests = append(f.requests, req)
+	if len(req.Tools) > 0 {
+		return nil, &fakeToolUnsupportedError{msg: "tools unsupported by current model"}
+	}
+	ch := make(chan llm.ChatEvent, 2)
+	ch <- llm.ChatEvent{Type: "text", Text: "fallback ok"}
+	ch <- llm.ChatEvent{Type: "done"}
+	close(ch)
+	return ch, nil
+}
+func (f *fakeNativeFallbackProvider) ListModels(ctx context.Context) ([]llm.ModelInfo, error) {
+	return nil, nil
+}
+func (f *fakeNativeFallbackProvider) ProbeModel(ctx context.Context, id string) (*llm.ModelInfo, error) {
+	return nil, nil
+}
+func (f *fakeNativeFallbackProvider) LoadModel(ctx context.Context, id string, cfg llm.LoadConfig) error {
+	return nil
+}
+
+type fakeToolUnsupportedError struct{ msg string }
+
+func (e *fakeToolUnsupportedError) Error() string { return e.msg }
+
+type scriptedTimeoutProvider struct {
+	steps    []scriptedTimeoutStep
+	requests []llm.ChatRequest
+	calls    int
+	name     string
+}
+
+type scriptedTimeoutStep struct {
+	content string
+	block   bool
+}
+
+func (p *scriptedTimeoutProvider) Name() string {
+	if p.name != "" {
+		return p.name
+	}
+	return "fake"
+}
+func (p *scriptedTimeoutProvider) Chat(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
+	p.requests = append(p.requests, req)
+	if p.calls >= len(p.steps) {
+		return &llm.ChatResponse{Content: "done"}, nil
+	}
+	step := p.steps[p.calls]
+	p.calls++
+	if step.block {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return &llm.ChatResponse{Content: step.content}, nil
+}
+func (p *scriptedTimeoutProvider) Stream(ctx context.Context, req llm.ChatRequest) (<-chan llm.ChatEvent, error) {
+	resp, err := p.Chat(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	ch := make(chan llm.ChatEvent, 2)
+	if resp.Content != "" {
+		ch <- llm.ChatEvent{Type: "text", Text: resp.Content}
+	}
+	ch <- llm.ChatEvent{Type: "done"}
+	close(ch)
+	return ch, nil
+}
+func (p *scriptedTimeoutProvider) ListModels(ctx context.Context) ([]llm.ModelInfo, error) {
+	return nil, nil
+}
+func (p *scriptedTimeoutProvider) ProbeModel(ctx context.Context, id string) (*llm.ModelInfo, error) {
+	return nil, nil
+}
+func (p *scriptedTimeoutProvider) LoadModel(ctx context.Context, id string, cfg llm.LoadConfig) error {
 	return nil
 }
 
@@ -140,7 +242,7 @@ func TestRuntimeReadsFileThenAnswers(t *testing.T) {
 	}
 }
 
-func TestPlanPromptIncludesActiveChecklistWithExecuteTaskGuidance(t *testing.T) {
+func TestPlanPromptIncludesActiveChecklistAndBuildHandoff(t *testing.T) {
 	cwd := t.TempDir()
 	cfg := config.Defaults()
 	cfg.Providers.Default.Name = "fake"
@@ -158,13 +260,50 @@ func TestPlanPromptIncludesActiveChecklistWithExecuteTaskGuidance(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	for range runtime.Run(context.Background(), "continue") {
+	// Use a neutral message so the plan->build auto-switch in run() does not
+	// fire — we want to verify the plan-mode prompt content here.
+	for range runtime.Run(context.Background(), "what tasks remain?") {
 	}
 	prompt := provider.requests[0].Messages[1].Content
 	if !strings.Contains(prompt, "Plan document exists: active portal plan") ||
 		!strings.Contains(prompt, "Active checklist: 1 pending, 0 in progress, 0 done") ||
-		!strings.Contains(prompt, "execute_task") {
-		t.Fatalf("expected active checklist guidance with execute_task, got:\n%s", prompt)
+		!strings.Contains(prompt, "/mode build") {
+		t.Fatalf("expected active checklist guidance pointing at build mode, got:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "execute_task") {
+		t.Fatalf("plan-mode prompt should not mention execute_task anymore, got:\n%s", prompt)
+	}
+}
+
+func TestPlanModeAutoSwitchesToBuildOnExecuteIntent(t *testing.T) {
+	cwd := t.TempDir()
+	cfg := config.Defaults()
+	cfg.Providers.Default.Name = "fake"
+	registry := tools.NewRegistry()
+	tools.RegisterBuiltins(registry)
+	provider := &fakeProvider{responses: []string{"done"}}
+	providers := llm.NewRegistry()
+	providers.Register(provider)
+
+	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+	if _, err := runtime.Plans.Save(plans.Document{Summary: "approved plan"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Tasks.ReplacePlan([]string{"Apply the patch"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var sawSwitch bool
+	for event := range runtime.Run(context.Background(), "execute the plan") {
+		if event.Type == EventAssistantText && strings.Contains(event.Text, "Auto-switched to build mode") {
+			sawSwitch = true
+		}
+	}
+	if !sawSwitch {
+		t.Fatal("expected auto-switch to build mode when execution intent fires on an approved plan")
+	}
+	if runtime.Mode != "build" {
+		t.Fatalf("expected mode to be build after auto-switch, got %s", runtime.Mode)
 	}
 }
 
@@ -179,7 +318,11 @@ func TestPlanPromptIncludesExistingPlanForRefinement(t *testing.T) {
 	providers.Register(provider)
 
 	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
-	if _, err := runtime.Plans.Save(plans.Document{Summary: "refactor plan"}); err != nil {
+	if _, err := runtime.Plans.Save(plans.Document{
+		Summary:    "refactor plan",
+		Approach:   "Update the rendering flow and keep the checklist incremental.",
+		Validation: []string{"go test ./...", "manual smoke test"},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := runtime.Tasks.ReplacePlan([]string{"Move code"}); err != nil {
@@ -189,12 +332,15 @@ func TestPlanPromptIncludesExistingPlanForRefinement(t *testing.T) {
 	}
 	prompt := provider.requests[0].Messages[1].Content
 	if !strings.Contains(prompt, "Plan document exists: refactor plan") ||
-		!strings.Contains(prompt, "Active checklist: 1 pending, 0 in progress, 0 done") {
+		!strings.Contains(prompt, "Active checklist: 1 pending, 0 in progress, 0 done") ||
+		!strings.Contains(prompt, "Plan digest:") ||
+		!strings.Contains(prompt, "approach=Update the rendering flow and keep the checklist incremental.") ||
+		!strings.Contains(prompt, "tasks=pending:Move code") {
 		t.Fatalf("expected existing plan in plan prompt, got:\n%s", prompt)
 	}
 }
 
-func TestPlanPromptExecutionIntentAvoidsReplanning(t *testing.T) {
+func TestPlanPromptExecutionIntentWithoutTasksStaysInPlan(t *testing.T) {
 	cwd := t.TempDir()
 	cfg := config.Defaults()
 	cfg.Providers.Default.Name = "fake"
@@ -208,15 +354,12 @@ func TestPlanPromptExecutionIntentAvoidsReplanning(t *testing.T) {
 	if _, err := runtime.Plans.Save(plans.Document{Summary: "approved execution plan"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runtime.Tasks.ReplacePlan([]string{"Apply the patch"}); err != nil {
-		t.Fatal(err)
-	}
+	// No active tasks — auto-switch should NOT fire even with execute intent.
 
 	for range runtime.Run(context.Background(), "execute the approved plan") {
 	}
-	prompt := provider.requests[0].Messages[1].Content
-	if !strings.Contains(prompt, "Execution intent detected. Do NOT call plan_write or todo_write") {
-		t.Fatalf("expected execution-intent anti-replan guidance, got:\n%s", prompt)
+	if runtime.Mode != "plan" {
+		t.Fatalf("expected to stay in plan mode without active tasks, got %s", runtime.Mode)
 	}
 }
 
@@ -415,12 +558,12 @@ func TestPlanModeNativeTodoWriteEmitsLocalSummary(t *testing.T) {
 	}
 	var sawSummary bool
 	for event := range runtime.Run(context.Background(), "plan snake refactor") {
-		if event.Type == EventAssistantText && strings.Contains(event.Text, "Plan created and saved") {
+		if event.Type == EventAssistantText && strings.Contains(event.Text, "Plan saved") && strings.Contains(event.Text, "/mode build") {
 			sawSummary = true
 		}
 	}
 	if !sawSummary {
-		t.Fatal("expected native todo_write to emit local summary")
+		t.Fatal("expected native todo_write to emit plan-saved summary with build-mode handoff")
 	}
 }
 
@@ -567,6 +710,37 @@ func TestRuntimeUsesRoleModelsWhenModelMultiEnabled(t *testing.T) {
 	}
 }
 
+func TestRuntimeUsesEditorModelInBuildModeWhenModelMultiEnabled(t *testing.T) {
+	cwd := t.TempDir()
+	cfg := config.Defaults()
+	cfg.Providers.Default.Name = "fake"
+	cfg.ModelLoading.Enabled = true
+	cfg.ModelLoading.Strategy = "single"
+	cfg.Models["chat"] = "chat-model"
+	cfg.Models["planner"] = "plan-model"
+	cfg.Models["editor"] = "build-model"
+	config.SetDetectedForRole(&cfg, "editor", &config.DetectedContext{ModelID: "build-model", LoadedContextLength: 48000})
+
+	registry := tools.NewRegistry()
+	tools.RegisterBuiltins(registry)
+	provider := &fakeProvider{responses: []string{"built"}}
+	providers := llm.NewRegistry()
+	providers.Register(provider)
+	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+	if err := runtime.SetMode("build"); err != nil {
+		t.Fatal(err)
+	}
+
+	for range runtime.Run(context.Background(), "work the checklist") {
+	}
+	if len(provider.requests) == 0 || provider.requests[0].Model != "build-model" {
+		t.Fatalf("build request model = %#v, want build-model", provider.requests)
+	}
+	if len(provider.loads) == 0 || provider.loads[0] != "build-model" {
+		t.Fatalf("build load = %#v, want build-model first", provider.loads)
+	}
+}
+
 func TestRuntimeUsesChatForMainModesUntilModelMultiEnabled(t *testing.T) {
 	cwd := t.TempDir()
 	cfg := config.Defaults()
@@ -704,6 +878,7 @@ func TestReloadCurrentModelAppliesParallelSlots(t *testing.T) {
 }
 
 func TestRuntimeApprovesEditThenAnswers(t *testing.T) {
+	requireGit(t)
 	cwd := t.TempDir()
 	if err := os.WriteFile(filepath.Join(cwd, "file.txt"), []byte("hello world\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -750,7 +925,100 @@ func TestRuntimeApprovesEditThenAnswers(t *testing.T) {
 	}
 }
 
+func TestRuntimeApprovalBootstrapsGitRepo(t *testing.T) {
+	requireGit(t)
+	cwd := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cwd, "file.txt"), []byte("hello world\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Defaults()
+	cfg.Providers.Default.Name = "fake"
+	registry := tools.NewRegistry()
+	tools.RegisterBuiltins(registry)
+	providers := llm.NewRegistry()
+	providers.Register(&fakeProvider{responses: []string{
+		`<tool_call>{"name":"edit_file","input":{"path":"file.txt","old_text":"world","new_text":"forge"}}</tool_call>`,
+		`Edited the file.`,
+	}})
+
+	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+	runtime.Policy = NewSprintPolicy()
+	if !runtime.GitSessionState().AutoInitialized {
+		t.Fatalf("expected runtime to auto-initialize git state at session start, got %#v", runtime.GitSessionState())
+	}
+	var approvalDiff string
+	for event := range runtime.Run(context.Background(), "edit a file") {
+		if event.Type == EventApproval {
+			approvalDiff = event.Approval.Diff
+			event.Approval.Response <- ApprovalResponse{Approved: true}
+		}
+	}
+	if strings.Contains(approvalDiff, "initialize a git repository") {
+		t.Fatalf("bootstrap should be surfaced before approval now, got approval diff:\n%s", approvalDiff)
+	}
+	if _, err := os.Stat(filepath.Join(cwd, ".git")); err != nil {
+		t.Fatalf("expected .git directory after approved edit: %v", err)
+	}
+}
+
+func TestRuntimeApprovalSnapshotsDirtyTree(t *testing.T) {
+	requireGit(t)
+	cwd := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cwd, "file.txt"), []byte("hello world\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Defaults()
+	cfg.Providers.Default.Name = "fake"
+	registry := tools.NewRegistry()
+	tools.RegisterBuiltins(registry)
+	providers := llm.NewRegistry()
+	providers.Register(&fakeProvider{responses: []string{
+		`<tool_call>{"name":"edit_file","input":{"path":"file.txt","old_text":"world","new_text":"forge"}}</tool_call>`,
+		`Edited the file.`,
+	}})
+
+	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+	runtime.Policy = NewSprintPolicy()
+	if _, err := exec.Command("git", "-C", cwd, "init").CombinedOutput(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exec.Command("git", "-C", cwd, "config", "--local", "user.name", "Tester").CombinedOutput(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exec.Command("git", "-C", cwd, "config", "--local", "user.email", "tester@example.com").CombinedOutput(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exec.Command("git", "-C", cwd, "add", "-A").CombinedOutput(); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", cwd, "commit", "--allow-empty", "-m", "baseline").CombinedOutput(); err != nil {
+		t.Fatalf("baseline commit failed: %v\n%s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "other.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var approvalDiff string
+	for event := range runtime.Run(context.Background(), "edit a file") {
+		if event.Type == EventApproval {
+			approvalDiff = event.Approval.Diff
+			event.Approval.Response <- ApprovalResponse{Approved: true}
+		}
+	}
+	if !strings.Contains(approvalDiff, "snapshot commit") {
+		t.Fatalf("expected dirty-tree snapshot note in approval diff, got:\n%s", approvalDiff)
+	}
+	out, err := exec.Command("git", "-C", cwd, "log", "--oneline", "-2").CombinedOutput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), cfg.Git.SnapshotCommitMessage) {
+		t.Fatalf("expected snapshot commit in recent history, got:\n%s", out)
+	}
+}
+
 func TestRuntimeRejectsEditThenAnswers(t *testing.T) {
+	requireGit(t)
 	cwd := t.TempDir()
 	if err := os.WriteFile(filepath.Join(cwd, "file.txt"), []byte("hello world\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -939,6 +1207,37 @@ func TestRuntimeNativeToolCallStreamingDeltas(t *testing.T) {
 	}
 }
 
+func TestRuntimeFallsBackWhenNativeToolsUnsupported(t *testing.T) {
+	cwd := t.TempDir()
+	cfg := config.Defaults()
+	cfg.Providers.Default.Name = "fake"
+	registry := tools.NewRegistry()
+	tools.RegisterBuiltins(registry)
+	providers := llm.NewRegistry()
+	provider := &fakeNativeFallbackProvider{}
+	providers.Register(provider)
+
+	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+	var sawFinalText bool
+	for event := range runtime.Run(context.Background(), "hello") {
+		if (event.Type == EventAssistantText || event.Type == EventAssistantDelta) && strings.Contains(event.Text, "fallback ok") {
+			sawFinalText = true
+		}
+	}
+	if !sawFinalText {
+		t.Fatal("expected fallback text answer after tool-calling rejection")
+	}
+	if len(provider.requests) < 2 {
+		t.Fatalf("expected retry without tools, got %d request(s)", len(provider.requests))
+	}
+	if len(provider.requests[0].Tools) == 0 {
+		t.Fatal("expected first request to include native tools")
+	}
+	if len(provider.requests[len(provider.requests)-1].Tools) != 0 {
+		t.Fatal("expected final retry to omit tools")
+	}
+}
+
 func TestRuntimeEmitsModelProgressDuringStreaming(t *testing.T) {
 	cwd := t.TempDir()
 	cfg := config.Defaults()
@@ -955,7 +1254,7 @@ func TestRuntimeEmitsModelProgressDuringStreaming(t *testing.T) {
 		if event.Type != EventModelProgress || event.Progress == nil {
 			continue
 		}
-		if event.Progress.Phase == "waiting" {
+		if event.Progress.Phase == "waiting_on_provider" {
 			sawWaiting = true
 		}
 		if event.Progress.OutputTokens > 0 && event.Progress.TotalTokens >= event.Progress.InputTokens {

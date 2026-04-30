@@ -84,5 +84,14 @@ func toWire(ev agent.Event) EventWire {
 	if ev.Result != nil {
 		w.Summary = ev.Result.Summary
 	}
+	if ev.AskUser != nil && w.Summary == "" {
+		w.Summary = ev.AskUser.Question
+	}
+	if ev.Approval != nil && w.Summary == "" {
+		w.Summary = ev.Approval.Summary
+	}
+	if ev.SubagentProgress != nil && w.Summary == "" {
+		w.Summary = ev.SubagentProgress.Agent + " " + ev.SubagentProgress.Status
+	}
 	return w
 }

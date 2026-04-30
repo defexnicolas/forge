@@ -125,7 +125,7 @@ func extractTextFromHTML(raw string) string {
 type webSearchTool struct{}
 
 func (webSearchTool) Name() string        { return "web_search" }
-func (webSearchTool) Description() string { return "Search the web and return results." }
+func (webSearchTool) Description() string { return "Search the web (beta) and return parsed results." }
 func (webSearchTool) Schema() json.RawMessage {
 	return json.RawMessage(`{"type":"object","required":["query"],"properties":{"query":{"type":"string","description":"The search query."},"max_results":{"type":"integer","description":"Max results to return (default 5)."}}}`)
 }
@@ -196,6 +196,9 @@ type searchResult struct {
 }
 
 func parseDDGResults(body string, maxResults int) []searchResult {
+	if strings.TrimSpace(body) == "" || maxResults <= 0 {
+		return nil
+	}
 	doc, err := html.Parse(strings.NewReader(body))
 	if err != nil {
 		return nil
@@ -263,7 +266,7 @@ func findSnippet(n *html.Node) string {
 	walk = func(node *html.Node) string {
 		if node.Type == html.ElementNode {
 			class := getAttr(node, "class")
-			if strings.Contains(class, "result__snippet") {
+			if strings.Contains(class, "result__snippet") || strings.Contains(class, "result-snippet") {
 				return strings.TrimSpace(textContent(node))
 			}
 		}

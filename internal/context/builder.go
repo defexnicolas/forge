@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"forge/internal/config"
+	"forge/internal/gitops"
 	"forge/internal/lsp"
 	"forge/internal/projectstate"
 	"forge/internal/skills"
@@ -28,6 +29,7 @@ type Builder struct {
 	Skills       *skills.Manager
 	LSP          lsp.Client
 	ProjectState *projectstate.Service
+	GitState     *gitops.SessionState
 }
 
 type HistorySource interface {
@@ -52,6 +54,7 @@ type Snapshot struct {
 	Items             []Item
 	TokensUsed        int
 	TokensBudget      int
+	GitState          *gitops.SessionState
 }
 
 type BuildOptions struct {
@@ -74,6 +77,7 @@ func (b *Builder) BuildWithOptions(userMessage string, opts BuildOptions) Snapsh
 		Model:             model,
 		ContextEngine:     b.Config.Context.Engine,
 		ReadOnlyToolNames: ReadOnlyToolNames(),
+		GitState:          b.GitState,
 	}
 
 	// Inject cached project snapshot if available. Persisted across sessions
@@ -432,6 +436,9 @@ func (s Snapshot) renderHeader() string {
 		fmt.Fprintf(&b, "Tokens: 0/%d\n", s.TokensBudget)
 	}
 	fmt.Fprintf(&b, "Read-only tools: %s\n", strings.Join(s.ReadOnlyToolNames, ", "))
+	if s.GitState != nil {
+		fmt.Fprintf(&b, "%s\n", s.GitState.PromptFact())
+	}
 	return b.String()
 }
 

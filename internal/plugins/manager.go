@@ -155,19 +155,48 @@ func (p Plugin) HooksPath() string {
 	return ""
 }
 
-func looksLikePlugin(path string) bool {
-	candidates := []string{
-		"skills",
-		"commands",
-		"agents",
-		"hooks",
-		"output-styles",
-		"bin",
-		".mcp.json",
-		".lsp.json",
-		"settings.json",
-		".forge/plugin.toml",
+func (p Plugin) Components() []string {
+	var out []string
+	for _, candidate := range []string{"skills", "commands", "agents", "hooks", ".mcp.json", "bin", "output-styles", ".lsp.json", "settings.json"} {
+		if _, err := os.Stat(filepath.Join(p.Path, candidate)); err == nil {
+			out = append(out, candidate)
+		}
 	}
+	return out
+}
+
+func (p Plugin) SupportedComponents() []string {
+	var out []string
+	for _, candidate := range []string{"commands", "agents", "hooks", ".mcp.json"} {
+		if _, err := os.Stat(filepath.Join(p.Path, candidate)); err == nil {
+			out = append(out, candidate)
+		}
+	}
+	return out
+}
+
+func (p Plugin) PendingComponents() []string {
+	var out []string
+	for _, candidate := range []string{"skills", "bin", "output-styles", ".lsp.json", "settings.json"} {
+		if _, err := os.Stat(filepath.Join(p.Path, candidate)); err == nil {
+			out = append(out, candidate)
+		}
+	}
+	return out
+}
+
+func (p Plugin) CompatibilityStatus() string {
+	if len(p.PendingComponents()) > 0 {
+		return "partial"
+	}
+	if len(p.SupportedComponents()) > 0 {
+		return "partial"
+	}
+	return "discovered"
+}
+
+func looksLikePlugin(path string) bool {
+	candidates := []string{"skills", "commands", "agents", "hooks", "output-styles", "bin", ".mcp.json", ".lsp.json", "settings.json", ".forge/plugin.toml"}
 	for _, candidate := range candidates {
 		if _, err := os.Stat(filepath.Join(path, candidate)); err == nil {
 			return true

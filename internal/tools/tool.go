@@ -160,10 +160,7 @@ func (r *Registry) ToolDefs(names []string) []llm.ToolDef {
 
 	defs := make([]llm.ToolDef, 0, len(selected))
 	for _, t := range selected {
-		schema := t.Schema()
-		if len(schema) == 0 || string(schema) == "null" {
-			schema = json.RawMessage(`{"type":"object","properties":{}}`)
-		}
+		schema := normalizeToolSchema(t.Schema())
 		defs = append(defs, llm.ToolDef{
 			Type: "function",
 			Function: llm.FunctionDef{
@@ -174,4 +171,24 @@ func (r *Registry) ToolDefs(names []string) []llm.ToolDef {
 		})
 	}
 	return defs
+}
+
+func normalizeToolSchema(schema json.RawMessage) json.RawMessage {
+	if len(schema) == 0 || string(schema) == "null" {
+		return json.RawMessage(`{"type":"object","properties":{}}`)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(schema, &payload); err != nil {
+		return schema
+	}
+	if kind, _ := payload["type"].(string); kind == "object" {
+		if _, ok := payload["properties"]; !ok {
+			payload["properties"] = map[string]any{}
+		}
+		out, err := json.Marshal(payload)
+		if err == nil {
+			return json.RawMessage(out)
+		}
+	}
+	return schema
 }
