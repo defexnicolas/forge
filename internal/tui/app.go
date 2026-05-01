@@ -1029,10 +1029,18 @@ func (m *model) handleCommand(line string) string {
 	case "/plugins":
 		return m.describePlugins()
 	case "/mcp":
-		if m.options.MCP != nil {
-			return m.options.MCP.Describe()
+		if m.options.MCP == nil {
+			return "MCP not loaded."
 		}
-		return "MCP not loaded."
+		if len(fields) > 1 {
+			switch fields[1] {
+			case "resources":
+				return m.describeMCPResources()
+			case "prompts":
+				return m.describeMCPPrompts()
+			}
+		}
+		return m.options.MCP.Describe()
 	case "/hooks":
 		if m.options.Hooks != nil {
 			return m.options.Hooks.Describe()

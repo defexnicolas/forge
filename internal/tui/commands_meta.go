@@ -37,7 +37,7 @@ var tuiCommands = []commandDescriptor{
 	},
 	{Name: "/skills", Usage: "/skills [repo|refresh [repo]|cache]", Description: "browse, cache, and install skills"},
 	{Name: "/tools", Usage: "/tools", Description: "list registered tools"},
-	{Name: "/mcp", Usage: "/mcp", Description: "show MCP servers and tools"},
+	{Name: "/mcp", Usage: "/mcp [resources|prompts]", Description: "show MCP servers, tools, resources, or prompts", Subcommands: []string{"resources", "prompts"}},
 	{Name: "/plugins", Usage: "/plugins", Description: "list discovered plugins"},
 	{Name: "/hooks", Usage: "/hooks", Description: "list loaded hooks"},
 	{Name: "/log", Usage: "/log", Description: "show live plain-text log path"},
