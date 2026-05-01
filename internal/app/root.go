@@ -5,15 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"time"
 
 	"forge/internal/config"
 	"forge/internal/llm"
 	"forge/internal/session"
 	"forge/internal/tui"
-
-	"github.com/pelletier/go-toml/v2"
 	"github.com/spf13/cobra"
 )
 
@@ -104,10 +101,10 @@ func probeActiveContext(cwd string, cfg *config.Config, providers *llm.Registry)
 		MaxContextLength:    info.MaxContextLength,
 		ProbedAt:            time.Now().UTC(),
 	}
-	// Persist so restarts skip the probe and /yarn inspect can show it.
-	if data, err := toml.Marshal(cfg); err == nil {
-		_ = os.WriteFile(filepath.Join(cwd, ".forge", "config.toml"), data, 0o644)
-	}
+	config.SetDetectedForRole(cfg, "chat", cfg.Context.Detected)
+	// Persist only the probe result as a workspace-local override. Avoid
+	// materializing inherited Hub defaults into .forge/config.toml.
+	_ = config.PersistWorkspaceConfig(cwd, *cfg)
 }
 
 func openSession(cwd, resume string) (*session.Store, error) {

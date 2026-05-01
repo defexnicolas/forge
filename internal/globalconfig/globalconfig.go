@@ -19,18 +19,21 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/pelletier/go-toml/v2"
 )
 
 // GlobalConfig is the on-disk shape of ~/.codex/forge/global.toml.
 type GlobalConfig struct {
-	Theme     *string                  `toml:"theme,omitempty"`
-	Providers map[string]ProviderEntry `toml:"providers,omitempty"`
-	Models    map[string]string        `toml:"models,omitempty"`
-	Yarn      *YarnDefaults            `toml:"yarn,omitempty"`
-	Skills    *SkillsDefaults          `toml:"skills,omitempty"`
-	Plugins   *PluginsDefaults         `toml:"plugins,omitempty"`
+	Theme          *string                  `toml:"theme,omitempty"`
+	Providers      map[string]ProviderEntry `toml:"providers,omitempty"`
+	Models         map[string]string        `toml:"models,omitempty"`
+	DetectedByRole map[string]DetectedModel `toml:"detected_by_role,omitempty"`
+	ModelLoading   *ModelLoadingDefaults    `toml:"model_loading,omitempty"`
+	Yarn           *YarnDefaults            `toml:"yarn,omitempty"`
+	Skills         *SkillsDefaults          `toml:"skills,omitempty"`
+	Plugins        *PluginsDefaults         `toml:"plugins,omitempty"`
 }
 
 // ProviderEntry mirrors config.ProviderConfig but every field is a pointer
@@ -46,13 +49,32 @@ type ProviderEntry struct {
 // YarnDefaults captures the YARN context defaults the user wants every
 // workspace to inherit.
 type YarnDefaults struct {
-	Profile        *string `toml:"profile,omitempty"`
-	BudgetTokens   *int    `toml:"budget_tokens,omitempty"`
-	MaxNodes       *int    `toml:"max_nodes,omitempty"`
-	MaxFileBytes   *int    `toml:"max_file_bytes,omitempty"`
-	HistoryEvents  *int    `toml:"history_events,omitempty"`
-	RenderMode     *string `toml:"render_mode,omitempty"`
-	RenderHeadLine *int    `toml:"render_head_lines,omitempty"`
+	Profile                *string `toml:"profile,omitempty"`
+	BudgetTokens           *int    `toml:"budget_tokens,omitempty"`
+	ModelContextTokens     *int    `toml:"model_context_tokens,omitempty"`
+	ReserveOutputTokens    *int    `toml:"reserve_output_tokens,omitempty"`
+	MaxNodes               *int    `toml:"max_nodes,omitempty"`
+	MaxFileBytes           *int    `toml:"max_file_bytes,omitempty"`
+	HistoryEvents          *int    `toml:"history_events,omitempty"`
+	Pins                   *string `toml:"pins,omitempty"`
+	Mentions               *string `toml:"mentions,omitempty"`
+	CompactEvents          *int    `toml:"compact_events,omitempty"`
+	CompactTranscriptChars *int    `toml:"compact_transcript_chars,omitempty"`
+	RenderMode             *string `toml:"render_mode,omitempty"`
+	RenderHeadLine         *int    `toml:"render_head_lines,omitempty"`
+}
+
+type ModelLoadingDefaults struct {
+	Enabled       *bool   `toml:"enabled,omitempty"`
+	Strategy      *string `toml:"strategy,omitempty"`
+	ParallelSlots *int    `toml:"parallel_slots,omitempty"`
+}
+
+type DetectedModel struct {
+	ModelID             string    `toml:"model_id"`
+	LoadedContextLength int       `toml:"loaded_context_length"`
+	MaxContextLength    int       `toml:"max_context_length"`
+	ProbedAt            time.Time `toml:"probed_at"`
 }
 
 // SkillsDefaults captures cross-workspace skills config: install scope,

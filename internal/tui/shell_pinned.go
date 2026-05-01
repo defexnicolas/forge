@@ -43,12 +43,22 @@ func (m *shellModel) openPinnedWorkspace() {
 // Currently a status message until the next commit fills it in.
 
 // togglePinForActiveSelection pins or unpins the workspace currently
-// selected in Recent or Pinned. From Pinned: toggle current pinned entry.
-// From Recent: toggle the recent entry. Anywhere else: no-op (the user
-// pressed P somewhere it doesn't apply).
+// selected in Explorer / Recent / Pinned.
+// From Explorer: pin the selected directory, or the current explorer dir.
+// From Pinned: toggle current pinned entry.
+// From Recent: toggle the recent entry.
+// Anywhere else: no-op.
 func (m *shellModel) togglePinForActiveSelection() {
 	var target string
 	switch m.activeView {
+	case viewExplorer:
+		target = m.explorerDir
+		if m.explorerIndex >= 0 && m.explorerIndex < len(m.explorerEntries) {
+			entry := m.explorerEntries[m.explorerIndex]
+			if entry.IsDir {
+				target = entry.Path
+			}
+		}
 	case viewPinned:
 		if m.pinnedIndex < 0 || m.pinnedIndex >= len(m.hubState.Pinned) {
 			return

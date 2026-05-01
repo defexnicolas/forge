@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"forge/internal/config"
 	"forge/internal/globalconfig"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -27,7 +28,13 @@ func (m *shellModel) handleHubFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd, bool)
 			result := "Provider config canceled."
 			if !m.providerForm.canceled {
 				if cfg, ok := m.loadHubSettingsConfig(); ok {
-					result = stripAnsi(m.providerForm.Apply(&cfg, hubSettingsProviders(cfg)))
+					result = stripAnsi(m.providerForm.ApplyInMemory(&cfg, hubSettingsProviders(cfg)))
+					config.InheritChatModelDefaults(&cfg)
+					if err := saveHubGlobalConfig(cfg); err != nil {
+						result = "Global save failed: " + err.Error()
+					} else {
+						m.applyHubChatConfig(cfg)
+					}
 				}
 			}
 			m.statusMessage = result
@@ -41,7 +48,13 @@ func (m *shellModel) handleHubFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd, bool)
 			result := "Model selection canceled."
 			if !m.modelForm.canceled {
 				if cfg, ok := m.loadHubSettingsConfig(); ok {
-					result = stripAnsi(m.modelForm.Apply(&cfg))
+					result = stripAnsi(m.modelForm.ApplyRoleInMemory(&cfg, "chat"))
+					config.InheritChatModelDefaults(&cfg)
+					if err := saveHubGlobalConfig(cfg); err != nil {
+						result = "Global save failed: " + err.Error()
+					} else {
+						m.applyHubChatConfig(cfg)
+					}
 				}
 			}
 			m.statusMessage = result
@@ -52,7 +65,15 @@ func (m *shellModel) handleHubFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd, bool)
 		var cmd tea.Cmd
 		m.modelMultiForm, cmd = m.modelMultiForm.Update(msg)
 		if m.modelMultiForm.done {
-			m.statusMessage = stripAnsi(m.modelMultiForm.Result())
+			result := stripAnsi(m.modelMultiForm.Result())
+			if !m.modelMultiForm.canceled && m.modelMultiForm.errMsg == "" {
+				if err := saveHubGlobalConfig(m.modelMultiForm.cfg); err != nil {
+					result = "Global save failed: " + err.Error()
+				} else {
+					m.applyHubChatConfig(m.modelMultiForm.cfg)
+				}
+			}
+			m.statusMessage = result
 			m.activeHubForm = hubFormNone
 		}
 		return *m, cmd, true
@@ -63,7 +84,12 @@ func (m *shellModel) handleHubFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd, bool)
 			result := "YARN settings canceled."
 			if !m.yarnSettingsForm.canceled {
 				if cfg, ok := m.loadHubSettingsConfig(); ok {
-					result = stripAnsi(m.yarnSettingsForm.Apply(&cfg))
+					result = stripAnsi(m.yarnSettingsForm.ApplyInMemory(&cfg))
+					if err := saveHubGlobalConfig(cfg); err != nil {
+						result = "Global save failed: " + err.Error()
+					} else {
+						m.applyHubChatConfig(cfg)
+					}
 				}
 			}
 			m.statusMessage = result
@@ -87,6 +113,10 @@ func (m *shellModel) handleHubFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd, bool)
 				if m.workspace != nil {
 					m.workspace.theme = m.theme
 					m.workspace.refresh()
+				}
+				if m.hubChat != nil {
+					m.hubChat.theme = m.theme
+					m.hubChat.refresh()
 				}
 			}
 			m.statusMessage = result

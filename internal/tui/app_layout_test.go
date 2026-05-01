@@ -57,6 +57,25 @@ func TestAppLayoutFitsTerminalHeight(t *testing.T) {
 				return m
 			},
 		},
+		{
+			name: "ask user modal",
+			setup: func(t *testing.T, m model) model {
+				m.activeForm = formAskUser
+				m.askUserForm = newAskUserForm(&agent.AskUserRequest{
+					Question: "Which direction should the plan take?",
+					Options:  []string{"Small patch", "Broader refactor", "Investigate first"},
+				}, m.theme, m.width, m.height)
+				return m
+			},
+		},
+		{
+			name: "plan reset confirm",
+			setup: func(t *testing.T, m model) model {
+				m.activeForm = formConfirmPlanReset
+				m.confirmPlanReset = newConfirmFormWithDefault("A prior plan exists. Clear it and start fresh?", m.theme, false)
+				return m
+			},
+		},
 	}
 
 	for _, tt := range tests {

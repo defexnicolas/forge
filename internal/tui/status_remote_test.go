@@ -34,6 +34,27 @@ func TestStatusLineUsesActiveRoleDetectedContext(t *testing.T) {
 	}
 }
 
+func TestStatusLineUsesActiveRoleModelWhenIdle(t *testing.T) {
+	m := newSizedLayoutModel(t, 96, 24)
+	m.options.Config = config.Defaults()
+	m.agentRuntime.Config = m.options.Config
+	m.options.Config.ModelLoading.Enabled = true
+	m.options.Config.Models["chat"] = "chat-model"
+	m.options.Config.Models["planner"] = "hub-plan-model"
+	m.agentRuntime.Config = m.options.Config
+	if err := m.agentRuntime.SetMode("plan"); err != nil {
+		t.Fatal(err)
+	}
+
+	got := stripAnsi(m.statusLineView())
+	if !strings.Contains(got, "hub-plan-model") {
+		t.Fatalf("status line missing planner model:\n%s", got)
+	}
+	if strings.Contains(got, "chat-model") {
+		t.Fatalf("status line should prefer planner model over chat model:\n%s", got)
+	}
+}
+
 func TestRemoteSessionSnapshotIncludesVisibleStreamingState(t *testing.T) {
 	m := newSizedLayoutModel(t, 96, 24)
 	m.history = append(m.history, "    previous line")

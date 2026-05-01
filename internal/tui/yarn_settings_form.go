@@ -2,8 +2,6 @@ package tui
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -12,7 +10,6 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/pelletier/go-toml/v2"
 )
 
 const (
@@ -142,6 +139,14 @@ func (f yarnSettingsForm) View() string {
 }
 
 func (f yarnSettingsForm) Apply(cfg *config.Config) string {
+	return f.apply(cfg, true)
+}
+
+func (f yarnSettingsForm) ApplyInMemory(cfg *config.Config) string {
+	return f.apply(cfg, false)
+}
+
+func (f yarnSettingsForm) apply(cfg *config.Config, persist bool) string {
 	if f.canceled {
 		return "YARN settings canceled."
 	}
@@ -157,18 +162,14 @@ func (f yarnSettingsForm) Apply(cfg *config.Config) string {
 	cfg.Context.Yarn.CompactEvents = parsePositive(f.fields[yarnFieldCompactEvents].Value(), cfg.Context.Yarn.CompactEvents)
 	cfg.Context.Yarn.CompactTranscriptChars = parsePositive(f.fields[yarnFieldCompactTranscript].Value(), cfg.Context.Yarn.CompactTranscriptChars)
 	config.Normalize(cfg)
-	f.persistConfig(*cfg)
+	if persist {
+		f.persistConfig(*cfg)
+	}
 	return f.theme.Success.Render("YARN settings saved.") + yarnOverflowWarning(*cfg, f.theme)
 }
 
 func (f yarnSettingsForm) persistConfig(cfg config.Config) {
-	dir := filepath.Join(f.cwd, ".forge")
-	_ = os.MkdirAll(dir, 0o755)
-	data, err := toml.Marshal(cfg)
-	if err != nil {
-		return
-	}
-	_ = os.WriteFile(filepath.Join(dir, "config.toml"), data, 0o644)
+	_ = config.PersistWorkspaceConfig(f.cwd, cfg)
 }
 
 func parsePositive(value string, fallback int) int {

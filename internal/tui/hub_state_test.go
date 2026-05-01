@@ -99,17 +99,36 @@ func TestTogglePinForRecentSelection(t *testing.T) {
 	}
 }
 
-func TestTogglePinNoOpOutsideRecentOrPinned(t *testing.T) {
+func TestTogglePinNoOpOutsideSupportedViews(t *testing.T) {
 	state := HubState{}
 	m := &shellModel{
 		hubState:   state,
 		options:    ShellOptions{StateStore: &memoryHubStateStore{}},
 		mode:       modeHub,
-		activeView: viewExplorer,
+		activeView: viewSessions,
 	}
 	m.togglePinForActiveSelection()
 	if len(m.hubState.Pinned) != 0 {
-		t.Errorf("toggle in Explorer view should be no-op, got %v", m.hubState.Pinned)
+		t.Errorf("toggle in unsupported view should be no-op, got %v", m.hubState.Pinned)
+	}
+}
+
+func TestTogglePinPinsExplorerDirectorySelection(t *testing.T) {
+	state := HubState{}
+	store := &memoryHubStateStore{state: state}
+	m := &shellModel{
+		hubState:  state,
+		options:   ShellOptions{StateStore: store},
+		mode:      modeHub,
+		activeView: viewExplorer,
+		explorerDir: "/projects",
+		explorerEntries: []explorerEntry{
+			{Name: "repo", Path: "/projects/repo", IsDir: true},
+		},
+	}
+	m.togglePinForActiveSelection()
+	if !m.hubState.IsPinned("/projects/repo") {
+		t.Errorf("expected explorer dir pinned, got %v", m.hubState.Pinned)
 	}
 }
 

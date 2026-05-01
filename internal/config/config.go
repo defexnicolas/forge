@@ -243,6 +243,17 @@ func LoadWithGlobal(cwd string) (Config, error) {
 	return cfg, nil
 }
 
+// ApplyGlobalConfig overlays a GlobalConfig onto cfg exactly like
+// LoadWithGlobal would do for a workspace that has not written any keys yet.
+// Used by the Hub to edit a global-defaults-backed view of Config.
+func ApplyGlobalConfig(cfg *Config, g globalconfig.GlobalConfig) {
+	if cfg == nil {
+		return
+	}
+	applyGlobalDefaults(cfg, g, map[string]bool{})
+	Normalize(cfg)
+}
+
 // loadWorkspaceKeys returns the set of dotted TOML keys actually present in
 // the workspace's .forge/config.toml. Used by LoadWithGlobal so we can tell
 // "user explicitly wrote this" from "user didn't mention this section". A
@@ -295,6 +306,43 @@ func applyGlobalDefaults(cfg *Config, g globalconfig.GlobalConfig, keys map[stri
 			}
 		}
 	}
+	if len(g.DetectedByRole) > 0 {
+		if cfg.Context.DetectedByRole == nil {
+			cfg.Context.DetectedByRole = map[string]DetectedContext{}
+		}
+		for role, detected := range g.DetectedByRole {
+			key := "context.detected_by_role." + role
+			if keys[key] || detected.LoadedContextLength <= 0 {
+				continue
+			}
+			cfg.Context.DetectedByRole[role] = DetectedContext{
+				ModelID:             detected.ModelID,
+				LoadedContextLength: detected.LoadedContextLength,
+				MaxContextLength:    detected.MaxContextLength,
+				ProbedAt:            detected.ProbedAt,
+			}
+			if role == "chat" && !keys["context.detected"] {
+				copyDetected := cfg.Context.DetectedByRole[role]
+				cfg.Context.Detected = &copyDetected
+			}
+		}
+	}
+	if g.ModelLoading != nil {
+		// Fresh scaffolded workspaces currently materialize the built-in
+		// model_loading defaults into .forge/config.toml. Treat those untouched
+		// built-in values as inheritable so Hub global model-multi settings can
+		// still flow into newly opened workspaces.
+		defaults := Defaults()
+		if g.ModelLoading.Enabled != nil && (!keys["model_loading.enabled"] || cfg.ModelLoading.Enabled == defaults.ModelLoading.Enabled) {
+			cfg.ModelLoading.Enabled = *g.ModelLoading.Enabled
+		}
+		if g.ModelLoading.Strategy != nil && (!keys["model_loading.strategy"] || cfg.ModelLoading.Strategy == defaults.ModelLoading.Strategy) {
+			cfg.ModelLoading.Strategy = *g.ModelLoading.Strategy
+		}
+		if g.ModelLoading.ParallelSlots != nil && (!keys["model_loading.parallel_slots"] || cfg.ModelLoading.ParallelSlots == defaults.ModelLoading.ParallelSlots) {
+			cfg.ModelLoading.ParallelSlots = *g.ModelLoading.ParallelSlots
+		}
+	}
 	if g.Yarn != nil {
 		applyYarnDefaults(&cfg.Context, g.Yarn, keys)
 	}
@@ -317,6 +365,12 @@ func applyYarnDefaults(ctx *ContextConfig, g *globalconfig.YarnDefaults, keys ma
 	if g.BudgetTokens != nil && !keys["context.budget_tokens"] {
 		ctx.BudgetTokens = *g.BudgetTokens
 	}
+	if g.ModelContextTokens != nil && !keys["context.model_context_tokens"] {
+		ctx.ModelContextTokens = *g.ModelContextTokens
+	}
+	if g.ReserveOutputTokens != nil && !keys["context.reserve_output_tokens"] {
+		ctx.ReserveOutputTokens = *g.ReserveOutputTokens
+	}
 	if g.MaxNodes != nil && !keys["context.yarn.max_nodes"] {
 		ctx.Yarn.MaxNodes = *g.MaxNodes
 	}
@@ -325,6 +379,18 @@ func applyYarnDefaults(ctx *ContextConfig, g *globalconfig.YarnDefaults, keys ma
 	}
 	if g.HistoryEvents != nil && !keys["context.yarn.history_events"] {
 		ctx.Yarn.HistoryEvents = *g.HistoryEvents
+	}
+	if g.Pins != nil && !keys["context.yarn.pins"] {
+		ctx.Yarn.Pins = *g.Pins
+	}
+	if g.Mentions != nil && !keys["context.yarn.mentions"] {
+		ctx.Yarn.Mentions = *g.Mentions
+	}
+	if g.CompactEvents != nil && !keys["context.yarn.compact_events"] {
+		ctx.Yarn.CompactEvents = *g.CompactEvents
+	}
+	if g.CompactTranscriptChars != nil && !keys["context.yarn.compact_transcript_chars"] {
+		ctx.Yarn.CompactTranscriptChars = *g.CompactTranscriptChars
 	}
 	if g.RenderMode != nil && !keys["context.yarn.render_mode"] {
 		ctx.Yarn.RenderMode = *g.RenderMode
@@ -655,6 +721,39 @@ func Normalize(cfg *Config) {
 	}
 	if len(cfg.Plan.Subagents.Roles) == 0 {
 		cfg.Plan.Subagents.Roles = append([]string(nil), defaults.Plan.Subagents.Roles...)
+	}
+}
+
+// InheritChatModelDefaults applies a pragmatic fallback for role-based model
+// loading: if chat has been configured explicitly but per-role models are
+// still blank or at their untouched defaults, treat them as inheriting chat.
+// This keeps a freshly configured workspace usable without forcing the user to
+// walk through /model-multi before the first message. Explicit role models
+// still win and are never overwritten.
+func InheritChatModelDefaults(cfg *Config) {
+	if cfg == nil || cfg.Models == nil {
+		return
+	}
+	chatModel := strings.TrimSpace(cfg.Models["chat"])
+	if chatModel == "" {
+		return
+	}
+	defaults := Defaults()
+	roles := []string{"explorer", "planner", "editor", "reviewer", "summarizer"}
+	chatDetected := cfg.Context.Detected
+	for _, role := range roles {
+		roleModel := strings.TrimSpace(cfg.Models[role])
+		if roleModel != "" && roleModel != defaults.Models[role] {
+			continue
+		}
+		cfg.Models[role] = chatModel
+		if DetectedForRole(*cfg, role, chatModel) == nil && chatDetected != nil && chatDetected.LoadedContextLength > 0 {
+			copyDetected := *chatDetected
+			if strings.TrimSpace(copyDetected.ModelID) == "" {
+				copyDetected.ModelID = chatModel
+			}
+			SetDetectedForRole(cfg, role, &copyDetected)
+		}
 	}
 }
 

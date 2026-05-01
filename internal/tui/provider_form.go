@@ -1,13 +1,8 @@
 package tui
 
 import (
-	"os"
-	"path/filepath"
-
 	"forge/internal/config"
 	"forge/internal/llm"
-
-	"github.com/pelletier/go-toml/v2"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -132,6 +127,14 @@ func (f providerForm) View() string {
 
 // Apply writes the form values back to config and rebuilds the provider.
 func (f providerForm) Apply(cfg *config.Config, providers *llm.Registry) string {
+	return f.apply(cfg, providers, true)
+}
+
+func (f providerForm) ApplyInMemory(cfg *config.Config, providers *llm.Registry) string {
+	return f.apply(cfg, providers, false)
+}
+
+func (f providerForm) apply(cfg *config.Config, providers *llm.Registry, persist bool) string {
 	if f.canceled {
 		return "Provider config canceled."
 	}
@@ -143,28 +146,28 @@ func (f providerForm) Apply(cfg *config.Config, providers *llm.Registry) string 
 	if providerName == "" || providerName == "lmstudio" {
 		cfg.Providers.LMStudio.BaseURL = url
 		cfg.Providers.LMStudio.APIKey = key
+		cfg.Providers.LMStudio.DefaultModel = model
 		providers.Register(llm.NewOpenAICompatible("lmstudio", cfg.Providers.LMStudio))
 	} else {
 		cfg.Providers.OpenAICompatible.BaseURL = url
 		cfg.Providers.OpenAICompatible.APIKey = key
+		cfg.Providers.OpenAICompatible.DefaultModel = model
 		providers.Register(llm.NewOpenAICompatible("openai_compatible", cfg.Providers.OpenAICompatible))
 	}
 	if model != "" {
+		if cfg.Models == nil {
+			cfg.Models = map[string]string{}
+		}
 		cfg.Models["chat"] = model
 	}
 
-	// Persist to .forge/config.toml
-	f.persistConfig(*cfg)
+	if persist {
+		f.persistConfig(*cfg)
+	}
 
 	return f.theme.Success.Render("Provider updated: " + url + " model=" + model)
 }
 
 func (f providerForm) persistConfig(cfg config.Config) {
-	dir := filepath.Join(f.cwd, ".forge")
-	_ = os.MkdirAll(dir, 0o755)
-	data, err := toml.Marshal(cfg)
-	if err != nil {
-		return
-	}
-	_ = os.WriteFile(filepath.Join(dir, "config.toml"), data, 0o644)
+	_ = config.PersistWorkspaceConfig(f.cwd, cfg)
 }

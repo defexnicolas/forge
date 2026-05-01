@@ -4,14 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"time"
 
 	"forge/internal/config"
 	"forge/internal/llm"
-
-	"github.com/pelletier/go-toml/v2"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -457,11 +453,5 @@ func (f modelForm) applyRole(cfg *config.Config, role string, persist bool) stri
 }
 
 func (f modelForm) persistConfig(cfg config.Config) {
-	dir := filepath.Join(f.cwd, ".forge")
-	_ = os.MkdirAll(dir, 0o755)
-	data, err := toml.Marshal(cfg)
-	if err != nil {
-		return
-	}
-	_ = os.WriteFile(filepath.Join(dir, "config.toml"), data, 0o644)
+	_ = config.PersistWorkspaceConfig(f.cwd, cfg)
 }

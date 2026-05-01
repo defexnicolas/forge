@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"forge/internal/globalconfig"
@@ -313,4 +314,152 @@ base_url = "https://workspace.example/v1"
 	}
 }
 
+func TestLoadWithGlobalAppliesModelLoadingAndDetectedDefaults(t *testing.T) {
+	t.Setenv("FORGE_GLOBAL_HOME", t.TempDir())
+	cwd := t.TempDir()
+	writeGlobal(t, globalconfig.GlobalConfig{
+		Models: map[string]string{
+			"chat":    "hub-chat",
+			"planner": "hub-planner",
+		},
+		ModelLoading: &globalconfig.ModelLoadingDefaults{
+			Enabled:       boolPtr(true),
+			Strategy:      stringPtr("single"),
+			ParallelSlots: intPtr(4),
+		},
+		DetectedByRole: map[string]globalconfig.DetectedModel{
+			"planner": {
+				ModelID:             "hub-planner",
+				LoadedContextLength: 64000,
+			},
+		},
+		Yarn: &globalconfig.YarnDefaults{
+			ModelContextTokens:  intPtr(64000),
+			ReserveOutputTokens: intPtr(4000),
+		},
+	})
 
+	cfg, err := LoadWithGlobal(cwd)
+	if err != nil {
+		t.Fatalf("LoadWithGlobal: %v", err)
+	}
+	if cfg.Models["planner"] != "hub-planner" {
+		t.Fatalf("planner model = %q, want hub-planner", cfg.Models["planner"])
+	}
+	if !cfg.ModelLoading.Enabled || cfg.ModelLoading.Strategy != "single" || cfg.ModelLoading.ParallelSlots != 4 {
+		t.Fatalf("unexpected model_loading: %#v", cfg.ModelLoading)
+	}
+	if detected := DetectedForRole(cfg, "planner", "hub-planner"); detected == nil || detected.LoadedContextLength != 64000 {
+		t.Fatalf("planner detected = %#v, want loaded context 64000", detected)
+	}
+	if cfg.Context.ModelContextTokens != 64000 || cfg.Context.ReserveOutputTokens != 4000 {
+		t.Fatalf("unexpected context defaults: model=%d reserve=%d", cfg.Context.ModelContextTokens, cfg.Context.ReserveOutputTokens)
+	}
+}
+
+func TestLoadWithGlobalOverridesScaffoldModelLoadingDefaults(t *testing.T) {
+	t.Setenv("FORGE_GLOBAL_HOME", t.TempDir())
+	cwd := t.TempDir()
+	writeWorkspaceConfig(t, cwd, `
+[model_loading]
+enabled = false
+strategy = "single"
+parallel_slots = 2
+`)
+	writeGlobal(t, globalconfig.GlobalConfig{
+		ModelLoading: &globalconfig.ModelLoadingDefaults{
+			Enabled:       boolPtr(true),
+			Strategy:      stringPtr("parallel"),
+			ParallelSlots: intPtr(4),
+		},
+	})
+
+	cfg, err := LoadWithGlobal(cwd)
+	if err != nil {
+		t.Fatalf("LoadWithGlobal: %v", err)
+	}
+	if !cfg.ModelLoading.Enabled || cfg.ModelLoading.Strategy != "parallel" || cfg.ModelLoading.ParallelSlots != 4 {
+		t.Fatalf("expected global model_loading to override scaffold defaults, got %#v", cfg.ModelLoading)
+	}
+}
+
+func TestPersistWorkspaceConfigDoesNotMaterializeHubDefaults(t *testing.T) {
+	t.Setenv("FORGE_GLOBAL_HOME", t.TempDir())
+	cwd := t.TempDir()
+	writeGlobal(t, globalconfig.GlobalConfig{
+		Models: map[string]string{
+			"chat": "hub-chat",
+		},
+		ModelLoading: &globalconfig.ModelLoadingDefaults{
+			Enabled:       boolPtr(true),
+			Strategy:      stringPtr("single"),
+			ParallelSlots: intPtr(4),
+		},
+		Yarn: &globalconfig.YarnDefaults{
+			Profile:            stringPtr("26B"),
+			ModelContextTokens: intPtr(131072),
+		},
+	})
+
+	cfg, err := LoadWithGlobal(cwd)
+	if err != nil {
+		t.Fatalf("LoadWithGlobal: %v", err)
+	}
+	InheritChatModelDefaults(&cfg)
+	cfg.Context.Detected = &DetectedContext{
+		ModelID:             "hub-chat",
+		LoadedContextLength: 131072,
+	}
+	SetDetectedForRole(&cfg, "chat", cfg.Context.Detected)
+	if err := PersistWorkspaceConfig(cwd, cfg); err != nil {
+		t.Fatalf("PersistWorkspaceConfig: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(cwd, ".forge", "config.toml"))
+	if err != nil {
+		t.Fatalf("read persisted workspace config: %v", err)
+	}
+	text := string(data)
+	if strings.Contains(text, "models.chat") || strings.Contains(text, "parallel_slots") || strings.Contains(text, "profile = \"26B\"") {
+		t.Fatalf("workspace config materialized hub defaults:\n%s", text)
+	}
+	if !strings.Contains(text, "loaded_context_length = 131072") {
+		t.Fatalf("expected detected context to persist, got:\n%s", text)
+	}
+}
+
+func TestPersistWorkspaceConfigWritesOnlyLocalOverrides(t *testing.T) {
+	t.Setenv("FORGE_GLOBAL_HOME", t.TempDir())
+	cwd := t.TempDir()
+	writeGlobal(t, globalconfig.GlobalConfig{
+		Models: map[string]string{
+			"chat": "hub-chat",
+		},
+	})
+
+	cfg, err := LoadWithGlobal(cwd)
+	if err != nil {
+		t.Fatalf("LoadWithGlobal: %v", err)
+	}
+	InheritChatModelDefaults(&cfg)
+	cfg.Models["chat"] = "workspace-chat"
+	if err := PersistWorkspaceConfig(cwd, cfg); err != nil {
+		t.Fatalf("PersistWorkspaceConfig: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(cwd, ".forge", "config.toml"))
+	if err != nil {
+		t.Fatalf("read persisted workspace config: %v", err)
+	}
+	text := string(data)
+	if !strings.Contains(text, "chat = 'workspace-chat'") {
+		t.Fatalf("expected local chat override, got:\n%s", text)
+	}
+	if strings.Contains(text, "planner =") || strings.Contains(text, "parallel_slots") {
+		t.Fatalf("unexpected extra overrides persisted:\n%s", text)
+	}
+}
+
+func boolPtr(v bool) *bool       { return &v }
+func stringPtr(v string) *string { return &v }
+func intPtr(v int) *int          { return &v }

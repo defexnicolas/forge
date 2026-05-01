@@ -3,8 +3,6 @@ package tui
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -14,8 +12,6 @@ import (
 	"forge/internal/llm"
 	"forge/internal/session"
 	"forge/internal/yarn"
-
-	"github.com/pelletier/go-toml/v2"
 )
 
 // /yarn shows graph and node details.
@@ -400,11 +396,5 @@ func (m *model) syncRuntimeConfig() {
 }
 
 func (m model) persistConfig() {
-	dir := filepath.Join(m.options.CWD, ".forge")
-	_ = os.MkdirAll(dir, 0o755)
-	data, err := toml.Marshal(m.options.Config)
-	if err != nil {
-		return
-	}
-	_ = os.WriteFile(filepath.Join(dir, "config.toml"), data, 0o644)
+	_ = config.PersistWorkspaceConfig(m.options.CWD, m.options.Config)
 }

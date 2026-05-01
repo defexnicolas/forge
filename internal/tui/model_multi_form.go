@@ -3,8 +3,6 @@ package tui
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -13,7 +11,6 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/pelletier/go-toml/v2"
 )
 
 // contextWithShortTimeout returns a 5s context for the quick ListModels
@@ -68,6 +65,7 @@ type modelMultiForm struct {
 	done           bool
 	canceled       bool
 	errMsg         string
+	persist        bool
 	// Reuse step state — rebuilt each time the form advances to a new role.
 	reuseCursor  int
 	reuseOptions []modelReuseOption
@@ -79,6 +77,10 @@ type modelMultiForm struct {
 }
 
 func newModelMultiForm(cwd string, cfg config.Config, providers *llm.Registry, theme Theme) modelMultiForm {
+	return newModelMultiFormWithPersist(cwd, cfg, providers, theme, true)
+}
+
+func newModelMultiFormWithPersist(cwd string, cfg config.Config, providers *llm.Registry, theme Theme, persist bool) modelMultiForm {
 	config.Normalize(&cfg)
 	cursor := 0
 	if strings.EqualFold(cfg.ModelLoading.Strategy, "parallel") {
@@ -92,6 +94,7 @@ func newModelMultiForm(cwd string, cfg config.Config, providers *llm.Registry, t
 		cwd:            cwd,
 		theme:          theme,
 		providers:      providers,
+		persist:        persist,
 		roles: []modelMultiRole{
 			{label: "EXPLORER", role: "explorer"},
 			{label: "PLAN", role: "planner"},
@@ -166,7 +169,9 @@ func (f modelMultiForm) advanceToNextRole() modelMultiForm {
 	if f.roleIdx >= len(f.roles) {
 		f.cfg.ModelLoading.Enabled = true
 		f.cfg.ModelLoading.Strategy = f.strategy
-		f.persistConfig(f.cfg)
+		if f.persist {
+			f.persistConfig(f.cfg)
+		}
 		f.done = true
 		return f
 	}
@@ -441,11 +446,5 @@ func (f modelMultiForm) Result() string {
 }
 
 func (f modelMultiForm) persistConfig(cfg config.Config) {
-	dir := filepath.Join(f.cwd, ".forge")
-	_ = os.MkdirAll(dir, 0o755)
-	data, err := toml.Marshal(cfg)
-	if err != nil {
-		return
-	}
-	_ = os.WriteFile(filepath.Join(dir, "config.toml"), data, 0o644)
+	_ = config.PersistWorkspaceConfig(f.cwd, cfg)
 }

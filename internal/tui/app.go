@@ -667,9 +667,9 @@ func (m model) statusLineView() string {
 	default:
 		mode = t.StatusValue.Render("[" + modeName + "]")
 	}
-	modelName := m.agentRuntime.LastModelUsed
+	modelName := strings.TrimSpace(m.agentRuntime.LastModelUsed)
 	if modelName == "" {
-		modelName = m.options.Config.Models["chat"]
+		modelName = m.activeRoleModelID()
 	}
 	if modelName == "" {
 		modelName = "default"
@@ -1411,6 +1411,8 @@ func (m model) lowerChromeHeight() int {
 
 func (m model) activeFormView() string {
 	switch m.activeForm {
+	case formAskUser:
+		return m.askUserForm.View()
 	case formProvider:
 		return m.providerForm.View()
 	case formSkills:
@@ -1423,6 +1425,8 @@ func (m model) activeFormView() string {
 		return m.modelMultiForm.View()
 	case formConfirmExecute:
 		return m.confirmExecute.View()
+	case formConfirmPlanReset:
+		return m.confirmPlanReset.View()
 	case formConfirmExplorerPlan:
 		return m.confirmExplorerPlan.View()
 	case formYarnSettings:

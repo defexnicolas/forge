@@ -77,12 +77,12 @@ const (
 	paneMain    appPane = "main"
 	paneInput   appPane = "input"
 
-	viewExplorer appView = "explorer"
-	viewRecent   appView = "recent"
-	viewPinned   appView = "pinned"
-	viewSessions appView = "sessions"
-	viewTools    appView = "tools"
-	viewMCPs     appView = "mcps"
+	viewExplorer  appView = "explorer"
+	viewRecent    appView = "recent"
+	viewPinned    appView = "pinned"
+	viewSessions  appView = "sessions"
+	viewTools     appView = "tools"
+	viewMCPs      appView = "mcps"
 	viewSettings  appView = "settings"
 	viewChat      appView = "chat"
 	viewPlan      appView = "plan"
@@ -106,29 +106,31 @@ type explorerEntry struct {
 }
 
 type shellModel struct {
-	options          ShellOptions
-	theme            Theme
-	width            int
-	height           int
-	mode             appMode
-	activePane       appPane
-	activeView       appView
-	sidebarIndex     int
-	hubState         HubState
-	explorerDir      string
-	explorerEntries  []explorerEntry
-	explorerIndex    int
-	recentIndex      int
-	pinnedIndex      int
-	workspace        *model
-	workspaceSession *WorkspaceSession
-	activeHubForm    hubFormMode
-	providerForm     providerForm
-	modelForm        modelForm
-	modelMultiForm   modelMultiForm
-	yarnSettingsForm yarnSettingsForm
-	themeForm        themeForm
-	skillsForm       skillsForm
+	options            ShellOptions
+	theme              Theme
+	width              int
+	height             int
+	mode               appMode
+	activePane         appPane
+	activeView         appView
+	sidebarIndex       int
+	hubState           HubState
+	explorerDir        string
+	explorerEntries    []explorerEntry
+	explorerIndex      int
+	recentIndex        int
+	pinnedIndex        int
+	hubChat            *model
+	hubChatSession     *WorkspaceSession
+	workspace          *model
+	workspaceSession   *WorkspaceSession
+	activeHubForm      hubFormMode
+	providerForm       providerForm
+	modelForm          modelForm
+	modelMultiForm     modelMultiForm
+	yarnSettingsForm   yarnSettingsForm
+	themeForm          themeForm
+	skillsForm         skillsForm
 	hubSettingsIndex   int
 	migrationProposals []migrationProposal
 	statusMessage      string
@@ -209,10 +211,17 @@ func (m shellModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		return m, m.resizeWorkspace()
+		return m, tea.Batch(m.resizeWorkspace(), m.resizeHubChat())
 	case tea.KeyMsg:
 		if msg.Type == tea.KeyCtrlC {
 			return m, tea.Quit
+		}
+		if m.mode == modeHub && m.activeView == viewChat && m.hubChat != nil && m.activePane == paneInput && !m.hubChatHasModal() {
+			if msg.String() == "ctrl+w" || msg.Type == tea.KeyF6 {
+				m.rotatePane(1)
+				return m, m.resizeHubChat()
+			}
+			return m, m.forwardHubChat(msg)
 		}
 		if m.mode == modeWorkspace && m.activePane == paneInput && !m.workspaceHasModal() {
 			if msg.String() == "ctrl+w" || msg.Type == tea.KeyF6 {
@@ -221,11 +230,17 @@ func (m shellModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, m.forwardWorkspace(msg)
 		}
+		if m.hubChatHasModal() {
+			return m, m.forwardHubChat(msg)
+		}
 		if m.workspaceHasModal() {
 			return m, m.forwardWorkspace(msg)
 		}
 		return m.handleKey(msg)
 	default:
+		if m.mode == modeHub && m.activeView == viewChat && m.hubChat != nil {
+			return m, m.forwardHubChat(msg)
+		}
 		if m.workspace != nil {
 			return m, m.forwardWorkspace(msg)
 		}
@@ -234,10 +249,19 @@ func (m shellModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m shellModel) View() string {
+	if m.mode == modeHub && m.activeView == viewChat && m.hubChatHasModal() {
+		return m.hubChat.View()
+	}
 	if m.workspace != nil && m.workspaceHasModal() {
 		return m.workspace.View()
 	}
 	sidebar := m.sidebarView()
+	if m.mode == modeHub && m.activeView == viewChat {
+		if m.hubChat != nil {
+			return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, m.hubChat.View())
+		}
+		return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, m.hubChatEmptyView())
+	}
 	if m.mode == modeWorkspace && m.workspace != nil {
 		return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, m.workspace.View())
 	}
@@ -245,6 +269,9 @@ func (m shellModel) View() string {
 }
 
 func (m *shellModel) Close() error {
+	if err := m.closeHubChat(); err != nil {
+		return err
+	}
 	return m.closeWorkspace()
 }
 
@@ -267,7 +294,7 @@ func (m *shellModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.rotatePane(1)
 			return *m, m.resizeWorkspace()
 		}
-		if m.mode == modeHub && m.activePane == paneMain && len(msg.Runes) == 1 {
+		if m.mode == modeHub && (m.activePane == paneMain || m.activePane == paneSidebar) && len(msg.Runes) == 1 {
 			switch strings.ToLower(string(msg.Runes[0])) {
 			case "o":
 				m.openSelectedWorkspace()
@@ -308,6 +335,9 @@ func (m *shellModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.workspace != nil {
 		return *m, m.forwardWorkspace(msg)
 	}
+	if m.mode == modeHub && m.activeView == viewChat && m.hubChat != nil {
+		return *m, m.forwardHubChat(msg)
+	}
 	return *m, nil
 }
 
@@ -334,7 +364,6 @@ func (m *shellModel) handleEsc() (tea.Model, tea.Cmd) {
 		return *m, nil
 	}
 	if m.activeView != viewExplorer {
-		m.activeView = viewExplorer
 		m.selectSidebarView(viewExplorer)
 		return *m, nil
 	}
@@ -350,8 +379,7 @@ func (m *shellModel) handleUp() (tea.Model, tea.Cmd) {
 	switch m.activePane {
 	case paneSidebar:
 		if m.sidebarIndex > 0 {
-			m.sidebarIndex--
-			m.activeView = m.currentSidebarItems()[m.sidebarIndex].View
+			m.selectSidebarView(m.currentSidebarItems()[m.sidebarIndex-1].View)
 		}
 	case paneMain:
 		if m.mode == modeHub {
@@ -387,8 +415,7 @@ func (m *shellModel) handleDown() (tea.Model, tea.Cmd) {
 	case paneSidebar:
 		items := m.currentSidebarItems()
 		if m.sidebarIndex < len(items)-1 {
-			m.sidebarIndex++
-			m.activeView = items[m.sidebarIndex].View
+			m.selectSidebarView(items[m.sidebarIndex+1].View)
 		}
 	case paneMain:
 		if m.mode == modeHub {
@@ -424,7 +451,12 @@ func (m *shellModel) handleEnter() (tea.Model, tea.Cmd) {
 		if m.mode == modeWorkspace {
 			return *m, m.activateWorkspaceSidebar()
 		}
-		m.activeView = m.currentSidebarItems()[m.sidebarIndex].View
+		m.selectSidebarView(m.currentSidebarItems()[m.sidebarIndex].View)
+		if m.activeView == viewChat {
+			m.activePane = paneInput
+			return *m, m.ensureHubChatSession()
+		}
+		m.activePane = paneMain
 		return *m, nil
 	}
 	if m.mode == modeHub && m.activePane == paneMain {
@@ -447,6 +479,13 @@ func (m *shellModel) handleEnter() (tea.Model, tea.Cmd) {
 				items[m.hubSettingsIndex].Open(m)
 			}
 			return *m, nil
+		case viewChat:
+			if m.hubChat == nil {
+				m.activePane = paneInput
+				return *m, m.ensureHubChatSession()
+			}
+			m.activePane = paneInput
+			return *m, m.resizeHubChat()
 		}
 	}
 	if m.mode == modeWorkspace && m.activePane == paneMain && m.activeView == viewChat {
@@ -458,7 +497,7 @@ func (m *shellModel) handleEnter() (tea.Model, tea.Cmd) {
 
 func (m *shellModel) rotatePane(step int) {
 	panes := []appPane{paneSidebar, paneMain}
-	if m.mode == modeWorkspace {
+	if m.mode == modeWorkspace || (m.mode == modeHub && m.activeView == viewChat) {
 		panes = append(panes, paneInput)
 	}
 	index := 0
@@ -500,6 +539,7 @@ func (m *shellModel) OpenWorkspace(cwd string) error {
 		_ = session.Close()
 		return err
 	}
+	_ = m.closeHubChat()
 	m.attachWorkspace(session)
 	return nil
 }
@@ -532,6 +572,46 @@ func (m *shellModel) closeWorkspace() error {
 	return err
 }
 
+func (m *shellModel) closeHubChat() error {
+	if m.hubChat != nil {
+		_ = m.hubChat.close()
+	}
+	var err error
+	if m.hubChatSession != nil {
+		err = m.hubChatSession.Close()
+	}
+	m.hubChat = nil
+	m.hubChatSession = nil
+	return err
+}
+
+func (m *shellModel) applyHubChatConfig(cfg config.Config) {
+	if m.hubChat == nil {
+		return
+	}
+	providers := hubSettingsProviders(cfg)
+	m.hubChat.options.Config = cfg
+	m.hubChat.options.Providers = providers
+	if m.hubChat.agentRuntime == nil {
+		return
+	}
+	m.hubChat.agentRuntime.Config = cfg
+	m.hubChat.agentRuntime.Builder.Config = cfg
+	m.hubChat.agentRuntime.Providers = providers
+	for role, modelID := range cfg.Models {
+		modelID = strings.TrimSpace(modelID)
+		if modelID == "" {
+			continue
+		}
+		m.hubChat.agentRuntime.SetRoleModel(role, modelID)
+	}
+	m.hubChat.agentRuntime.SetChatModel(strings.TrimSpace(cfg.Models["chat"]))
+}
+
+func (m *shellModel) hubChatHasModal() bool {
+	return m.hubChat != nil && (m.hubChat.activeForm != formNone || m.hubChat.searching)
+}
+
 func (m *shellModel) workspaceHasModal() bool {
 	return m.workspace != nil && (m.workspace.activeForm != formNone || m.workspace.searching)
 }
@@ -560,6 +640,22 @@ func (m *shellModel) resizeWorkspace() tea.Cmd {
 	return cmd
 }
 
+func (m *shellModel) resizeHubChat() tea.Cmd {
+	if m.hubChat == nil {
+		return nil
+	}
+	m.syncHubChatFocus()
+	updated, cmd := m.hubChat.Update(tea.WindowSizeMsg{
+		Width:  max(40, m.width-shellSidebarWidth-1),
+		Height: max(10, m.height),
+	})
+	if chat, ok := updated.(model); ok {
+		m.hubChat = &chat
+		m.syncHubChatFocus()
+	}
+	return cmd
+}
+
 func (m *shellModel) forwardWorkspace(msg tea.Msg) tea.Cmd {
 	if m.workspace == nil {
 		return nil
@@ -573,6 +669,19 @@ func (m *shellModel) forwardWorkspace(msg tea.Msg) tea.Cmd {
 	return cmd
 }
 
+func (m *shellModel) forwardHubChat(msg tea.Msg) tea.Cmd {
+	if m.hubChat == nil {
+		return nil
+	}
+	m.syncHubChatFocus()
+	updated, cmd := m.hubChat.Update(msg)
+	if chat, ok := updated.(model); ok {
+		m.hubChat = &chat
+		m.syncHubChatFocus()
+	}
+	return cmd
+}
+
 func (m *shellModel) syncWorkspaceFocus() {
 	if m.workspace == nil {
 		return
@@ -582,6 +691,17 @@ func (m *shellModel) syncWorkspaceFocus() {
 		return
 	}
 	m.workspace.input.Blur()
+}
+
+func (m *shellModel) syncHubChatFocus() {
+	if m.hubChat == nil {
+		return
+	}
+	if m.mode == modeHub && m.activeView == viewChat && m.activePane == paneInput {
+		m.hubChat.input.Focus()
+		return
+	}
+	m.hubChat.input.Blur()
 }
 
 func (m shellModel) sidebarView() string {
@@ -613,7 +733,7 @@ func (m shellModel) sidebarView() string {
 	}
 	style := lipgloss.NewStyle().
 		Width(shellSidebarWidth).
-		Height(max(10, m.height)).
+		Height(max(1, m.height-4)).
 		Padding(1, 1).
 		BorderStyle(lipgloss.NormalBorder()).
 		BorderForeground(lipgloss.Color("240"))
@@ -644,6 +764,7 @@ func (m shellModel) currentSidebarItems() []shellSidebarItem {
 		{View: viewTools, Label: "Tools", Hint: "global info"},
 		{View: viewMCPs, Label: "MCPs", Hint: "global info"},
 		{View: viewSettings, Label: "Settings", Hint: "hub state"},
+		{View: viewChat, Label: "Chat", Hint: "general chat"},
 	}
 }
 
@@ -651,6 +772,9 @@ func (m *shellModel) selectSidebarView(view appView) {
 	items := m.currentSidebarItems()
 	for i, item := range items {
 		if item.View == view {
+			if m.mode == modeHub && m.activeView != view {
+				m.statusMessage = ""
+			}
 			m.sidebarIndex = i
 			m.activeView = view
 			return
@@ -687,7 +811,7 @@ func (m *shellModel) activateWorkspaceSidebar() tea.Cmd {
 		}
 	case viewSettings:
 		m.activeView = viewSettings
-		m.pushWorkspacePanelOutput("status", m.workspace.describeStatus())
+		m.pushWorkspacePanelOutput("settings", m.workspace.describeWorkspaceSettings())
 	case viewHub:
 		if err := m.SwitchToHub(); err != nil {
 			m.statusMessage = "Close workspace failed: " + err.Error()
@@ -706,16 +830,126 @@ func (m *shellModel) pushWorkspacePanelOutput(label, body string) {
 	m.workspace.refresh()
 }
 
+func (m shellModel) hubChatEmptyView() string {
+	style := lipgloss.NewStyle().
+		Width(m.hubContentWidth()).
+		Height(m.hubInnerHeight()).
+		Padding(1, 1)
+	lines := []string{
+		m.theme.Accent.Render("  Hub Chat"),
+		m.theme.Muted.Render("  Quick chat without leaving the Hub."),
+		"",
+		m.theme.Muted.Render("This chat is global and not tied to Explorer, Pinned, or Recent."),
+		"",
+		m.theme.Muted.Render("Press Enter to open the Hub chat."),
+	}
+	return style.Render(strings.Join(lines, "\n"))
+}
+
+func (m *shellModel) ensureHubChatSession() tea.Cmd {
+	if m.hubChat != nil && m.hubChatSession != nil {
+		return tea.Batch(m.resizeHubChat(), m.hubChat.Init())
+	}
+	session, err := openHubChatSession()
+	if err != nil {
+		m.statusMessage = "Open hub chat failed: " + err.Error()
+		return nil
+	}
+	_ = m.closeHubChat()
+	chat := newModel(session.Options)
+	chat.theme = m.theme
+	m.hubChatSession = session
+	m.hubChat = &chat
+	m.syncHubChatFocus()
+	return tea.Batch(m.resizeHubChat(), m.hubChat.Init())
+}
+
 func (m shellModel) hubView() string {
 	title := m.theme.Accent.Render("  Forge Hub")
 	subtitle := m.theme.Muted.Render("  Browse folders and open a workspace.")
-	body := m.renderHubMain()
-	status := m.renderHubStatus()
+	panelHeight := m.height
+	if panelHeight <= 0 {
+		panelHeight = 32
+	}
+	innerHeight := m.hubInnerHeight()
+	body := clipLines(m.renderHubMain(), m.hubBodyLineBudget())
+	bodyLines := strings.Split(body, "\n")
+	if len(bodyLines) == 1 && bodyLines[0] == "" {
+		bodyLines = nil
+	}
+	lines := []string{title, subtitle, ""}
+	lines = append(lines, bodyLines...)
+	footer := []string{m.renderHubHelp(), m.renderHubStatus()}
+	filler := innerHeight - len(lines) - len(footer)
+	for i := 0; i < filler; i++ {
+		lines = append(lines, "")
+	}
+	lines = append(lines, footer...)
 	mainStyle := lipgloss.NewStyle().
-		Width(max(40, m.width-shellSidebarWidth-1)).
-		Height(max(10, m.height)).
+		Width(m.hubContentWidth()).
+		Height(innerHeight).
 		Padding(1, 1)
-	return mainStyle.Render(title + "\n" + subtitle + "\n\n" + body + "\n\n" + status)
+	return mainStyle.Render(strings.Join(lines, "\n"))
+}
+
+func (m shellModel) hubContentWidth() int {
+	// Sidebar total width is content + padding + border = shellSidebarWidth+4.
+	// This panel also has 1-char horizontal padding on each side, so reserve
+	// 2 more columns here to keep the joined layout within the terminal width.
+	return max(24, m.width-shellSidebarWidth-6)
+}
+
+func (m shellModel) hubTextWidth() int {
+	// Be conservative: lipgloss width calculations plus padding/styles can
+	// still consume a few extra columns in the joined layout.
+	return max(16, m.hubContentWidth()-6)
+}
+
+func (m shellModel) hubInnerHeight() int {
+	panelHeight := m.height
+	if panelHeight <= 0 {
+		panelHeight = 32
+	}
+	return max(1, panelHeight-2)
+}
+
+func (m shellModel) hubBodyLineBudget() int {
+	// Header consumes 3 lines ("Forge Hub", subtitle, blank), footer
+	// consumes 2 fixed lines (help + status).
+	return max(1, m.hubInnerHeight()-5)
+}
+
+func (m shellModel) truncateHubText(text string) string {
+	width := m.hubTextWidth()
+	if width <= 0 {
+		return text
+	}
+	return truncateStrict(text, width)
+}
+
+func clipLines(text string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	lines := strings.Split(text, "\n")
+	if len(lines) <= limit {
+		return text
+	}
+	return strings.Join(lines[:limit], "\n")
+}
+
+func truncateStrict(s string, limit int) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	if limit <= 0 {
+		return ""
+	}
+	if len(s) <= limit {
+		return s
+	}
+	if limit <= 3 {
+		return s[:limit]
+	}
+	return s[:limit-3] + "..."
 }
 
 func (m shellModel) renderHubMain() string {
@@ -742,6 +976,8 @@ func (m shellModel) renderHubMain() string {
 		return m.theme.Muted.Render("Open a workspace to inspect MCP servers.")
 	case viewSettings:
 		return m.renderSettings()
+	case viewChat:
+		return stripAnsi(m.hubChatEmptyView())
 	default:
 		return ""
 	}
@@ -749,8 +985,8 @@ func (m shellModel) renderHubMain() string {
 
 func (m shellModel) renderExplorer() string {
 	lines := []string{
-		m.theme.StatusValue.Render("Path: ") + m.explorerDir,
-		m.theme.Muted.Render("Enter opens a directory. O opens the selected directory as a workspace. Backspace goes to the parent."),
+		m.theme.StatusValue.Render(m.truncateHubText("Path: " + m.explorerDir)),
+		m.theme.Muted.Render(m.truncateHubText("Enter opens a directory. O opens the selected directory as a workspace. Backspace goes to the parent.")),
 		"",
 	}
 	lines = append(lines, m.explorerVisibleLines()...)
@@ -758,7 +994,10 @@ func (m shellModel) renderExplorer() string {
 }
 
 func (m shellModel) explorerVisibleLines() []string {
-	visible := max(6, m.height-10)
+	// Explorer body spends 3 lines on its own header (path, help, blank).
+	// Keep the scroll window aligned with the actual clipped body height so
+	// the selected row never slips one line below the visible area.
+	visible := max(1, m.hubBodyLineBudget()-3)
 	start := 0
 	if m.explorerIndex >= visible {
 		start = m.explorerIndex - visible + 1
@@ -778,7 +1017,7 @@ func (m shellModel) explorerVisibleLines() []string {
 		if i == m.explorerIndex {
 			prefix = "> "
 		}
-		lines = append(lines, prefix+name)
+		lines = append(lines, prefix+m.truncateHubText(name))
 	}
 	if len(lines) == 0 {
 		lines = append(lines, m.theme.Muted.Render("  No entries"))
@@ -797,7 +1036,7 @@ func (m shellModel) renderRecent() string {
 		if i == m.recentIndex {
 			prefix = "> "
 		}
-		lines = append(lines, fmt.Sprintf("%s%s", prefix, item.Path))
+		lines = append(lines, fmt.Sprintf("%s%s", prefix, m.truncateHubText(item.Path)))
 		lines = append(lines, m.theme.Muted.Render("    opened "+item.OpenedAt.Format("2006-01-02 15:04")))
 	}
 	return strings.Join(lines, "\n")
@@ -842,8 +1081,8 @@ func (m shellModel) renderSettings() string {
 	items := m.hubSettingsItems()
 
 	lines := []string{
-		m.theme.StatusValue.Render("Hub default file: ") + compactDisplayPath(globalConfigDisplayPath()),
-		m.theme.StatusValue.Render("Workspace target: ") + compactDisplayPath(m.hubSettingsTarget()),
+		m.theme.StatusValue.Render(m.truncateHubText("Hub default file: " + compactDisplayPath(globalConfigDisplayPath()))),
+		m.theme.StatusValue.Render(m.truncateHubText("Workspace target: " + compactDisplayPath(m.hubSettingsTarget()))),
 		"",
 	}
 
@@ -871,7 +1110,7 @@ func (m shellModel) renderSettings() string {
 		lines = append(lines, prefix+item.Label)
 		lines = append(lines, m.theme.Muted.Render("    "+item.Hint))
 	}
-	lines = append(lines, "", m.theme.Muted.Render("Enter opens the selected editor. Hub items persist globally; Workspace items write to the target's .forge/config.toml."))
+	lines = append(lines, "", m.theme.Muted.Render(m.truncateHubText("Enter opens the selected editor. Hub items persist globally; Workspace items write to the target's .forge/config.toml.")))
 	return strings.Join(lines, "\n")
 }
 
@@ -891,10 +1130,62 @@ func (m shellModel) renderHubStatus() string {
 	if m.activeView == viewSettings {
 		parts = append(parts, "target:"+compactDisplayPath(m.hubSettingsTarget()))
 	}
-	if strings.TrimSpace(m.statusMessage) != "" {
-		parts = append(parts, m.statusMessage)
+	if status := compactStatusMessage(m.statusMessage); status != "" {
+		parts = append(parts, status)
 	}
-	return m.theme.StatusBar.Render(" " + strings.Join(parts, " | "))
+	width := max(8, m.hubTextWidth()-2) // status bar adds horizontal padding
+	return m.theme.StatusBar.Render(truncateStrict(" "+strings.Join(parts, " | "), width))
+}
+
+func (m shellModel) renderHubHelp() string {
+	var text string
+	if m.activePane == paneSidebar {
+		text = "Hub keys: Up/Down select view | Enter activate | Tab switch pane | Esc explorer/quit"
+	} else {
+		switch m.activeView {
+		case viewExplorer:
+			text = "Explorer: Up/Down move | Enter open dir | O open workspace | Backspace parent | P pin | Esc explorer/quit"
+		case viewRecent:
+			text = "Recent: Up/Down move | Enter open workspace | Esc explorer | Tab switch pane"
+		case viewPinned:
+			text = "Pinned: Up/Down move | Enter open workspace | P unpin | Esc explorer | Tab switch pane"
+		case viewSettings:
+			if m.activeHubForm != hubFormNone {
+				text = "Settings form: Enter confirm | Esc cancel | Tab or arrows navigate"
+			} else {
+				text = "Settings: Up/Down select item | Enter edit | Esc explorer | Tab switch pane"
+			}
+		case viewChat:
+			text = "Hub Chat: general conversation | Ctrl+W or F6 switch pane | Esc explorer | Tab switch pane"
+		case viewSessions:
+			text = "Sessions: review saved workspace sessions | Esc explorer | Tab switch pane"
+		case viewTools:
+			text = "Tools: inspect available tools | Esc explorer | Tab switch pane"
+		case viewMCPs:
+			text = "MCPs: inspect connected servers | Esc explorer | Tab switch pane"
+		case viewMigration:
+			text = "Migration: Enter apply | Esc dismiss"
+		default:
+			text = "Hub: Tab switch pane | Esc explorer/quit"
+		}
+	}
+	return m.theme.Muted.Render(m.truncateHubText(text))
+}
+
+func compactStatusMessage(msg string) string {
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		return ""
+	}
+	lines := strings.Split(msg, "\n")
+	parts := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.Join(strings.Fields(strings.TrimSpace(line)), " ")
+		if line != "" {
+			parts = append(parts, line)
+		}
+	}
+	return strings.Join(parts, " | ")
 }
 
 type hubScope int
@@ -938,10 +1229,10 @@ func (m *shellModel) hubSettingsItems() []hubSettingsItem {
 		{
 			Label: "Provider",
 			Hint:  "base URL, key, chat model",
-			Scope: scopeWorkspace,
+			Scope: scopeHub,
 			Open: func(m *shellModel) {
 				if cfg, ok := m.loadHubSettingsConfig(); ok {
-					m.providerForm = newProviderForm(m.hubSettingsTarget(), cfg, m.theme)
+					m.providerForm = newProviderForm("", cfg, m.theme)
 					m.activeHubForm = hubFormProvider
 				}
 			},
@@ -949,10 +1240,10 @@ func (m *shellModel) hubSettingsItems() []hubSettingsItem {
 		{
 			Label: "Model",
 			Hint:  "pick active chat model and context",
-			Scope: scopeWorkspace,
+			Scope: scopeHub,
 			Open: func(m *shellModel) {
 				if cfg, ok := m.loadHubSettingsConfig(); ok {
-					m.modelForm = newModelForm(m.hubSettingsTarget(), cfg, hubSettingsProviders(cfg), m.theme)
+					m.modelForm = newModelForm("", cfg, hubSettingsProviders(cfg), m.theme)
 					m.activeHubForm = hubFormModel
 				}
 			},
@@ -960,10 +1251,10 @@ func (m *shellModel) hubSettingsItems() []hubSettingsItem {
 		{
 			Label: "Model Multi",
 			Hint:  "role models and loading strategy",
-			Scope: scopeWorkspace,
+			Scope: scopeHub,
 			Open: func(m *shellModel) {
 				if cfg, ok := m.loadHubSettingsConfig(); ok {
-					m.modelMultiForm = newModelMultiForm(m.hubSettingsTarget(), cfg, hubSettingsProviders(cfg), m.theme)
+					m.modelMultiForm = newModelMultiFormWithPersist("", cfg, hubSettingsProviders(cfg), m.theme, false)
 					m.activeHubForm = hubFormModelMulti
 				}
 			},
@@ -971,10 +1262,10 @@ func (m *shellModel) hubSettingsItems() []hubSettingsItem {
 		{
 			Label: "YARN / Context",
 			Hint:  "context, budget, pins, compacting",
-			Scope: scopeWorkspace,
+			Scope: scopeHub,
 			Open: func(m *shellModel) {
 				if cfg, ok := m.loadHubSettingsConfig(); ok {
-					m.yarnSettingsForm = newYarnSettingsForm(m.hubSettingsTarget(), cfg, m.theme)
+					m.yarnSettingsForm = newYarnSettingsForm("", cfg, m.theme)
 					m.activeHubForm = hubFormYarn
 				}
 			},
@@ -991,8 +1282,7 @@ func (m *shellModel) hubSettingsItems() []hubSettingsItem {
 }
 
 func (m *shellModel) loadHubSettingsConfig() (config.Config, bool) {
-	target := m.hubSettingsTarget()
-	cfg, err := config.Load(target)
+	cfg, err := loadHubGlobalConfig()
 	if err != nil {
 		m.statusMessage = "Config load failed: " + err.Error()
 		return config.Config{}, false

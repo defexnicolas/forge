@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"forge/internal/agent"
+	"forge/internal/config"
 	"forge/internal/permissions"
 	"forge/internal/plans"
 	"forge/internal/session"
@@ -37,7 +38,15 @@ func (m *model) handleModelCommand(fields []string) string {
 			if len(fields) < 3 {
 				return "Usage: /model set <model-name>"
 			}
+			if m.options.Config.Models == nil {
+				m.options.Config.Models = map[string]string{}
+			}
 			m.options.Config.Models["chat"] = fields[2]
+			if m.options.Config.Context.Detected != nil && m.options.Config.Context.Detected.ModelID != "" && m.options.Config.Context.Detected.ModelID != fields[2] {
+				m.options.Config.Context.Detected = nil
+			}
+			m.persistConfig()
+			m.syncRuntimeConfig()
 			m.agentRuntime.SetChatModel(fields[2])
 			msg := t.Success.Render("Model set to: " + fields[2])
 			if m.agentRuntime.ActiveParserName != "" {
@@ -246,6 +255,86 @@ func (m model) describeConfig() string {
 		rows = append(rows, []string{"models." + role, model})
 	}
 	return t.FormatTable([]string{"Config", "Value"}, rows)
+}
+
+func (m model) describeWorkspaceSettings() string {
+	t := m.theme
+	cfg := m.options.Config
+	base, err := config.GlobalDefaultsConfig()
+	if err != nil {
+		base = config.Defaults()
+	}
+	keys := config.WorkspaceKeys(m.options.CWD)
+	providerKey := "providers.lmstudio.base_url"
+	providerURL := cfg.Providers.LMStudio.BaseURL
+	baseProviderURL := base.Providers.LMStudio.BaseURL
+	if cfg.Providers.Default.Name == "openai_compatible" {
+		providerKey = "providers.openai_compatible.base_url"
+		providerURL = cfg.Providers.OpenAICompatible.BaseURL
+		baseProviderURL = base.Providers.OpenAICompatible.BaseURL
+	}
+	rows := [][]string{
+		{"provider", cfg.Providers.Default.Name, workspaceSettingSource(keys["providers.default.name"], cfg.Providers.Default.Name, base.Providers.Default.Name)},
+		{"provider_url", providerURL, workspaceSettingSource(keys[providerKey], providerURL, baseProviderURL)},
+		{"chat_model", cfg.Models["chat"], workspaceModelSource(keys, cfg, base, "chat")},
+		{"explorer_model", cfg.Models["explorer"], workspaceModelSource(keys, cfg, base, "explorer")},
+		{"planner_model", cfg.Models["planner"], workspaceModelSource(keys, cfg, base, "planner")},
+		{"editor_model", cfg.Models["editor"], workspaceModelSource(keys, cfg, base, "editor")},
+		{"reviewer_model", cfg.Models["reviewer"], workspaceModelSource(keys, cfg, base, "reviewer")},
+		{"summarizer_model", cfg.Models["summarizer"], workspaceModelSource(keys, cfg, base, "summarizer")},
+		{"model_loading.enabled", fmt.Sprintf("%t", cfg.ModelLoading.Enabled), workspaceSettingSource(keys["model_loading.enabled"], cfg.ModelLoading.Enabled, base.ModelLoading.Enabled)},
+		{"model_loading.strategy", cfg.ModelLoading.Strategy, workspaceSettingSource(keys["model_loading.strategy"], cfg.ModelLoading.Strategy, base.ModelLoading.Strategy)},
+		{"model_loading.parallel_slots", fmt.Sprintf("%d", cfg.ModelLoading.ParallelSlots), workspaceSettingSource(keys["model_loading.parallel_slots"], cfg.ModelLoading.ParallelSlots, base.ModelLoading.ParallelSlots)},
+		{"context.yarn.profile", cfg.Context.Yarn.Profile, workspaceSettingSource(keys["context.yarn.profile"], cfg.Context.Yarn.Profile, base.Context.Yarn.Profile)},
+		{"context.budget_tokens", fmt.Sprintf("%d", cfg.Context.BudgetTokens), workspaceSettingSource(keys["context.budget_tokens"], cfg.Context.BudgetTokens, base.Context.BudgetTokens)},
+		{"context.model_context_tokens", fmt.Sprintf("%d", cfg.Context.ModelContextTokens), workspaceSettingSource(keys["context.model_context_tokens"], cfg.Context.ModelContextTokens, base.Context.ModelContextTokens)},
+		{"context.reserve_output_tokens", fmt.Sprintf("%d", cfg.Context.ReserveOutputTokens), workspaceSettingSource(keys["context.reserve_output_tokens"], cfg.Context.ReserveOutputTokens, base.Context.ReserveOutputTokens)},
+	}
+	if cfg.Context.Detected != nil && cfg.Context.Detected.LoadedContextLength > 0 {
+		rows = append(rows, []string{
+			"context.detected.chat",
+			fmt.Sprintf("%d", cfg.Context.Detected.LoadedContextLength),
+			workspaceSettingSource(keys["context.detected"], cfg.Context.Detected.LoadedContextLength, detectedLength(base.Context.Detected)),
+		})
+	}
+	return t.Muted.Render("Effective workspace settings. Source shows whether each value comes from the workspace override, the Hub default, or the builtin default.") +
+		"\n\n" + t.FormatTable([]string{"Setting", "Value", "Source"}, rows)
+}
+
+func workspaceSettingSource(isLocal bool, effective, base any) string {
+	if isLocal {
+		return "workspace"
+	}
+	if effective != base {
+		return "hub"
+	}
+	return "builtin"
+}
+
+func workspaceModelSource(keys map[string]bool, effective, base config.Config, role string) string {
+	path := "models." + role
+	if keys[path] {
+		return "workspace"
+	}
+	if role != "chat" && strings.TrimSpace(effective.Models[role]) == strings.TrimSpace(effective.Models["chat"]) {
+		switch chatSource := workspaceModelSource(keys, effective, base, "chat"); chatSource {
+		case "workspace":
+			return "workspace via chat"
+		case "hub":
+			return "hub via chat"
+		}
+	}
+	if strings.TrimSpace(effective.Models[role]) != strings.TrimSpace(base.Models[role]) {
+		return "hub"
+	}
+	return "builtin"
+}
+
+func detectedLength(detected *config.DetectedContext) int {
+	if detected == nil {
+		return 0
+	}
+	return detected.LoadedContextLength
 }
 
 func (m *model) enterReviewMode() string {

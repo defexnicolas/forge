@@ -53,6 +53,7 @@ func openWorkspaceSession(ctx context.Context, cwd string, opts workspaceBootstr
 		// global file is malformed, so fail open: log and continue.
 		fmt.Fprintf(os.Stderr, "global config: %s\n", err)
 	}
+	config.InheritChatModelDefaults(&cfg)
 	gitState, err := gitops.InspectSessionState(
 		cwd,
 		cfg.Git.AutoInit,
