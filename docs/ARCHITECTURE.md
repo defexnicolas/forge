@@ -716,6 +716,35 @@ Tests:
 
 - `runGoSearchText` y `runGoSearchFiles` se prueban directamente con la flag `forgeForceGoSearchBackend` que enmascara `rg` aunque este instalado, para garantizar cobertura del fallback en CI.
 
+#### Persistencia: SQLite vs `.forge/*`
+
+El estado mutable del proyecto se reparte entre dos backends. SQLite cuando los datos se consultan por id/relaciones/agregados, archivos en `.forge/` cuando los datos son artifacts (logs, dumps, snapshots de export).
+
+| Store | Backend | Path | Razon |
+|---|---|---|---|
+| `tasks` | SQLite | `.forge/forge.db` (tabla `tasks`) | Lookup por id y filtro por status. Migrado desde el legacy `.forge/tasks/tasks.json`, que ahora se importa una sola vez en el primer arranque. |
+| `plans` | SQLite | `.forge/forge.db` (tabla `plans`) | Documento estructurado por sesion (summary, context, assumptions, approach, stubs, risks, validation). Se actualiza con `plan_write`. |
+| `project_state` | SQLite | `.forge/forge.db` (tabla `project_state`) | Snapshot por repo (`repo_root` PK, `snapshot_json`, `git_head`). Permite responder preguntas estructurales sin re-walk del arbol. |
+| `sessions/messages/tool_calls/context_items` | SQLite | `.forge/sessions.db` | Append-heavy y se lee por sesion completa. JSONL no escala con el numero de sesiones; SQLite + WAL si. |
+| `plugin enabled/disabled` | JSON | `.forge/plugins.json` | Map sencillo, lo edita el usuario via `/plugin disable`. |
+| `config` | TOML | `.forge/config.toml` | Lo edita el usuario directo o el wizard. Repos sin SQLite igual deben poder leerlo. |
+| `themes` | JSON | `.forge/themes/*.json` | Cada theme es un archivo standalone que el usuario puede compartir. Se cargan al startup. |
+| `directory cache` | JSON | `.forge/cache/skills-directory.json` | Cache best-effort del listing remoto de skills. Si se borra, el manager hace refresh. |
+| `repository cache` | JSON | `.forge/cache/skills-<repo>.json` | Idem por repo. |
+| `forge.log` | text | `.forge/forge.log` | stderr redirigido durante TUI. Tail-friendly. |
+| `yarn snapshots/exports` | JSON / HTML | `.forge/yarn/*` | Artifacts generados por `/yarn export`. No los consume el runtime. |
+
+Reglas:
+
+- **SQLite** para datos consultados por id, filtrados, paginados, o agregados. Las migraciones viven en `internal/db/sqlite.go` (`forge.db`) y `internal/session/sqlite.go` (`sessions.db`) y son aditivas: cada release agrega una migracion nueva, nunca reescribe una existente.
+- **`.forge/`** para artifacts y configuracion editable por humanos. Si el archivo se borra, el sistema debe poder regenerarlo o seguir funcionando con defaults.
+- **Nunca** persistir el mismo dato en ambos backends. La unica excepcion es la importacion one-shot del legacy `tasks.json`, que se elimina despues de la primera lectura exitosa.
+
+Pendiente:
+
+- Definir cuando deprecar el path legacy `tasks.json` por completo (hoy se sigue intentando importar al arrancar).
+- Considerar mover `themes`, `cache/*` y `plugins.json` a SQLite si la suma de archivos JSON se vuelve molesta para sincronizar entre maquinas. Mientras sean pocos y editables a mano, archivos planos ganan.
+
 ### 9. Compatibilidad con Claude Code
 
 La herramienta debe poder consumir recursos creados para Claude Code siempre que usen formatos publicos: MCP, plugins, commands, agents, skills, hooks y settings. La meta es compatibilidad pragmatica, no dependencia de implementaciones internas.
