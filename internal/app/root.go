@@ -136,6 +136,9 @@ func NewRootCommand() *cobra.Command {
 					}
 				}
 			}
+			if len(pluginSkillDirs) > 0 {
+				tools.RegisterRunSkillTool(registry, pluginSkillDirs)
+			}
 
 			var projectSvc *projectstate.Service
 			if sqlDB, err := db.Open(cwd); err == nil {
