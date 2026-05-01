@@ -701,6 +701,21 @@ Reglas de diseno:
 - Las tools que escriben archivos deben reportar `changedFiles`.
 - Las tools que devuelven mucho texto deben paginar, resumir o emitir artifacts.
 
+#### Backend de busqueda (`search_text`, `search_files`)
+
+Las tools de busqueda usan ripgrep (`rg`) cuando esta disponible y caen al fallback Go nativo cuando no. La detección se hace una sola vez via `exec.LookPath("rg")` y queda cacheada en `internal/tools/search_backend.go`.
+
+Razones:
+
+- `rg` es 5-50x mas rapido que `filepath.WalkDir` en repos reales y respeta `.gitignore` automaticamente.
+- El fallback Go garantiza que las tools funcionen en maquinas sin `rg` instalado (Windows out-of-the-box, sandboxes minimos).
+- El fallback Go aplica skip-list propia para directorios ruidosos (`.git`, `node_modules`, `vendor`, `dist`, `build`, `target`, `__pycache__`, etc.) y extensiones binarias (`.exe`, `.png`, `.zip`, etc.). No es tan completo como `.gitignore` pero evita el peor caso de walking de `node_modules` con cientos de miles de archivos.
+- El `Summary` del resultado declara explicitamente `(ripgrep)` o `(go-fallback)` para que el modelo y el usuario vean que backend produjo los matches.
+
+Tests:
+
+- `runGoSearchText` y `runGoSearchFiles` se prueban directamente con la flag `forgeForceGoSearchBackend` que enmascara `rg` aunque este instalado, para garantizar cobertura del fallback en CI.
+
 ### 9. Compatibilidad con Claude Code
 
 La herramienta debe poder consumir recursos creados para Claude Code siempre que usen formatos publicos: MCP, plugins, commands, agents, skills, hooks y settings. La meta es compatibilidad pragmatica, no dependencia de implementaciones internas.

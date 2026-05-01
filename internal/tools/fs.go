@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -97,23 +98,17 @@ func (searchFilesTool) Run(ctx Context, input json.RawMessage) (Result, error) {
 	if err := json.Unmarshal(input, &req); err != nil {
 		return Result{}, err
 	}
-	var matches []string
-	err := filepath.WalkDir(ctx.CWD, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return err
-		}
-		if strings.Contains(strings.ToLower(filepath.Base(path)), strings.ToLower(req.Pattern)) {
-			rel, _ := filepath.Rel(ctx.CWD, path)
-			matches = append(matches, rel)
-		}
-		return nil
-	})
+	matches, err := runSearchFiles(context.Background(), ctx.CWD, req.Pattern)
 	if err != nil {
 		return Result{}, err
 	}
+	backend := "ripgrep"
+	if ripgrepPath() == "" {
+		backend = "go-fallback"
+	}
 	return Result{
 		Title:   "Search files",
-		Summary: fmt.Sprintf("%d matches", len(matches)),
+		Summary: fmt.Sprintf("%d matches (%s)", len(matches), backend),
 		Content: []ContentBlock{{Type: "text", Text: strings.Join(matches, "\n")}},
 	}, nil
 }

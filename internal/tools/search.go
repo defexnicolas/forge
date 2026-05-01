@@ -1,11 +1,9 @@
 package tools
 
 import (
-	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 )
 
@@ -30,37 +28,17 @@ func (searchTextTool) Run(ctx Context, input json.RawMessage) (Result, error) {
 	if req.Limit <= 0 {
 		req.Limit = 50
 	}
-
-	var matches []string
-	err := filepath.WalkDir(ctx.CWD, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() || len(matches) >= req.Limit {
-			return err
-		}
-		file, err := os.Open(path)
-		if err != nil {
-			return nil
-		}
-		defer file.Close()
-		scanner := bufio.NewScanner(file)
-		lineNumber := 0
-		for scanner.Scan() {
-			lineNumber++
-			if strings.Contains(scanner.Text(), req.Query) {
-				rel, _ := filepath.Rel(ctx.CWD, path)
-				matches = append(matches, fmt.Sprintf("%s:%d:%s", rel, lineNumber, scanner.Text()))
-				if len(matches) >= req.Limit {
-					break
-				}
-			}
-		}
-		return nil
-	})
+	matches, err := runSearchText(context.Background(), ctx.CWD, req.Query, req.Limit)
 	if err != nil {
 		return Result{}, err
 	}
+	backend := "ripgrep"
+	if ripgrepPath() == "" {
+		backend = "go-fallback"
+	}
 	return Result{
 		Title:   "Search text",
-		Summary: fmt.Sprintf("%d matches", len(matches)),
+		Summary: fmt.Sprintf("%d matches (%s)", len(matches), backend),
 		Content: []ContentBlock{{Type: "text", Text: strings.Join(matches, "\n")}},
 	}, nil
 }
