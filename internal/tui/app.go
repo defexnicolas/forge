@@ -30,20 +30,20 @@ import (
 )
 
 type Options struct {
-	CWD             string
-	Config          config.Config
-	Tools           *tools.Registry
-	Providers       *llm.Registry
-	Session         *session.Store
-	Skills          *skills.Manager
-	Plugins         *plugins.Manager
-	MCP             *mcp.Manager
-	Hooks           *hooks.Runner
-	ProjectState    *projectstate.Service
-	GitState        gitops.SessionState
-	LSP             lsp.Client
-	PluginSettings  plugins.MergedSettings
-	OutputStyles    []plugins.OutputStyle
+	CWD            string
+	Config         config.Config
+	Tools          *tools.Registry
+	Providers      *llm.Registry
+	Session        *session.Store
+	Skills         *skills.Manager
+	Plugins        *plugins.Manager
+	MCP            *mcp.Manager
+	Hooks          *hooks.Runner
+	ProjectState   *projectstate.Service
+	GitState       gitops.SessionState
+	LSP            lsp.Client
+	PluginSettings plugins.MergedSettings
+	OutputStyles   []plugins.OutputStyle
 }
 
 type App struct{ options Options }
@@ -235,7 +235,7 @@ func newModel(options Options) model {
 		}
 	}
 
-	cwd := filepath.Base(options.CWD)
+	cwd := compactDisplayPath(options.CWD)
 
 	m := model{
 		options:              options,
@@ -255,7 +255,7 @@ func newModel(options Options) model {
 		history: []string{
 			"",
 			theme.Accent.Render("  forge") + theme.Muted.Render(" | "+cwd+" | session:"+sessionName),
-			theme.Muted.Render("  /help for commands | Shift+Tab to switch mode | Ctrl+C or /quit to exit"),
+			theme.Muted.Render("  /help for commands | /mode to switch agent mode | Tab switches panes"),
 			"",
 		},
 	}
@@ -674,7 +674,7 @@ func (m model) statusLineView() string {
 	if modelName == "" {
 		modelName = "default"
 	}
-	cwd := filepath.Base(m.options.CWD)
+	cwd := compactDisplayPath(m.options.CWD)
 	provider := m.options.Config.Providers.Default.Name
 	status := t.Muted.Render("idle")
 	if m.pendingAskUser != nil {

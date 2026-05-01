@@ -1,6 +1,12 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"forge/internal/globalconfig"
+)
 
 func TestDefaultsUseRecommendedYarnProfile(t *testing.T) {
 	cfg := Defaults()
@@ -169,3 +175,142 @@ func TestApplyYarnProfiles(t *testing.T) {
 		}
 	}
 }
+
+func writeWorkspaceConfig(t *testing.T, cwd string, raw string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(cwd, ".forge"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, ".forge", "config.toml"), []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeGlobal(t *testing.T, g globalconfig.GlobalConfig) {
+	t.Helper()
+	if err := globalconfig.Save(g); err != nil {
+		t.Fatalf("write global: %v", err)
+	}
+}
+
+func TestLoadWithGlobalUsesGlobalForUnsetWorkspaceFields(t *testing.T) {
+	t.Setenv("FORGE_GLOBAL_HOME", t.TempDir())
+	cwd := t.TempDir()
+	// Workspace omits explorer + planner models -- those fall to built-in
+	// "local-model", which counts as "unset" so global wins.
+	writeWorkspaceConfig(t, cwd, `
+[models]
+chat = "workspace-chat"
+`)
+	scope := "user"
+	cli := "pnpx"
+	writeGlobal(t, globalconfig.GlobalConfig{
+		Models: map[string]string{
+			"explorer": "global-explorer",
+			"planner":  "global-planner",
+			"chat":     "global-chat", // should LOSE: workspace set chat already
+		},
+		Skills: &globalconfig.SkillsDefaults{
+			InstallScope: &scope,
+			CLI:          &cli,
+		},
+	})
+
+	cfg, err := LoadWithGlobal(cwd)
+	if err != nil {
+		t.Fatalf("LoadWithGlobal: %v", err)
+	}
+	if cfg.Models["chat"] != "workspace-chat" {
+		t.Errorf("workspace 'chat' should win, got %q", cfg.Models["chat"])
+	}
+	if cfg.Models["explorer"] != "global-explorer" {
+		t.Errorf("global should fill explorer, got %q", cfg.Models["explorer"])
+	}
+	if cfg.Models["planner"] != "global-planner" {
+		t.Errorf("global should fill planner, got %q", cfg.Models["planner"])
+	}
+	if cfg.Skills.InstallScope != "user" {
+		t.Errorf("global skills.install_scope should win, got %q", cfg.Skills.InstallScope)
+	}
+	if cfg.Skills.CLI != "pnpx" {
+		t.Errorf("global skills.cli should win when workspace at default 'npx', got %q", cfg.Skills.CLI)
+	}
+}
+
+func TestLoadWithGlobalRespectsWorkspaceOverride(t *testing.T) {
+	t.Setenv("FORGE_GLOBAL_HOME", t.TempDir())
+	cwd := t.TempDir()
+	writeWorkspaceConfig(t, cwd, `
+[skills]
+install_scope = "project"
+cli           = "yarn-dlx"
+`)
+	scope := "user"
+	cli := "pnpx"
+	writeGlobal(t, globalconfig.GlobalConfig{
+		Skills: &globalconfig.SkillsDefaults{
+			InstallScope: &scope,
+			CLI:          &cli,
+		},
+	})
+
+	cfg, err := LoadWithGlobal(cwd)
+	if err != nil {
+		t.Fatalf("LoadWithGlobal: %v", err)
+	}
+	if cfg.Skills.InstallScope != "project" {
+		t.Errorf("workspace install_scope should win, got %q", cfg.Skills.InstallScope)
+	}
+	if cfg.Skills.CLI != "yarn-dlx" {
+		t.Errorf("workspace cli should win, got %q", cfg.Skills.CLI)
+	}
+}
+
+func TestLoadWithGlobalMissingGlobalIsFine(t *testing.T) {
+	t.Setenv("FORGE_GLOBAL_HOME", t.TempDir()) // no global written
+	cwd := t.TempDir()
+	writeWorkspaceConfig(t, cwd, `
+[skills]
+install_scope = "project"
+`)
+	cfg, err := LoadWithGlobal(cwd)
+	if err != nil {
+		t.Fatalf("missing global should not error, got %v", err)
+	}
+	if cfg.Skills.InstallScope != "project" {
+		t.Errorf("workspace value lost, got %q", cfg.Skills.InstallScope)
+	}
+}
+
+func TestLoadWithGlobalProvidersFillEmptyOnly(t *testing.T) {
+	t.Setenv("FORGE_GLOBAL_HOME", t.TempDir())
+	cwd := t.TempDir()
+	// Workspace overrides only base_url for openai_compatible.
+	writeWorkspaceConfig(t, cwd, `
+[providers.openai_compatible]
+base_url = "https://workspace.example/v1"
+`)
+	baseURL := "https://global.example/v1"
+	apiKey := "global-key"
+	writeGlobal(t, globalconfig.GlobalConfig{
+		Providers: map[string]globalconfig.ProviderEntry{
+			"openai_compatible": {
+				BaseURL: &baseURL,
+				APIKey:  &apiKey,
+			},
+		},
+	})
+
+	cfg, err := LoadWithGlobal(cwd)
+	if err != nil {
+		t.Fatalf("LoadWithGlobal: %v", err)
+	}
+	if cfg.Providers.OpenAICompatible.BaseURL != "https://workspace.example/v1" {
+		t.Errorf("workspace base_url should win, got %q", cfg.Providers.OpenAICompatible.BaseURL)
+	}
+	if cfg.Providers.OpenAICompatible.APIKey != "global-key" {
+		t.Errorf("global api_key should fill, got %q", cfg.Providers.OpenAICompatible.APIKey)
+	}
+}
+
+

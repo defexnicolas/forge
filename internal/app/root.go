@@ -2,24 +2,15 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"forge/internal/config"
-	"forge/internal/db"
-	"forge/internal/gitops"
-	"forge/internal/hooks"
 	"forge/internal/llm"
-	"forge/internal/lsp"
-	"forge/internal/mcp"
-	"forge/internal/plugins"
-	"forge/internal/projectstate"
 	"forge/internal/session"
-	"forge/internal/skills"
-	"forge/internal/tools"
 	"forge/internal/tui"
 
 	"github.com/pelletier/go-toml/v2"
@@ -34,186 +25,38 @@ func NewRootCommand() *cobra.Command {
 		Use:   "forge",
 		Short: "Terminal workbench for coding agents",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if cwd == "" {
-				var err error
-				cwd, err = os.Getwd()
+			launchDir, err := os.Getwd()
+			if err != nil {
+				return err
+			}
+
+			var initialWorkspace *tui.WorkspaceSession
+			if cwd != "" {
+				initialWorkspace, err = openWorkspaceSession(context.Background(), cwd, workspaceBootstrapOptions{
+					Resume:          resume,
+					Output:          cmd.OutOrStdout(),
+					PromptIfMissing: true,
+				})
 				if err != nil {
+					if errors.Is(err, errWorkspaceInitAborted) {
+						return nil
+					}
 					return err
 				}
 			}
 
-			// Permission prompt: ask if .forge/ doesn't exist.
-			forgeDir := filepath.Join(cwd, ".forge")
-			if _, statErr := os.Stat(forgeDir); os.IsNotExist(statErr) {
-				fmt.Fprintf(cmd.OutOrStdout(), "Forge wants to operate in: %s\n", cwd)
-				fmt.Fprintf(cmd.OutOrStdout(), "This will create a .forge/ directory for config, sessions, and context.\n")
-				fmt.Fprintf(cmd.OutOrStdout(), "Allow? [Y/n] ")
-				var answer string
-				fmt.Scanln(&answer)
-				answer = strings.TrimSpace(strings.ToLower(answer))
-				if answer == "n" || answer == "no" {
-					fmt.Fprintln(cmd.OutOrStdout(), "Aborted.")
-					return nil
-				}
-				if err := ensureProjectScaffold(cwd, cmd.OutOrStdout(), false); err != nil {
-					return err
-				}
-				fmt.Fprintf(cmd.OutOrStdout(), "Initialized .forge/ in %s\n\n", cwd)
-			}
-
-			if err := ensureProjectScaffold(cwd, cmd.OutOrStdout(), false); err != nil {
-				return err
-			}
-
-			cfg, err := config.Load(cwd)
-			if err != nil {
-				return err
-			}
-			gitState, err := gitops.InspectSessionState(
-				cwd,
-				cfg.Git.AutoInit,
-				cfg.Git.RequireCleanOrSnapshot,
-				cfg.Git.BaselineCommitMessage,
-			)
-			if err != nil {
-				return err
-			}
-			if gitState.AutoInitialized {
-				fmt.Fprintf(cmd.OutOrStdout(), "Initialized git repository in %s\n", cwd)
-			}
-
-			// Redirect stderr to .forge/forge.log BEFORE any work that may
-			// write to it. Bubble Tea owns stdout; anything we print to
-			// stderr after this point lands in a tailable file instead of
-			// being scribbled over the TUI frame. Done at most once per
-			// process — no close hook needed, the OS reclaims the fd at
-			// exit.
-			_ = redirectStderrToLog(cwd)
-
-			registry := tools.NewRegistry()
-			tools.RegisterBuiltins(registry)
-			if err := tools.RegisterExternal(registry, cwd); err != nil {
-				return err
-			}
-
-			mcpManager := mcp.NewManager(cwd, registry)
-			if err := mcpManager.Start(context.Background()); err != nil {
-				fmt.Fprintf(os.Stderr, "mcp: %s\n", err)
-			}
-			tools.RegisterMCPResourceTools(registry, mcpResourceAdapter{m: mcpManager})
-
-			providers := llm.NewRegistry()
-			providers.Register(llm.NewOpenAICompatible("openai_compatible", cfg.Providers.OpenAICompatible))
-			providers.Register(llm.NewOpenAICompatible("lmstudio", cfg.Providers.LMStudio))
-			probeActiveContext(cwd, &cfg, providers)
-			sessionStore, err := openSession(cwd, resume)
-			if err != nil {
-				return err
-			}
-
-			hookRunner := hooks.NewRunner(cwd)
-
-			// Load MCP, hooks, skill dirs, LSP configs, settings, and output
-			// styles from discovered plugins.
-			pluginMgr := plugins.NewManager(cwd)
-			enabledState := plugins.LoadEnabledState(cwd)
-			var pluginSkillDirs []string
-			var pluginLSPConfigs []string
-			var enabledPlugins []plugins.Plugin
-			var outputStyles []plugins.OutputStyle
-			if discoveredPlugins, err := pluginMgr.Discover(); err == nil {
-				for _, p := range discoveredPlugins {
-					if enabledState.Disabled[p.Name] {
-						continue
-					}
-					enabledPlugins = append(enabledPlugins, p)
-					if mcpPath := p.MCPConfigPath(); mcpPath != "" {
-						if err := mcpManager.StartFromFile(context.Background(), mcpPath); err != nil {
-							fmt.Fprintf(os.Stderr, "plugin %s mcp: %s\n", p.Name, err)
-						}
-					}
-					if hooksPath := p.HooksPath(); hooksPath != "" {
-						if err := hookRunner.Load(hooksPath); err != nil {
-							fmt.Fprintf(os.Stderr, "plugin %s hooks: %s\n", p.Name, err)
-						}
-					}
-					if skillsDir := p.SkillsDir(); skillsDir != "" {
-						pluginSkillDirs = append(pluginSkillDirs, skillsDir)
-					}
-					if lspPath := p.LSPConfigPath(); lspPath != "" {
-						pluginLSPConfigs = append(pluginLSPConfigs, lspPath)
-					}
-					outputStyles = append(outputStyles, p.ListOutputStyles()...)
-				}
-			}
-			if len(pluginSkillDirs) > 0 {
-				tools.RegisterRunSkillTool(registry, pluginSkillDirs)
-			}
-
-			// Merge plugin settings.json safe-subset (permissions + env). The
-			// project's own config keeps wins for env keys it already sets:
-			// only inject plugin envs that are not already in os.Environ.
-			pluginSettings, settingsErrs := plugins.MergePluginSettings(enabledPlugins)
-			for _, err := range settingsErrs {
-				fmt.Fprintf(os.Stderr, "plugin settings: %s\n", err)
-			}
-			for k, v := range pluginSettings.Env {
-				if _, set := os.LookupEnv(k); !set {
-					_ = os.Setenv(k, v)
-				}
-			}
-
-			// Build the LSP router. LoadConfig is forgiving: missing project
-			// .lsp.json is fine, the router just stubs every call.
-			lspConfig, err := lsp.LoadConfig(cwd, pluginLSPConfigs...)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "lsp config: %s\n", err)
-			}
-			var lspClient lsp.Client
-			if len(lspConfig.ByExt) > 0 {
-				lspClient = lsp.NewRouter(cwd, lspConfig)
-			}
-
-			var projectSvc *projectstate.Service
-			if sqlDB, err := db.Open(cwd); err == nil {
-				projectSvc = projectstate.NewService(sqlDB)
-				go func() {
-					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-					defer cancel()
-					if _, err := projectSvc.EnsureSnapshot(ctx, cwd); err != nil {
-						fmt.Fprintf(os.Stderr, "projectstate: %s\n", err)
-					}
-				}()
-			} else {
-				fmt.Fprintf(os.Stderr, "projectstate db: %s\n", err)
-			}
-
-			app := tui.New(tui.Options{
-				CWD:          cwd,
-				Config:       cfg,
-				Tools:        registry,
-				Providers:    providers,
-				Session:      sessionStore,
-				ProjectState: projectSvc,
-				Skills: skills.NewManager(cwd, skills.Options{
-					CLI:             cfg.Skills.CLI,
-					DirectoryURL:    cfg.Skills.DirectoryURL,
-					Repositories:    cfg.Skills.Repositories,
-					Agent:           cfg.Skills.Agent,
-					InstallScope:    cfg.Skills.InstallScope,
-					Copy:            cfg.Skills.Copy,
-					Installer:       cfg.Skills.Installer,
-					PluginSkillDirs: pluginSkillDirs,
-				}),
-				Plugins:        pluginMgr,
-				MCP:            mcpManager,
-				Hooks:          hookRunner,
-				GitState:       gitState,
-				LSP:            lspClient,
-				PluginSettings: pluginSettings,
-				OutputStyles:   outputStyles,
+			app := tui.NewShell(tui.ShellOptions{
+				InitialWorkspace: initialWorkspace,
+				InitialHubDir:    launchDir,
+				StateStore:       tui.NewFileHubStateStore(""),
+				OpenWorkspace: func(workspaceCWD, workspaceResume string) (*tui.WorkspaceSession, error) {
+					return openWorkspaceSession(context.Background(), workspaceCWD, workspaceBootstrapOptions{
+						Resume:          workspaceResume,
+						Output:          nil,
+						PromptIfMissing: false,
+					})
+				},
 			})
-
 			return app.Run(context.Background())
 		},
 	}

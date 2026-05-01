@@ -223,8 +223,41 @@ func NewRuntime(cwd string, cfg config.Config, registry *tools.Registry, provide
 		Subagents: DefaultSubagents(),
 		Parsers:   DefaultParsers(),
 	}
+	runtime.seedLoadedModelsFromConfig()
 	runtime.RefreshGitSessionState()
 	return runtime
+}
+
+func (r *Runtime) seedLoadedModelsFromConfig() {
+	if r == nil {
+		return
+	}
+	activeRole := r.modelRoleForMode()
+	activeModel := r.roleModel(activeRole)
+	if detected := config.DetectedForRole(r.Config, activeRole, activeModel); detected != nil {
+		modelID := strings.TrimSpace(detected.ModelID)
+		if modelID == "" {
+			modelID = activeModel
+		}
+		if modelID != "" {
+			r.MarkModelLoaded(modelID)
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(r.Config.ModelLoading.Strategy), "parallel") {
+		for role, detected := range r.Config.Context.DetectedByRole {
+			modelID := strings.TrimSpace(detected.ModelID)
+			if modelID == "" {
+				modelID = r.roleModel(role)
+			}
+			if modelID == "" || detected.LoadedContextLength <= 0 {
+				continue
+			}
+			if r.loadedModels == nil {
+				r.loadedModels = map[string]bool{}
+			}
+			r.loadedModels[modelID] = true
+		}
+	}
 }
 
 // SetChatModel updates the active chat model and caches the parser that

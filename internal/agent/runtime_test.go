@@ -705,8 +705,8 @@ func TestRuntimeUsesRoleModelsWhenModelMultiEnabled(t *testing.T) {
 	if len(provider.requests) == 0 || provider.requests[0].Model != "plan-model" {
 		t.Fatalf("plan request model = %#v, want plan-model", provider.requests)
 	}
-	if provider.loads[0] != "plan-model" {
-		t.Fatalf("plan load = %#v, want plan-model first", provider.loads)
+	if len(provider.loads) != 0 {
+		t.Fatalf("expected detected planner model to skip load, got %#v", provider.loads)
 	}
 }
 
@@ -769,6 +769,36 @@ func TestRuntimeUsesChatForMainModesUntilModelMultiEnabled(t *testing.T) {
 	// ParallelSlots reaches LM Studio (GEN slots wouldn't apply otherwise).
 	if len(provider.loads) != 1 || provider.loads[0] != "chat-model" {
 		t.Fatalf("expected exactly one startup slot-apply load on chat-model, got %#v", provider.loads)
+	}
+}
+
+func TestRuntimeSkipsStartupReloadWhenDetectedModelAlreadyLoaded(t *testing.T) {
+	cwd := t.TempDir()
+	cfg := config.Defaults()
+	cfg.Providers.Default.Name = "fake"
+	cfg.Models["chat"] = "chat-model"
+	cfg.Context.Detected = &config.DetectedContext{
+		ModelID:             "chat-model",
+		LoadedContextLength: 32000,
+	}
+
+	registry := tools.NewRegistry()
+	tools.RegisterBuiltins(registry)
+	provider := &fakeProvider{responses: []string{"planned"}}
+	providers := llm.NewRegistry()
+	providers.Register(provider)
+	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+
+	if err := runtime.SetMode("plan"); err != nil {
+		t.Fatal(err)
+	}
+	for range runtime.Run(context.Background(), "plan it") {
+	}
+	if len(provider.requests) == 0 || provider.requests[0].Model != "chat-model" {
+		t.Fatalf("request model = %#v, want chat-model", provider.requests)
+	}
+	if len(provider.loads) != 0 {
+		t.Fatalf("expected detected loaded model to skip startup reload, got %#v", provider.loads)
 	}
 }
 

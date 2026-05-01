@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"forge/internal/gitops"
+	"forge/internal/globalconfig"
 
 	"github.com/pelletier/go-toml/v2"
 )
@@ -209,6 +210,193 @@ func Load(cwd string) (Config, error) {
 	}
 	Normalize(&cfg)
 	return cfg, nil
+}
+
+// LoadWithGlobal reads the workspace config and overlays the user's global
+// defaults from globalconfig.Load(). Resolution order, low to high:
+//
+//  1. Defaults() (built-in)
+//  2. ~/.codex/forge/global.toml -- only fills slots the workspace toml does
+//     not mention at all
+//  3. Workspace .forge/config.toml -- whatever the user wrote, even if it
+//     equals a built-in default
+//
+// "Did the workspace set this key?" is answered by re-reading the workspace
+// toml as a generic map and checking key presence, not by comparing against
+// Defaults() (which would mistakenly treat "I want the default value" as
+// "I didn't set this").
+//
+// A missing global file is not an error; only a malformed one is.
+func LoadWithGlobal(cwd string) (Config, error) {
+	cfg, err := Load(cwd)
+	if err != nil {
+		return cfg, err
+	}
+	keys := loadWorkspaceKeys(cwd)
+	g, gerr := globalconfig.Load()
+	if gerr != nil {
+		// Surface the error but still hand back the workspace-only config so
+		// the user is not locked out by a typo in the global file.
+		return cfg, gerr
+	}
+	applyGlobalDefaults(&cfg, g, keys)
+	return cfg, nil
+}
+
+// loadWorkspaceKeys returns the set of dotted TOML keys actually present in
+// the workspace's .forge/config.toml. Used by LoadWithGlobal so we can tell
+// "user explicitly wrote this" from "user didn't mention this section". A
+// missing or malformed file yields an empty set, which makes every global
+// default applicable.
+func loadWorkspaceKeys(cwd string) map[string]bool {
+	path := filepath.Join(cwd, ".forge", "config.toml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return map[string]bool{}
+	}
+	var raw map[string]any
+	if err := toml.Unmarshal(data, &raw); err != nil {
+		return map[string]bool{}
+	}
+	out := map[string]bool{}
+	collectTOMLKeys("", raw, out)
+	return out
+}
+
+func collectTOMLKeys(prefix string, m map[string]any, out map[string]bool) {
+	for k, v := range m {
+		full := k
+		if prefix != "" {
+			full = prefix + "." + k
+		}
+		out[full] = true
+		if sub, ok := v.(map[string]any); ok {
+			collectTOMLKeys(full, sub, out)
+		}
+	}
+}
+
+// applyGlobalDefaults overlays a globalconfig.GlobalConfig onto an in-place
+// Config. Each pointer field in the global is applied only when its matching
+// dotted TOML key is absent from `keys` (i.e. the workspace did not write
+// it). Slice fields use the same key-presence test on the slice's parent
+// section.
+func applyGlobalDefaults(cfg *Config, g globalconfig.GlobalConfig, keys map[string]bool) {
+	if g.Models != nil {
+		if cfg.Models == nil {
+			cfg.Models = map[string]string{}
+		}
+		for role, gModel := range g.Models {
+			if gModel == "" {
+				continue
+			}
+			if !keys["models."+role] {
+				cfg.Models[role] = gModel
+			}
+		}
+	}
+	if g.Yarn != nil {
+		applyYarnDefaults(&cfg.Context, g.Yarn, keys)
+	}
+	if g.Skills != nil {
+		applySkillsDefaults(&cfg.Skills, g.Skills, keys)
+	}
+	if g.Plugins != nil {
+		applyPluginsDefaults(&cfg.Plugins, g.Plugins, keys)
+	}
+	if g.Providers != nil {
+		applyProviderEntry(&cfg.Providers.OpenAICompatible, g.Providers["openai_compatible"], keys, "providers.openai_compatible")
+		applyProviderEntry(&cfg.Providers.LMStudio, g.Providers["lmstudio"], keys, "providers.lmstudio")
+	}
+}
+
+func applyYarnDefaults(ctx *ContextConfig, g *globalconfig.YarnDefaults, keys map[string]bool) {
+	if g.Profile != nil && !keys["context.yarn.profile"] {
+		ctx.Yarn.Profile = *g.Profile
+	}
+	if g.BudgetTokens != nil && !keys["context.budget_tokens"] {
+		ctx.BudgetTokens = *g.BudgetTokens
+	}
+	if g.MaxNodes != nil && !keys["context.yarn.max_nodes"] {
+		ctx.Yarn.MaxNodes = *g.MaxNodes
+	}
+	if g.MaxFileBytes != nil && !keys["context.yarn.max_file_bytes"] {
+		ctx.Yarn.MaxFileBytes = *g.MaxFileBytes
+	}
+	if g.HistoryEvents != nil && !keys["context.yarn.history_events"] {
+		ctx.Yarn.HistoryEvents = *g.HistoryEvents
+	}
+	if g.RenderMode != nil && !keys["context.yarn.render_mode"] {
+		ctx.Yarn.RenderMode = *g.RenderMode
+	}
+	if g.RenderHeadLine != nil && !keys["context.yarn.render_head_lines"] {
+		ctx.Yarn.RenderHeadLines = *g.RenderHeadLine
+	}
+}
+
+func applySkillsDefaults(s *SkillsConfig, g *globalconfig.SkillsDefaults, keys map[string]bool) {
+	if g.CLI != nil && !keys["skills.cli"] {
+		s.CLI = *g.CLI
+	}
+	if g.DirectoryURL != nil && !keys["skills.directory_url"] {
+		s.DirectoryURL = *g.DirectoryURL
+	}
+	if len(g.Repositories) > 0 && !keys["skills.repositories"] {
+		s.Repositories = append([]string(nil), g.Repositories...)
+	}
+	if g.Agent != nil && !keys["skills.agent"] {
+		s.Agent = *g.Agent
+	}
+	if g.InstallScope != nil && !keys["skills.install_scope"] {
+		s.InstallScope = *g.InstallScope
+	}
+	// CacheDir is read directly from globalconfig.CacheDir() at the call
+	// site (workspace.go) -- not exposed through SkillsConfig today.
+	_ = g.CacheDir
+}
+
+func applyPluginsDefaults(p *PluginsConfig, g *globalconfig.PluginsDefaults, keys map[string]bool) {
+	if g.Enabled != nil && !keys["plugins.enabled"] {
+		p.Enabled = *g.Enabled
+	}
+	if g.ClaudeCompatible != nil && !keys["plugins.claude_compatible"] {
+		p.ClaudeCompatible = *g.ClaudeCompatible
+	}
+	// EnabledByDefault is purely additive: workspace marketplaces stay,
+	// plus any unique entries from the global list.
+	for _, name := range g.EnabledByDefault {
+		if name == "" {
+			continue
+		}
+		seen := false
+		for _, existing := range p.Marketplaces {
+			if existing == name {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			p.Marketplaces = append(p.Marketplaces, name)
+		}
+	}
+}
+
+func applyProviderEntry(p *ProviderConfig, g globalconfig.ProviderEntry, keys map[string]bool, sect string) {
+	if g.BaseURL != nil && !keys[sect+".base_url"] {
+		p.BaseURL = *g.BaseURL
+	}
+	if g.APIKey != nil && !keys[sect+".api_key"] {
+		p.APIKey = *g.APIKey
+	}
+	if g.APIKeyEnv != nil && !keys[sect+".api_key_env"] {
+		p.APIKeyEnv = *g.APIKeyEnv
+	}
+	if g.DefaultModel != nil && !keys[sect+".default_model"] {
+		p.DefaultModel = *g.DefaultModel
+	}
+	if g.SupportsTools != nil && !keys[sect+".supports_tools"] {
+		p.SupportsTools = *g.SupportsTools
+	}
 }
 
 func Defaults() Config {
