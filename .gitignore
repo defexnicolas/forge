@@ -4,4 +4,5 @@
 .forge/tasks/
 .forge/yarn/
 forge.exe
+forge.exe~
 forge

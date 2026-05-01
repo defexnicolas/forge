@@ -47,9 +47,11 @@ func openWorkspaceSession(ctx context.Context, cwd string, opts workspaceBootstr
 		return nil, err
 	}
 
-	cfg, err := config.Load(cwd)
+	cfg, err := config.LoadWithGlobal(cwd)
 	if err != nil {
-		return nil, err
+		// LoadWithGlobal still hands back the workspace-only config when the
+		// global file is malformed, so fail open: log and continue.
+		fmt.Fprintf(os.Stderr, "global config: %s\n", err)
 	}
 	gitState, err := gitops.InspectSessionState(
 		cwd,
