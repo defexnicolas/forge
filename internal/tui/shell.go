@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"forge/internal/config"
+	"forge/internal/globalconfig"
 	"forge/internal/llm"
 	"forge/internal/session"
 
@@ -125,6 +126,8 @@ type shellModel struct {
 	modelForm        modelForm
 	modelMultiForm   modelMultiForm
 	yarnSettingsForm yarnSettingsForm
+	themeForm        themeForm
+	skillsForm       skillsForm
 	hubSettingsIndex int
 	statusMessage    string
 	lastEscTime      time.Time
@@ -793,16 +796,42 @@ func (m shellModel) renderSessions() string {
 
 func (m shellModel) renderSettings() string {
 	if formView := m.activeHubFormView(); formView != "" {
-		header := m.theme.Muted.Render("Editing " + m.hubSettingsTarget())
-		return header + "\n\n" + formView
+		var label string
+		items := m.hubSettingsItems()
+		if m.hubSettingsIndex >= 0 && m.hubSettingsIndex < len(items) {
+			if items[m.hubSettingsIndex].Scope == scopeHub {
+				label = "Editing Hub default (~/.codex/forge/global.toml)"
+			} else {
+				label = "Editing workspace override: " + m.hubSettingsTarget()
+			}
+		}
+		return m.theme.Muted.Render(label) + "\n\n" + formView
 	}
 	items := m.hubSettingsItems()
+
 	lines := []string{
-		m.theme.Muted.Render("Settings edit the target workspace config directly from Hub."),
-		m.theme.StatusValue.Render("Target: ") + compactDisplayPath(m.hubSettingsTarget()),
+		m.theme.StatusValue.Render("Hub default file: ") + compactDisplayPath(globalConfigDisplayPath()),
+		m.theme.StatusValue.Render("Workspace target: ") + compactDisplayPath(m.hubSettingsTarget()),
 		"",
 	}
+
+	// Render two sections with headers so the user can tell at a glance
+	// whether selecting an item will edit the global file or the workspace
+	// toml.
+	currentScope := hubScope(-1)
 	for i, item := range items {
+		if item.Scope != currentScope {
+			currentScope = item.Scope
+			if i > 0 {
+				lines = append(lines, "")
+			}
+			switch item.Scope {
+			case scopeHub:
+				lines = append(lines, m.theme.Accent.Render("HUB DEFAULTS"))
+			case scopeWorkspace:
+				lines = append(lines, m.theme.Accent.Render("WORKSPACE OVERRIDES"))
+			}
+		}
 		prefix := "  "
 		if i == m.hubSettingsIndex && m.activePane == paneMain {
 			prefix = "> "
@@ -810,8 +839,15 @@ func (m shellModel) renderSettings() string {
 		lines = append(lines, prefix+item.Label)
 		lines = append(lines, m.theme.Muted.Render("    "+item.Hint))
 	}
-	lines = append(lines, "", m.theme.Muted.Render("Enter opens the selected editor. Use Explorer or Recent to change the target."))
+	lines = append(lines, "", m.theme.Muted.Render("Enter opens the selected editor. Hub items persist globally; Workspace items write to the target's .forge/config.toml."))
 	return strings.Join(lines, "\n")
+}
+
+// globalConfigDisplayPath shows the hub global config file path with the
+// home dir abbreviated to ~ for readability. compactDisplayPath does the
+// rest of the cosmetics.
+func globalConfigDisplayPath() string {
+	return globalconfig.Path()
 }
 
 func (m shellModel) renderHubStatus() string {
@@ -829,17 +865,48 @@ func (m shellModel) renderHubStatus() string {
 	return m.theme.StatusBar.Render(" " + strings.Join(parts, " | "))
 }
 
+type hubScope int
+
+const (
+	scopeHub hubScope = iota
+	scopeWorkspace
+)
+
 type hubSettingsItem struct {
 	Label string
 	Hint  string
+	Scope hubScope
 	Open  func(*shellModel)
 }
 
 func (m *shellModel) hubSettingsItems() []hubSettingsItem {
 	return []hubSettingsItem{
+		// Hub defaults: persist to ~/.codex/forge/global.toml. Apply to
+		// every workspace that does not override.
+		{
+			Label: "Theme (global)",
+			Hint:  "persist UI theme as default for every workspace",
+			Scope: scopeHub,
+			Open: func(m *shellModel) {
+				m.themeForm = newThemeForm(m.theme)
+				m.activeHubForm = hubFormTheme
+			},
+		},
+		{
+			Label: "Skills (global)",
+			Hint:  "browse and install skills into ~/.codex/skills",
+			Scope: scopeHub,
+			Open: func(m *shellModel) {
+				m.openHubSkillsBrowser()
+			},
+		},
+
+		// Workspace overrides: persist to <target>/.forge/config.toml.
+		// Hub defaults still apply to keys this file does not write.
 		{
 			Label: "Provider",
 			Hint:  "base URL, key, chat model",
+			Scope: scopeWorkspace,
 			Open: func(m *shellModel) {
 				if cfg, ok := m.loadHubSettingsConfig(); ok {
 					m.providerForm = newProviderForm(m.hubSettingsTarget(), cfg, m.theme)
@@ -850,6 +917,7 @@ func (m *shellModel) hubSettingsItems() []hubSettingsItem {
 		{
 			Label: "Model",
 			Hint:  "pick active chat model and context",
+			Scope: scopeWorkspace,
 			Open: func(m *shellModel) {
 				if cfg, ok := m.loadHubSettingsConfig(); ok {
 					m.modelForm = newModelForm(m.hubSettingsTarget(), cfg, hubSettingsProviders(cfg), m.theme)
@@ -860,6 +928,7 @@ func (m *shellModel) hubSettingsItems() []hubSettingsItem {
 		{
 			Label: "Model Multi",
 			Hint:  "role models and loading strategy",
+			Scope: scopeWorkspace,
 			Open: func(m *shellModel) {
 				if cfg, ok := m.loadHubSettingsConfig(); ok {
 					m.modelMultiForm = newModelMultiForm(m.hubSettingsTarget(), cfg, hubSettingsProviders(cfg), m.theme)
@@ -870,6 +939,7 @@ func (m *shellModel) hubSettingsItems() []hubSettingsItem {
 		{
 			Label: "YARN / Context",
 			Hint:  "context, budget, pins, compacting",
+			Scope: scopeWorkspace,
 			Open: func(m *shellModel) {
 				if cfg, ok := m.loadHubSettingsConfig(); ok {
 					m.yarnSettingsForm = newYarnSettingsForm(m.hubSettingsTarget(), cfg, m.theme)
@@ -880,6 +950,7 @@ func (m *shellModel) hubSettingsItems() []hubSettingsItem {
 		{
 			Label: "Open Workspace",
 			Hint:  "enter chat with this target",
+			Scope: scopeWorkspace,
 			Open: func(m *shellModel) {
 				m.openSelectedWorkspace()
 			},

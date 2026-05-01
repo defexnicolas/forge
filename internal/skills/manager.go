@@ -120,6 +120,14 @@ func (m *Manager) Options() Options {
 	return m.options
 }
 
+// Cwd returns the manager's root directory: a workspace's cwd for a regular
+// manager, the user's global skills install dir for one created via
+// NewGlobalManager. Used by callers (e.g. the Hub skills browser) that need
+// to render or search relative to that root.
+func (m *Manager) Cwd() string {
+	return m.cwd
+}
+
 func (m *Manager) Repositories() []string {
 	return append([]string(nil), m.options.Repositories...)
 }

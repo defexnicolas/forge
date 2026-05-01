@@ -1,6 +1,10 @@
 package tui
 
-import tea "github.com/charmbracelet/bubbletea"
+import (
+	"forge/internal/globalconfig"
+
+	tea "github.com/charmbracelet/bubbletea"
+)
 
 type hubFormMode int
 
@@ -10,6 +14,8 @@ const (
 	hubFormModel
 	hubFormModelMulti
 	hubFormYarn
+	hubFormTheme
+	hubFormSkills
 )
 
 func (m *shellModel) handleHubFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
@@ -64,6 +70,37 @@ func (m *shellModel) handleHubFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd, bool)
 			m.activeHubForm = hubFormNone
 		}
 		return *m, cmd, true
+	case hubFormTheme:
+		var cmd tea.Cmd
+		m.themeForm, cmd = m.themeForm.Update(msg)
+		if m.themeForm.done {
+			result := "Theme change canceled."
+			if !m.themeForm.canceled && m.themeForm.chosen != "" {
+				m.theme = GetTheme(m.themeForm.chosen)
+				if err := globalconfig.SetTheme(m.themeForm.chosen); err != nil {
+					result = "Theme persisted in session, but global save failed: " + err.Error()
+				} else {
+					result = "Theme set globally to " + m.themeForm.chosen
+				}
+				// Propagate to the workspace's renderer if one is open so
+				// the change is visible immediately, not after restart.
+				if m.workspace != nil {
+					m.workspace.theme = m.theme
+					m.workspace.refresh()
+				}
+			}
+			m.statusMessage = result
+			m.activeHubForm = hubFormNone
+		}
+		return *m, cmd, true
+	case hubFormSkills:
+		var cmd tea.Cmd
+		m.skillsForm, cmd = m.skillsForm.Update(msg)
+		if m.skillsForm.done {
+			m.statusMessage = "Skills browser closed."
+			m.activeHubForm = hubFormNone
+		}
+		return *m, cmd, true
 	default:
 		return *m, nil, false
 	}
@@ -79,6 +116,10 @@ func (m shellModel) activeHubFormView() string {
 		return m.modelMultiForm.View()
 	case hubFormYarn:
 		return m.yarnSettingsForm.View()
+	case hubFormTheme:
+		return m.themeForm.View()
+	case hubFormSkills:
+		return m.skillsForm.View()
 	default:
 		return ""
 	}

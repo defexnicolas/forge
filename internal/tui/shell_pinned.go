@@ -38,6 +38,10 @@ func (m *shellModel) openPinnedWorkspace() {
 	}
 }
 
+// openHubSkillsBrowser is wired in shell_skills.go (commit that lands the
+// global skills manager) so this file just declares the entry point.
+// Currently a status message until the next commit fills it in.
+
 // togglePinForActiveSelection pins or unpins the workspace currently
 // selected in Recent or Pinned. From Pinned: toggle current pinned entry.
 // From Recent: toggle the recent entry. Anywhere else: no-op (the user
