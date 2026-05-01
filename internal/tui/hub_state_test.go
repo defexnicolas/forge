@@ -71,6 +71,48 @@ func TestHubStateBackwardCompatLoadOldJSON(t *testing.T) {
 	}
 }
 
+func TestTogglePinForRecentSelection(t *testing.T) {
+	state := HubState{
+		RecentWorkspaces: []RecentWorkspace{
+			{Path: "/projects/a"},
+			{Path: "/projects/b"},
+		},
+	}
+	store := &memoryHubStateStore{state: state}
+	m := &shellModel{
+		hubState:    state,
+		options:     ShellOptions{StateStore: store},
+		mode:        modeHub,
+		activeView:  viewRecent,
+		recentIndex: 1,
+	}
+	m.togglePinForActiveSelection()
+	if !m.hubState.IsPinned("/projects/b") {
+		t.Errorf("expected /projects/b pinned, got %v", m.hubState.Pinned)
+	}
+	if !store.state.IsPinned("/projects/b") {
+		t.Errorf("expected pin to persist via StateStore, got %v", store.state.Pinned)
+	}
+	m.togglePinForActiveSelection() // toggle off
+	if m.hubState.IsPinned("/projects/b") {
+		t.Errorf("expected /projects/b unpinned, got %v", m.hubState.Pinned)
+	}
+}
+
+func TestTogglePinNoOpOutsideRecentOrPinned(t *testing.T) {
+	state := HubState{}
+	m := &shellModel{
+		hubState:   state,
+		options:    ShellOptions{StateStore: &memoryHubStateStore{}},
+		mode:       modeHub,
+		activeView: viewExplorer,
+	}
+	m.togglePinForActiveSelection()
+	if len(m.hubState.Pinned) != 0 {
+		t.Errorf("toggle in Explorer view should be no-op, got %v", m.hubState.Pinned)
+	}
+}
+
 func TestHubStateSaveLoadRoundtrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "hub.json")

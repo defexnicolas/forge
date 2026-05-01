@@ -78,6 +78,7 @@ const (
 
 	viewExplorer appView = "explorer"
 	viewRecent   appView = "recent"
+	viewPinned   appView = "pinned"
 	viewSessions appView = "sessions"
 	viewTools    appView = "tools"
 	viewMCPs     appView = "mcps"
@@ -116,6 +117,7 @@ type shellModel struct {
 	explorerEntries  []explorerEntry
 	explorerIndex    int
 	recentIndex      int
+	pinnedIndex      int
 	workspace        *model
 	workspaceSession *WorkspaceSession
 	activeHubForm    hubFormMode
@@ -246,6 +248,9 @@ func (m *shellModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			case "o":
 				m.openSelectedWorkspace()
 				return *m, m.resizeWorkspace()
+			case "p":
+				m.togglePinForActiveSelection()
+				return *m, nil
 			}
 		}
 	case tea.KeyF6:
@@ -329,6 +334,10 @@ func (m *shellModel) handleUp() (tea.Model, tea.Cmd) {
 				if m.recentIndex > 0 {
 					m.recentIndex--
 				}
+			case viewPinned:
+				if m.pinnedIndex > 0 {
+					m.pinnedIndex--
+				}
 			case viewSettings:
 				if m.hubSettingsIndex > 0 {
 					m.hubSettingsIndex--
@@ -362,6 +371,10 @@ func (m *shellModel) handleDown() (tea.Model, tea.Cmd) {
 				if m.recentIndex < len(m.hubState.RecentWorkspaces)-1 {
 					m.recentIndex++
 				}
+			case viewPinned:
+				if m.pinnedIndex < len(m.hubState.Pinned)-1 {
+					m.pinnedIndex++
+				}
 			case viewSettings:
 				if m.hubSettingsIndex < len(m.hubSettingsItems())-1 {
 					m.hubSettingsIndex++
@@ -391,6 +404,9 @@ func (m *shellModel) handleEnter() (tea.Model, tea.Cmd) {
 			return *m, nil
 		case viewRecent:
 			m.openRecentWorkspace()
+			return *m, m.resizeWorkspace()
+		case viewPinned:
+			m.openPinnedWorkspace()
 			return *m, m.resizeWorkspace()
 		case viewSettings:
 			items := m.hubSettingsItems()
@@ -589,6 +605,7 @@ func (m shellModel) currentSidebarItems() []shellSidebarItem {
 	}
 	return []shellSidebarItem{
 		{View: viewExplorer, Label: "Explorer", Hint: "browse folders"},
+		{View: viewPinned, Label: "Pinned", Hint: "favorite workspaces"},
 		{View: viewRecent, Label: "Recent", Hint: "reopen quickly"},
 		{View: viewSessions, Label: "Sessions", Hint: "workspace session logs"},
 		{View: viewTools, Label: "Tools", Hint: "global info"},
@@ -674,6 +691,8 @@ func (m shellModel) renderHubMain() string {
 		return m.renderExplorer()
 	case viewRecent:
 		return m.renderRecent()
+	case viewPinned:
+		return m.renderPinned()
 	case viewSessions:
 		return m.renderSessions()
 	case viewTools:
