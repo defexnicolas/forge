@@ -190,15 +190,53 @@ func (p Plugin) SettingsPath() string {
 }
 
 // OutputStylesDir returns the path to the output-styles/ subdirectory of a
-// plugin if one exists. Forge does not yet have an output-styles runtime, so
-// for now it stays in PendingComponents -- the path getter exists so future
-// loaders don't need to re-grow this stat boilerplate.
+// plugin if one exists. Forge surfaces them through ListOutputStyles so the
+// user can see what is available, but does not auto-apply them: applying an
+// output style means injecting prose into the system prompt, which is the
+// user's call.
 func (p Plugin) OutputStylesDir() string {
 	path := filepath.Join(p.Path, "output-styles")
 	if info, err := os.Stat(path); err == nil && info.IsDir() {
 		return path
 	}
 	return ""
+}
+
+// OutputStyle describes one style file shipped by a plugin.
+type OutputStyle struct {
+	Plugin string
+	Name   string
+	Path   string
+}
+
+// ListOutputStyles enumerates *.md and *.json files inside the plugin's
+// output-styles/ dir. Best-effort: unreadable directories are silently
+// skipped (the .Components() call already told the user the dir exists).
+func (p Plugin) ListOutputStyles() []OutputStyle {
+	dir := p.OutputStylesDir()
+	if dir == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []OutputStyle
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		ext := filepath.Ext(e.Name())
+		if ext != ".md" && ext != ".json" {
+			continue
+		}
+		out = append(out, OutputStyle{
+			Plugin: p.Name,
+			Name:   e.Name()[:len(e.Name())-len(ext)],
+			Path:   filepath.Join(dir, e.Name()),
+		})
+	}
+	return out
 }
 
 func (p Plugin) Components() []string {
@@ -213,8 +251,31 @@ func (p Plugin) Components() []string {
 
 func (p Plugin) SupportedComponents() []string {
 	var out []string
-	// "skills" moved here once skillSearchDirs honors plugin paths.
-	for _, candidate := range []string{"commands", "agents", "hooks", ".mcp.json", "skills"} {
+	// "skills"        loaded via Options.PluginSkillDirs (item 4 of roadmap).
+	// ".lsp.json"     loaded via lsp.LoadConfig + lsp.NewRouter (item 6).
+	// "settings.json" loaded via PluginSettings.LoadSettings (safe subset:
+	//                 permissions.allow/deny/ask + env). Anything else in
+	//                 the file is silently ignored.
+	// "output-styles" surfaced via ListOutputStyles -- forge does not
+	//                 auto-apply styles but the user can inspect them.
+	for _, candidate := range []string{"commands", "agents", "hooks", ".mcp.json", "skills", ".lsp.json", "settings.json", "output-styles"} {
+		if _, err := os.Stat(filepath.Join(p.Path, candidate)); err == nil {
+			out = append(out, candidate)
+		}
+	}
+	return out
+}
+
+// IgnoredComponents are recognized component names that forge will never
+// auto-load, by policy. They are listed separately so the user understands
+// the plugin works and the missing component is intentional.
+func (p Plugin) IgnoredComponents() []string {
+	var out []string
+	// "bin": running arbitrary binaries from a discovered plugin would let
+	// any plugin author execute code on the user's machine the first time
+	// the plugin is enabled. Disabled by design; users can install the
+	// binary themselves and reference it from .forge/config.toml.
+	for _, candidate := range []string{"bin"} {
 		if _, err := os.Stat(filepath.Join(p.Path, candidate)); err == nil {
 			out = append(out, candidate)
 		}
@@ -223,17 +284,10 @@ func (p Plugin) SupportedComponents() []string {
 }
 
 func (p Plugin) PendingComponents() []string {
-	var out []string
-	// "bin": Forge does not run plugin binaries.
-	// "output-styles": no output-styles runtime yet.
-	// ".lsp.json": LSP config merge is item 6 of the roadmap.
-	// "settings.json": no merger that is safe enough to enable by default yet.
-	for _, candidate := range []string{"bin", "output-styles", ".lsp.json", "settings.json"} {
-		if _, err := os.Stat(filepath.Join(p.Path, candidate)); err == nil {
-			out = append(out, candidate)
-		}
-	}
-	return out
+	// All previously-pending components now have loaders. Kept around as an
+	// extension point for any future component type that lands in discovery
+	// before its loader.
+	return nil
 }
 
 func (p Plugin) CompatibilityStatus() string {

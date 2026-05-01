@@ -30,18 +30,20 @@ import (
 )
 
 type Options struct {
-	CWD          string
-	Config       config.Config
-	Tools        *tools.Registry
-	Providers    *llm.Registry
-	Session      *session.Store
-	Skills       *skills.Manager
-	Plugins      *plugins.Manager
-	MCP          *mcp.Manager
-	Hooks        *hooks.Runner
-	ProjectState *projectstate.Service
-	GitState     gitops.SessionState
-	LSP          lsp.Client
+	CWD             string
+	Config          config.Config
+	Tools           *tools.Registry
+	Providers       *llm.Registry
+	Session         *session.Store
+	Skills          *skills.Manager
+	Plugins         *plugins.Manager
+	MCP             *mcp.Manager
+	Hooks           *hooks.Runner
+	ProjectState    *projectstate.Service
+	GitState        gitops.SessionState
+	LSP             lsp.Client
+	PluginSettings  plugins.MergedSettings
+	OutputStyles    []plugins.OutputStyle
 }
 
 type App struct{ options Options }
@@ -210,6 +212,17 @@ func newModel(options Options) model {
 	runtime.Builder.ProjectState = options.ProjectState
 	if options.LSP != nil {
 		runtime.Builder.LSP = options.LSP
+	}
+	// Plugin-supplied permissions are appended to the active command policy.
+	// They never replace the user's profile, only extend it.
+	if len(options.PluginSettings.AllowTools) > 0 {
+		runtime.Commands.Allow = append(runtime.Commands.Allow, options.PluginSettings.AllowTools...)
+	}
+	if len(options.PluginSettings.DenyTools) > 0 {
+		runtime.Commands.Deny = append(runtime.Commands.Deny, options.PluginSettings.DenyTools...)
+	}
+	if len(options.PluginSettings.AskTools) > 0 {
+		runtime.Commands.Ask = append(runtime.Commands.Ask, options.PluginSettings.AskTools...)
 	}
 	runtime.Hooks = options.Hooks
 	runtime.SetGitSessionState(options.GitState)

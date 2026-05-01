@@ -113,16 +113,20 @@ func NewRootCommand() *cobra.Command {
 
 			hookRunner := hooks.NewRunner(cwd)
 
-			// Load MCP, hooks, skill dirs, and LSP configs from discovered plugins.
+			// Load MCP, hooks, skill dirs, LSP configs, settings, and output
+			// styles from discovered plugins.
 			pluginMgr := plugins.NewManager(cwd)
 			enabledState := plugins.LoadEnabledState(cwd)
 			var pluginSkillDirs []string
 			var pluginLSPConfigs []string
+			var enabledPlugins []plugins.Plugin
+			var outputStyles []plugins.OutputStyle
 			if discoveredPlugins, err := pluginMgr.Discover(); err == nil {
 				for _, p := range discoveredPlugins {
 					if enabledState.Disabled[p.Name] {
 						continue
 					}
+					enabledPlugins = append(enabledPlugins, p)
 					if mcpPath := p.MCPConfigPath(); mcpPath != "" {
 						if err := mcpManager.StartFromFile(context.Background(), mcpPath); err != nil {
 							fmt.Fprintf(os.Stderr, "plugin %s mcp: %s\n", p.Name, err)
@@ -139,10 +143,24 @@ func NewRootCommand() *cobra.Command {
 					if lspPath := p.LSPConfigPath(); lspPath != "" {
 						pluginLSPConfigs = append(pluginLSPConfigs, lspPath)
 					}
+					outputStyles = append(outputStyles, p.ListOutputStyles()...)
 				}
 			}
 			if len(pluginSkillDirs) > 0 {
 				tools.RegisterRunSkillTool(registry, pluginSkillDirs)
+			}
+
+			// Merge plugin settings.json safe-subset (permissions + env). The
+			// project's own config keeps wins for env keys it already sets:
+			// only inject plugin envs that are not already in os.Environ.
+			pluginSettings, settingsErrs := plugins.MergePluginSettings(enabledPlugins)
+			for _, err := range settingsErrs {
+				fmt.Fprintf(os.Stderr, "plugin settings: %s\n", err)
+			}
+			for k, v := range pluginSettings.Env {
+				if _, set := os.LookupEnv(k); !set {
+					_ = os.Setenv(k, v)
+				}
 			}
 
 			// Build the LSP router. LoadConfig is forgiving: missing project
@@ -187,11 +205,13 @@ func NewRootCommand() *cobra.Command {
 					Installer:       cfg.Skills.Installer,
 					PluginSkillDirs: pluginSkillDirs,
 				}),
-				Plugins:  pluginMgr,
-				MCP:      mcpManager,
-				Hooks:    hookRunner,
-				GitState: gitState,
-				LSP:      lspClient,
+				Plugins:        pluginMgr,
+				MCP:            mcpManager,
+				Hooks:          hookRunner,
+				GitState:       gitState,
+				LSP:            lspClient,
+				PluginSettings: pluginSettings,
+				OutputStyles:   outputStyles,
 			})
 
 			return app.Run(context.Background())

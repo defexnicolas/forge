@@ -9,7 +9,7 @@ import (
 func TestPluginCompatibilityComponents(t *testing.T) {
 	dir := t.TempDir()
 	pluginDir := filepath.Join(dir, "demo-plugin")
-	for _, rel := range []string{"commands", "agents", "hooks", ".mcp.json", "skills", ".lsp.json", "settings.json"} {
+	for _, rel := range []string{"commands", "agents", "hooks", ".mcp.json", "skills", ".lsp.json", "settings.json", "output-styles", "bin"} {
 		target := filepath.Join(pluginDir, rel)
 		if filepath.Ext(rel) == ".json" {
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
@@ -26,25 +26,30 @@ func TestPluginCompatibilityComponents(t *testing.T) {
 	}
 
 	plugin := Plugin{Name: "demo", Path: pluginDir}
-	if got := plugin.CompatibilityStatus(); got != "partial" {
-		t.Fatalf("CompatibilityStatus() = %q, want partial", got)
+	// All component types now have loaders or explicit ignore-by-policy
+	// reasons, so a plugin that ships every recognized component is "ready".
+	if got := plugin.CompatibilityStatus(); got != "ready" {
+		t.Fatalf("CompatibilityStatus() = %q, want ready", got)
 	}
 	supported := plugin.SupportedComponents()
-	if len(supported) != 5 {
-		t.Fatalf("expected 5 supported components, got %#v", supported)
-	}
-	// skills must be supported now that the skills manager honors plugin dirs.
 	wantSupported := map[string]bool{
-		"commands": true, "agents": true, "hooks": true, ".mcp.json": true, "skills": true,
+		"commands": true, "agents": true, "hooks": true, ".mcp.json": true,
+		"skills": true, ".lsp.json": true, "settings.json": true, "output-styles": true,
+	}
+	if len(supported) != len(wantSupported) {
+		t.Fatalf("expected %d supported components, got %#v", len(wantSupported), supported)
 	}
 	for _, c := range supported {
 		if !wantSupported[c] {
 			t.Errorf("unexpected supported component: %q", c)
 		}
 	}
-	pending := plugin.PendingComponents()
-	if len(pending) != 2 {
-		t.Fatalf("expected 2 pending components (.lsp.json, settings.json), got %#v", pending)
+	if len(plugin.PendingComponents()) != 0 {
+		t.Errorf("expected 0 pending components, got %#v", plugin.PendingComponents())
+	}
+	ignored := plugin.IgnoredComponents()
+	if len(ignored) != 1 || ignored[0] != "bin" {
+		t.Errorf("expected only bin to be ignored, got %#v", ignored)
 	}
 }
 
