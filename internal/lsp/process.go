@@ -22,24 +22,59 @@ type ServerConfig struct {
 }
 
 // ProcessClient implements Client by spawning a language server process.
+//
+// Compared to the previous implementation, the I/O is split: a single
+// readLoop goroutine demuxes everything coming out of the server's stdout
+// into either responses (correlated by JSON-RPC id to the call that issued
+// them) or notifications (fanned out to handlers, currently just the
+// diagnostics cache).
+//
+// This is what unblocks Diagnostics(): LSP servers publish diagnostics via
+// 'textDocument/publishDiagnostics' notifications which the old reader could
+// not see (it only ran when Diagnostics held the mutex and only consumed one
+// message at a time).
 type ProcessClient struct {
-	config    ServerConfig
-	cwd       string
-	cmd       *exec.Cmd
-	stdin     io.WriteCloser
-	stdout    *bufio.Reader
-	mu        sync.Mutex
+	config  ServerConfig
+	cwd     string
+	cmd     *exec.Cmd
+	stdin   io.WriteCloser
+	stdout  *bufio.Reader
+	mu      sync.Mutex
+	started bool
+	closed  bool
+
+	// Pending in-flight calls: request id -> channel that will receive the
+	// raw result bytes (or an error). Owned under mu.
+	pending   map[int]chan rpcResponse
 	requestID int
-	started   bool
+
+	// Diagnostics cache: file URI -> latest published diagnostics. Updated
+	// from the read loop, read by Diagnostics().
+	diagMu      sync.RWMutex
+	diagByURI   map[string][]Diagnostic
+	diagWaiters map[string][]chan struct{}
+}
+
+type rpcResponse struct {
+	result json.RawMessage
+	err    error
 }
 
 // NewProcessClient creates an LSP client for the given server config.
 func NewProcessClient(cwd string, cfg ServerConfig) *ProcessClient {
-	return &ProcessClient{config: cfg, cwd: cwd}
+	return &ProcessClient{
+		config:      cfg,
+		cwd:         cwd,
+		pending:     map[int]chan rpcResponse{},
+		diagByURI:   map[string][]Diagnostic{},
+		diagWaiters: map[string][]chan struct{}{},
+	}
 }
 
 func (c *ProcessClient) start() error {
+	c.mu.Lock()
 	if c.started {
+		c.mu.Unlock()
 		return nil
 	}
 	cmd := exec.Command(c.config.Command, c.config.Args...)
@@ -49,19 +84,27 @@ func (c *ProcessClient) start() error {
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
+		c.mu.Unlock()
 		return err
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		c.mu.Unlock()
 		return err
 	}
 	if err := cmd.Start(); err != nil {
+		c.mu.Unlock()
 		return fmt.Errorf("lsp start %s: %w", c.config.Command, err)
 	}
 	c.cmd = cmd
 	c.stdin = stdin
 	c.stdout = bufio.NewReaderSize(stdout, 256*1024)
 	c.started = true
+	c.mu.Unlock()
+
+	// Pump stdout into the demux. The goroutine exits when the server closes
+	// the pipe (server died or shutdown was called).
+	go c.readLoop()
 
 	// Initialize handshake.
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -79,16 +122,26 @@ func (c *ProcessClient) start() error {
 		c.shutdown()
 		return fmt.Errorf("lsp initialize: %w", err)
 	}
-	// Send initialized notification.
 	_ = c.notify("initialized", map[string]any{})
 	return nil
 }
 
 func (c *ProcessClient) shutdown() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return
+	}
+	c.closed = true
 	if c.cmd != nil && c.cmd.Process != nil {
 		_ = c.stdin.Close()
 		_ = c.cmd.Process.Kill()
-		c.started = false
+	}
+	c.started = false
+	// Fail any pending callers so they don't block forever.
+	for id, ch := range c.pending {
+		ch <- rpcResponse{err: fmt.Errorf("lsp client shutting down")}
+		delete(c.pending, id)
 	}
 }
 
@@ -97,45 +150,40 @@ func (c *ProcessClient) nextID() int {
 	return c.requestID
 }
 
-// call sends a JSON-RPC request and reads the response.
+// call sends a JSON-RPC request and blocks until the server replies with a
+// matching id (or ctx fires).
 func (c *ProcessClient) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
+	if c.closed {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("lsp client closed")
+	}
 	id := c.nextID()
+	ch := make(chan rpcResponse, 1)
+	c.pending[id] = ch
+	c.mu.Unlock()
+
 	req := map[string]any{
 		"jsonrpc": "2.0",
 		"id":      id,
 		"method":  method,
 		"params":  params,
 	}
-	data, err := json.Marshal(req)
-	if err != nil {
-		return nil, err
-	}
-	header := fmt.Sprintf("Content-Length: %d\r\n\r\n", len(data))
-	if _, err := c.stdin.Write([]byte(header)); err != nil {
-		return nil, err
-	}
-	if _, err := c.stdin.Write(data); err != nil {
+	if err := c.writeMessage(req); err != nil {
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
 		return nil, err
 	}
 
-	// Read response with timeout.
-	type result struct {
-		data json.RawMessage
-		err  error
-	}
-	ch := make(chan result, 1)
-	go func() {
-		r, e := c.readResponse()
-		ch <- result{r, e}
-	}()
 	select {
 	case <-ctx.Done():
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
 		return nil, ctx.Err()
-	case res := <-ch:
-		return res.data, res.err
+	case resp := <-ch:
+		return resp.result, resp.err
 	}
 }
 
@@ -145,9 +193,18 @@ func (c *ProcessClient) notify(method string, params any) error {
 		"method":  method,
 		"params":  params,
 	}
+	return c.writeMessage(req)
+}
+
+func (c *ProcessClient) writeMessage(req map[string]any) error {
 	data, err := json.Marshal(req)
 	if err != nil {
 		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || c.stdin == nil {
+		return fmt.Errorf("lsp client closed")
 	}
 	header := fmt.Sprintf("Content-Length: %d\r\n\r\n", len(data))
 	if _, err := c.stdin.Write([]byte(header)); err != nil {
@@ -157,8 +214,62 @@ func (c *ProcessClient) notify(method string, params any) error {
 	return err
 }
 
-func (c *ProcessClient) readResponse() (json.RawMessage, error) {
-	// Read headers.
+// readLoop runs in its own goroutine, demuxes responses to pending callers
+// and notifications to in-process handlers.
+func (c *ProcessClient) readLoop() {
+	for {
+		body, err := c.readMessage()
+		if err != nil {
+			// Server closed or stream error -- fail outstanding calls.
+			c.mu.Lock()
+			for id, ch := range c.pending {
+				ch <- rpcResponse{err: err}
+				delete(c.pending, id)
+			}
+			c.mu.Unlock()
+			return
+		}
+		var envelope struct {
+			ID     *int            `json:"id"`
+			Result json.RawMessage `json:"result"`
+			Error  *struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params"`
+		}
+		if err := json.Unmarshal(body, &envelope); err != nil {
+			continue
+		}
+		if envelope.ID != nil && envelope.Method == "" {
+			// Response to a call.
+			c.mu.Lock()
+			ch, ok := c.pending[*envelope.ID]
+			if ok {
+				delete(c.pending, *envelope.ID)
+			}
+			c.mu.Unlock()
+			if !ok {
+				continue
+			}
+			if envelope.Error != nil {
+				ch <- rpcResponse{err: fmt.Errorf("lsp error %d: %s", envelope.Error.Code, envelope.Error.Message)}
+			} else {
+				ch <- rpcResponse{result: envelope.Result}
+			}
+			continue
+		}
+		// Notification (no id, has method) or server-to-client request (id +
+		// method, requires reply -- we don't implement those today, just
+		// ignore so the server doesn't block).
+		if envelope.Method == "textDocument/publishDiagnostics" {
+			c.handlePublishDiagnostics(envelope.Params)
+		}
+	}
+}
+
+func (c *ProcessClient) readMessage() ([]byte, error) {
 	contentLength := 0
 	for {
 		line, err := c.stdout.ReadString('\n')
@@ -181,34 +292,81 @@ func (c *ProcessClient) readResponse() (json.RawMessage, error) {
 	if _, err := io.ReadFull(c.stdout, body); err != nil {
 		return nil, err
 	}
-	var resp struct {
-		ID     *int            `json:"id"`
-		Result json.RawMessage `json:"result"`
-		Error  *struct {
-			Code    int    `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, err
-	}
-	if resp.Error != nil {
-		return nil, fmt.Errorf("lsp error %d: %s", resp.Error.Code, resp.Error.Message)
-	}
-	return resp.Result, nil
+	return body, nil
 }
 
-// Diagnostics returns diagnostics for a file.
+func (c *ProcessClient) handlePublishDiagnostics(params json.RawMessage) {
+	var payload struct {
+		URI         string `json:"uri"`
+		Diagnostics []struct {
+			Range struct {
+				Start struct {
+					Line      int `json:"line"`
+					Character int `json:"character"`
+				} `json:"start"`
+			} `json:"range"`
+			Severity int    `json:"severity"`
+			Message  string `json:"message"`
+		} `json:"diagnostics"`
+	}
+	if err := json.Unmarshal(params, &payload); err != nil {
+		return
+	}
+	out := make([]Diagnostic, 0, len(payload.Diagnostics))
+	for _, d := range payload.Diagnostics {
+		out = append(out, Diagnostic{
+			File:     uriToPath(payload.URI),
+			Line:     d.Range.Start.Line + 1,
+			Severity: severityName(d.Severity),
+			Message:  d.Message,
+		})
+	}
+	c.diagMu.Lock()
+	c.diagByURI[payload.URI] = out
+	waiters := c.diagWaiters[payload.URI]
+	delete(c.diagWaiters, payload.URI)
+	c.diagMu.Unlock()
+	for _, w := range waiters {
+		close(w)
+	}
+}
+
+func severityName(s int) string {
+	switch s {
+	case 1:
+		return "error"
+	case 2:
+		return "warning"
+	case 3:
+		return "info"
+	case 4:
+		return "hint"
+	default:
+		return "unknown"
+	}
+}
+
+// Diagnostics opens the file in the server and waits for the next
+// publishDiagnostics notification for that URI, up to 5 seconds. If the
+// server already cached diagnostics for the URI from a prior open, returns
+// them immediately.
 func (c *ProcessClient) Diagnostics(file string) ([]Diagnostic, error) {
 	if err := c.start(); err != nil {
 		return nil, err
 	}
-	// Open the file to trigger diagnostics.
 	content, err := os.ReadFile(file)
 	if err != nil {
 		return nil, err
 	}
 	uri := fileURI(file)
+
+	// Subscribe BEFORE didOpen so we don't race a fast server.
+	wait := make(chan struct{})
+	c.diagMu.Lock()
+	cached, hasCached := c.diagByURI[uri]
+	c.diagWaiters[uri] = append(c.diagWaiters[uri], wait)
+	c.diagMu.Unlock()
+
 	_ = c.notify("textDocument/didOpen", map[string]any{
 		"textDocument": map[string]any{
 			"uri":        uri,
@@ -217,11 +375,24 @@ func (c *ProcessClient) Diagnostics(file string) ([]Diagnostic, error) {
 			"text":       string(content),
 		},
 	})
-	// Give server a moment to compute diagnostics.
-	time.Sleep(2 * time.Second)
-	// LSP diagnostics come via notifications, not request/response.
-	// For simplicity, return empty - real implementation would need async notification handling.
-	return nil, nil
+
+	if hasCached && len(cached) > 0 {
+		// We've already got a previous batch. Still wait briefly in case
+		// the server republishes for the new didOpen.
+	}
+
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-wait:
+	case <-timer.C:
+		// Fall back to whatever we have (possibly stale, possibly empty).
+	}
+
+	c.diagMu.RLock()
+	diags := append([]Diagnostic(nil), c.diagByURI[uri]...)
+	c.diagMu.RUnlock()
+	return diags, nil
 }
 
 // Definition returns the definition location for a symbol.
@@ -283,8 +454,13 @@ func fileURI(path string) string {
 	return "file://" + path
 }
 
+func uriToPath(uri string) string {
+	path := strings.TrimPrefix(uri, "file://")
+	path = strings.TrimPrefix(path, "/")
+	return path
+}
+
 func parseLocations(data json.RawMessage) []Location {
-	// Try as array of locations.
 	var locs []struct {
 		URI   string `json:"uri"`
 		Range struct {
@@ -305,7 +481,6 @@ func parseLocations(data json.RawMessage) []Location {
 		}
 		return result
 	}
-	// Try as single location.
 	var single struct {
 		URI   string `json:"uri"`
 		Range struct {
@@ -326,7 +501,6 @@ func parseLocations(data json.RawMessage) []Location {
 }
 
 func parseSymbolNames(data json.RawMessage) []string {
-	// DocumentSymbol format.
 	var docSymbols []struct {
 		Name     string `json:"name"`
 		Children []struct {
@@ -343,7 +517,6 @@ func parseSymbolNames(data json.RawMessage) []string {
 		}
 		return names
 	}
-	// SymbolInformation format.
 	var symInfos []struct {
 		Name string `json:"name"`
 	}
