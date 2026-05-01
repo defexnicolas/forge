@@ -147,11 +147,12 @@ func InstallBuiltin(cwd, name string) error {
 	return fmt.Errorf("skill not found: %s", name)
 }
 
-// ScanLocal returns skills found in .forge/skills/ directories.
+// ScanLocal returns skills found in .forge/skills/ directories and any
+// plugin-shipped skills/ subdirectories registered via Options.PluginSkillDirs.
 func (m *Manager) ScanLocal() []Skill {
 	var skills []Skill
 	seen := map[string]bool{}
-	for _, dir := range skillSearchDirs(m.cwd) {
+	for _, dir := range m.searchDirs() {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			continue
@@ -201,6 +202,9 @@ func (m *Manager) RemoveInstalled(name string) (Skill, error) {
 	skill, ok := m.FindInstalled(name)
 	if !ok {
 		return Skill{}, fmt.Errorf("installed skill not found: %s", name)
+	}
+	if skill.Source == "plugin" {
+		return Skill{}, fmt.Errorf("plugin-shipped skill is read-only; disable the plugin instead")
 	}
 	if skill.Source != "project" && skill.Source != "legacy" {
 		return Skill{}, fmt.Errorf("global install is read-only from Forge")
@@ -259,6 +263,8 @@ func isPathWithin(path, root string) bool {
 func installedSource(dir string) string {
 	clean := filepath.ToSlash(dir)
 	switch {
+	case strings.Contains(clean, "/plugins/"):
+		return "plugin"
 	case strings.Contains(clean, ".agents/skills"):
 		return "project"
 	case strings.Contains(clean, ".codex/skills"):

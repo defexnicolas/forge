@@ -23,7 +23,7 @@ type SkillDetail struct {
 
 // LoadSkill reads a SKILL.md from a skills directory and parses its frontmatter.
 func (m *Manager) LoadSkill(name string) (*SkillDetail, error) {
-	for _, root := range skillSearchDirs(m.cwd) {
+	for _, root := range m.searchDirs() {
 		skillFile := filepath.Join(root, name, "SKILL.md")
 		data, err := os.ReadFile(skillFile)
 		if err != nil {

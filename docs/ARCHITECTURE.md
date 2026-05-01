@@ -782,17 +782,20 @@ El Plugin Runtime debe reconocer plugins con o sin `.claude-plugin/plugin.json`.
 Estado actual:
 
 - Descubre plugins en `.forge/plugins/`, `~/.forge/plugins/`, `.claude/plugins/` y `~/.claude/plugins/`.
-- Lee metadata basica desde `.claude-plugin/plugin.json`.
+- Lee metadata basica desde `.claude-plugin/plugin.json` (incluyendo `user_config: { KEY: VAL }`).
 - Autodetecta directorios compatibles como `skills/`, `commands/`, `agents/`, `hooks/`, `output-styles/`, `bin/`, `.mcp.json`, `.lsp.json`, `settings.json` y `.forge/plugin.toml`.
 - Puede listar commands y agents Markdown desde plugins.
 - Puede persistir estado enabled/disabled por proyecto.
 - Puede cargar hooks y `.mcp.json` de plugins habilitados desde el arranque de la app.
+- Puede cargar `skills/` de plugins habilitados pasando los paths como `Options.PluginSkillDirs` al skills manager. Las skills shipeadas por un plugin reportan `Source = "plugin"` y son read-only desde Forge (deshabilitar el plugin para "removerlas").
+- `Plugin.CompatibilityStatus()` retorna `"ready"` si todos los componentes presentes son soportados, `"partial"` si hay alguno pendiente, y `"discovered"` si el directorio existe pero no tiene componentes reconocidos.
+- `plugins.ExpandVars(p, s)` resuelve `${CLAUDE_PLUGIN_ROOT}` -> `p.Path` y `${user_config.KEY}` -> `p.UserConfig[KEY]`. Otras formas `${VAR}` se dejan literales.
 
 Pendiente:
 
 - Instalar/remover plugins desde marketplace.
-- Cargar LSP servers, output styles y settings desde plugins de forma integrada.
-- Resolver variables como `${CLAUDE_PLUGIN_ROOT}`, `${FORGE_PLUGIN_ROOT}` y `${user_config.KEY}`.
+- Cargar LSP servers, output styles y settings desde plugins de forma integrada (output-styles necesita primero un runtime de output-styles propio; settings.json necesita un merger seguro que solo aplique permission/env keys).
+- Aliasar `${FORGE_PLUGIN_ROOT}` como sinonimo de `${CLAUDE_PLUGIN_ROOT}` para compatibilidad cruzada.
 - Registrar plugins instalados en SQLite.
 
 ```text

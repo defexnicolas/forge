@@ -328,3 +328,68 @@ func writeSkill(t *testing.T, dir, name, description string) {
 		t.Fatal(err)
 	}
 }
+
+func TestManagerScansPluginSkillDirs(t *testing.T) {
+	cwd := t.TempDir()
+	pluginRoot := filepath.Join(cwd, ".forge", "plugins", "demo", "skills")
+	writeSkill(t, filepath.Join(pluginRoot, "from-plugin"), "from-plugin", "shipped by demo plugin")
+
+	mgr := NewManager(cwd, Options{
+		CLI:             "npx",
+		PluginSkillDirs: []string{pluginRoot},
+	})
+	scanned := mgr.ScanLocal()
+	var names []string
+	for _, s := range scanned {
+		names = append(names, s.Name)
+	}
+	found := false
+	for _, s := range scanned {
+		if s.Name == "from-plugin" {
+			if s.Source != "plugin" {
+				t.Errorf("plugin-shipped skill should report Source=plugin, got %q", s.Source)
+			}
+			if s.Description != "shipped by demo plugin" {
+				t.Errorf("description not propagated, got %q", s.Description)
+			}
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected to find from-plugin via PluginSkillDirs, got %v", names)
+	}
+
+	// Removing a plugin-shipped skill must be refused.
+	if _, err := mgr.RemoveInstalled("from-plugin"); err == nil {
+		t.Fatal("RemoveInstalled on a plugin-shipped skill should return an error")
+	}
+}
+
+func TestManagerProjectShadowsPluginSkill(t *testing.T) {
+	cwd := t.TempDir()
+	pluginDir := filepath.Join(cwd, ".forge", "plugins", "demo", "skills")
+	writeSkill(t, filepath.Join(pluginDir, "shared"), "shared", "from plugin")
+	projectDir := filepath.Join(cwd, ".forge", "skills")
+	writeSkill(t, filepath.Join(projectDir, "shared"), "shared", "from project")
+
+	mgr := NewManager(cwd, Options{
+		CLI:             "npx",
+		PluginSkillDirs: []string{pluginDir},
+	})
+	scanned := mgr.ScanLocal()
+	var description string
+	matchCount := 0
+	for _, s := range scanned {
+		if s.Name == "shared" {
+			matchCount++
+			description = s.Description
+		}
+	}
+	if matchCount != 1 {
+		t.Fatalf("expected exactly one 'shared' skill, got %d", matchCount)
+	}
+	if !strings.Contains(description, "project") {
+		t.Errorf("project skill should win shadow, got description=%q", description)
+	}
+}

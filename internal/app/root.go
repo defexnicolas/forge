@@ -111,9 +111,10 @@ func NewRootCommand() *cobra.Command {
 
 			hookRunner := hooks.NewRunner(cwd)
 
-			// Load MCP and hooks from discovered plugins.
+			// Load MCP, hooks, and skill dirs from discovered plugins.
 			pluginMgr := plugins.NewManager(cwd)
 			enabledState := plugins.LoadEnabledState(cwd)
+			var pluginSkillDirs []string
 			if discoveredPlugins, err := pluginMgr.Discover(); err == nil {
 				for _, p := range discoveredPlugins {
 					if enabledState.Disabled[p.Name] {
@@ -128,6 +129,9 @@ func NewRootCommand() *cobra.Command {
 						if err := hookRunner.Load(hooksPath); err != nil {
 							fmt.Fprintf(os.Stderr, "plugin %s hooks: %s\n", p.Name, err)
 						}
+					}
+					if skillsDir := p.SkillsDir(); skillsDir != "" {
+						pluginSkillDirs = append(pluginSkillDirs, skillsDir)
 					}
 				}
 			}
@@ -154,13 +158,14 @@ func NewRootCommand() *cobra.Command {
 				Session:      sessionStore,
 				ProjectState: projectSvc,
 				Skills: skills.NewManager(cwd, skills.Options{
-					CLI:          cfg.Skills.CLI,
-					DirectoryURL: cfg.Skills.DirectoryURL,
-					Repositories: cfg.Skills.Repositories,
-					Agent:        cfg.Skills.Agent,
-					InstallScope: cfg.Skills.InstallScope,
-					Copy:         cfg.Skills.Copy,
-					Installer:    cfg.Skills.Installer,
+					CLI:             cfg.Skills.CLI,
+					DirectoryURL:    cfg.Skills.DirectoryURL,
+					Repositories:    cfg.Skills.Repositories,
+					Agent:           cfg.Skills.Agent,
+					InstallScope:    cfg.Skills.InstallScope,
+					Copy:            cfg.Skills.Copy,
+					Installer:       cfg.Skills.Installer,
+					PluginSkillDirs: pluginSkillDirs,
 				}),
 				Plugins:  pluginMgr,
 				MCP:      mcpManager,

@@ -13,6 +13,7 @@ type Plugin struct {
 	Source      string
 	Description string
 	Version     string
+	UserConfig  map[string]string
 }
 
 type Manager struct {
@@ -76,6 +77,7 @@ func discoverRoot(root, source string) ([]Plugin, error) {
 			}
 			plugin.Description = manifest.Description
 			plugin.Version = manifest.Version
+			plugin.UserConfig = manifest.UserConfig
 		} else if !looksLikePlugin(path) {
 			continue
 		}
@@ -85,9 +87,10 @@ func discoverRoot(root, source string) ([]Plugin, error) {
 }
 
 type claudeManifest struct {
-	Name        string `json:"name"`
-	Version     string `json:"version"`
-	Description string `json:"description"`
+	Name        string            `json:"name"`
+	Version     string            `json:"version"`
+	Description string            `json:"description"`
+	UserConfig  map[string]string `json:"user_config,omitempty"`
 }
 
 func readClaudeManifest(path string) (claudeManifest, error) {
@@ -155,6 +158,49 @@ func (p Plugin) HooksPath() string {
 	return ""
 }
 
+// SkillsDir returns the path to the skills/ subdirectory of a plugin if one
+// exists, so the skills manager can include it in its search dirs.
+func (p Plugin) SkillsDir() string {
+	path := filepath.Join(p.Path, "skills")
+	if info, err := os.Stat(path); err == nil && info.IsDir() {
+		return path
+	}
+	return ""
+}
+
+// LSPConfigPath returns the path to a plugin-shipped .lsp.json. Reading and
+// merging is the LSP runtime's responsibility (item 6 of the roadmap).
+func (p Plugin) LSPConfigPath() string {
+	path := filepath.Join(p.Path, ".lsp.json")
+	if _, err := os.Stat(path); err == nil {
+		return path
+	}
+	return ""
+}
+
+// SettingsPath returns the path to a plugin-shipped settings.json (claude-style
+// permissions/env block). Reading and merging is intentionally NOT done here
+// -- the app loader decides which keys are safe to apply.
+func (p Plugin) SettingsPath() string {
+	path := filepath.Join(p.Path, "settings.json")
+	if _, err := os.Stat(path); err == nil {
+		return path
+	}
+	return ""
+}
+
+// OutputStylesDir returns the path to the output-styles/ subdirectory of a
+// plugin if one exists. Forge does not yet have an output-styles runtime, so
+// for now it stays in PendingComponents -- the path getter exists so future
+// loaders don't need to re-grow this stat boilerplate.
+func (p Plugin) OutputStylesDir() string {
+	path := filepath.Join(p.Path, "output-styles")
+	if info, err := os.Stat(path); err == nil && info.IsDir() {
+		return path
+	}
+	return ""
+}
+
 func (p Plugin) Components() []string {
 	var out []string
 	for _, candidate := range []string{"skills", "commands", "agents", "hooks", ".mcp.json", "bin", "output-styles", ".lsp.json", "settings.json"} {
@@ -167,7 +213,8 @@ func (p Plugin) Components() []string {
 
 func (p Plugin) SupportedComponents() []string {
 	var out []string
-	for _, candidate := range []string{"commands", "agents", "hooks", ".mcp.json"} {
+	// "skills" moved here once skillSearchDirs honors plugin paths.
+	for _, candidate := range []string{"commands", "agents", "hooks", ".mcp.json", "skills"} {
 		if _, err := os.Stat(filepath.Join(p.Path, candidate)); err == nil {
 			out = append(out, candidate)
 		}
@@ -177,7 +224,11 @@ func (p Plugin) SupportedComponents() []string {
 
 func (p Plugin) PendingComponents() []string {
 	var out []string
-	for _, candidate := range []string{"skills", "bin", "output-styles", ".lsp.json", "settings.json"} {
+	// "bin": Forge does not run plugin binaries.
+	// "output-styles": no output-styles runtime yet.
+	// ".lsp.json": LSP config merge is item 6 of the roadmap.
+	// "settings.json": no merger that is safe enough to enable by default yet.
+	for _, candidate := range []string{"bin", "output-styles", ".lsp.json", "settings.json"} {
 		if _, err := os.Stat(filepath.Join(p.Path, candidate)); err == nil {
 			out = append(out, candidate)
 		}
@@ -186,11 +237,13 @@ func (p Plugin) PendingComponents() []string {
 }
 
 func (p Plugin) CompatibilityStatus() string {
-	if len(p.PendingComponents()) > 0 {
+	pending := p.PendingComponents()
+	supported := p.SupportedComponents()
+	if len(pending) > 0 {
 		return "partial"
 	}
-	if len(p.SupportedComponents()) > 0 {
-		return "partial"
+	if len(supported) > 0 {
+		return "ready"
 	}
 	return "discovered"
 }

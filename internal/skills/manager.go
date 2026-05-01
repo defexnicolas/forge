@@ -28,6 +28,10 @@ type Options struct {
 	Copy         bool
 	DirectoryURL string
 	Installer    string // legacy; no longer used for Skills CLI operations
+	// PluginSkillDirs is appended to the search path so SKILL.md files inside
+	// enabled plugins (`<plugin>/skills/<name>/SKILL.md`) become discoverable
+	// without copying them into .forge/skills.
+	PluginSkillDirs []string
 }
 
 type Skill struct {
@@ -729,5 +733,14 @@ func skillSearchDirs(cwd string) []string {
 			filepath.Join(home, ".forge", "skills"),
 		)
 	}
+	return dirs
+}
+
+// searchDirs is the Manager-bound view that includes plugin-shipped skills
+// dirs, ordered after the user-controlled locations so a project skill always
+// wins a name collision against a plugin one.
+func (m *Manager) searchDirs() []string {
+	dirs := skillSearchDirs(m.cwd)
+	dirs = append(dirs, m.options.PluginSkillDirs...)
 	return dirs
 }
