@@ -99,6 +99,7 @@ func NewRootCommand() *cobra.Command {
 			if err := mcpManager.Start(context.Background()); err != nil {
 				fmt.Fprintf(os.Stderr, "mcp: %s\n", err)
 			}
+			tools.RegisterMCPResourceTools(registry, mcpResourceAdapter{m: mcpManager})
 
 			providers := llm.NewRegistry()
 			providers.Register(llm.NewOpenAICompatible("openai_compatible", cfg.Providers.OpenAICompatible))
