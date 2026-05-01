@@ -32,6 +32,15 @@ type Options struct {
 	// enabled plugins (`<plugin>/skills/<name>/SKILL.md`) become discoverable
 	// without copying them into .forge/skills.
 	PluginSkillDirs []string
+	// CacheDir overrides where directory + repository caches are read and
+	// written. Empty falls back to <cwd>/.forge/cache/skills (the original
+	// per-workspace location). The Hub passes ~/.codex/cache/skills here so
+	// every workspace shares a single skills-directory scrape.
+	CacheDir string
+	// InstallDir overrides where InstallBuiltin and the project skills
+	// search dir resolve. Empty keeps the existing <cwd>/.forge/skills
+	// layout. NewGlobalManager uses ~/.codex/skills.
+	InstallDir string
 }
 
 type Skill struct {
@@ -477,7 +486,7 @@ func (m *Manager) readDirectoryCache() ([]Skill, bool) {
 }
 
 func (m *Manager) writeDirectoryCache(listed []Skill) error {
-	dir := filepath.Join(m.cwd, ".forge", "cache", "skills")
+	dir := m.cacheBaseDir()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
@@ -513,12 +522,19 @@ func (m *Manager) DirectoryCacheInfo() CacheInfo {
 	return info
 }
 
+func (m *Manager) cacheBaseDir() string {
+	if m.options.CacheDir != "" {
+		return m.options.CacheDir
+	}
+	return filepath.Join(m.cwd, ".forge", "cache", "skills")
+}
+
 func (m *Manager) directoryCachePath() string {
-	return filepath.Join(m.cwd, ".forge", "cache", "skills", "skills_sh.json")
+	return filepath.Join(m.cacheBaseDir(), "skills_sh.json")
 }
 
 func (m *Manager) writeRepositoryCache(repo string, listed []Skill) error {
-	dir := filepath.Join(m.cwd, ".forge", "cache", "skills")
+	dir := m.cacheBaseDir()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
@@ -535,7 +551,7 @@ func (m *Manager) writeRepositoryCache(repo string, listed []Skill) error {
 }
 
 func (m *Manager) repositoryCachePath(repo string) string {
-	return filepath.Join(m.cwd, ".forge", "cache", "skills", safeCacheName(repo)+".json")
+	return filepath.Join(m.cacheBaseDir(), safeCacheName(repo)+".json")
 }
 
 func cacheableSkills(repo string, listed []Skill) []Skill {
