@@ -15,6 +15,7 @@ import (
 	"forge/internal/gitops"
 	"forge/internal/hooks"
 	"forge/internal/llm"
+	"forge/internal/lsp"
 	"forge/internal/mcp"
 	"forge/internal/plugins"
 	"forge/internal/projectstate"
@@ -40,6 +41,7 @@ type Options struct {
 	Hooks        *hooks.Runner
 	ProjectState *projectstate.Service
 	GitState     gitops.SessionState
+	LSP          lsp.Client
 }
 
 type App struct{ options Options }
@@ -206,6 +208,9 @@ func newModel(options Options) model {
 	runtime.Builder.History = options.Session
 	runtime.Builder.Skills = options.Skills
 	runtime.Builder.ProjectState = options.ProjectState
+	if options.LSP != nil {
+		runtime.Builder.LSP = options.LSP
+	}
 	runtime.Hooks = options.Hooks
 	runtime.SetGitSessionState(options.GitState)
 

@@ -40,7 +40,8 @@
       "Bash(git commit -m ' *)",
       "Bash(cp forge.exe \"C:/Users/nicod/Downloads/snake29/forge.exe\")",
       "Read(//c/Users/nicod/Downloads/snake29/**)",
-      "Bash(xargs basename *)"
+      "Bash(xargs basename *)",
+      "Bash(go add *)"
     ]
   }
 }

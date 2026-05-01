@@ -13,6 +13,7 @@ import (
 	"forge/internal/gitops"
 	"forge/internal/hooks"
 	"forge/internal/llm"
+	"forge/internal/lsp"
 	"forge/internal/mcp"
 	"forge/internal/plugins"
 	"forge/internal/projectstate"
@@ -112,10 +113,11 @@ func NewRootCommand() *cobra.Command {
 
 			hookRunner := hooks.NewRunner(cwd)
 
-			// Load MCP, hooks, and skill dirs from discovered plugins.
+			// Load MCP, hooks, skill dirs, and LSP configs from discovered plugins.
 			pluginMgr := plugins.NewManager(cwd)
 			enabledState := plugins.LoadEnabledState(cwd)
 			var pluginSkillDirs []string
+			var pluginLSPConfigs []string
 			if discoveredPlugins, err := pluginMgr.Discover(); err == nil {
 				for _, p := range discoveredPlugins {
 					if enabledState.Disabled[p.Name] {
@@ -134,10 +136,24 @@ func NewRootCommand() *cobra.Command {
 					if skillsDir := p.SkillsDir(); skillsDir != "" {
 						pluginSkillDirs = append(pluginSkillDirs, skillsDir)
 					}
+					if lspPath := p.LSPConfigPath(); lspPath != "" {
+						pluginLSPConfigs = append(pluginLSPConfigs, lspPath)
+					}
 				}
 			}
 			if len(pluginSkillDirs) > 0 {
 				tools.RegisterRunSkillTool(registry, pluginSkillDirs)
+			}
+
+			// Build the LSP router. LoadConfig is forgiving: missing project
+			// .lsp.json is fine, the router just stubs every call.
+			lspConfig, err := lsp.LoadConfig(cwd, pluginLSPConfigs...)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "lsp config: %s\n", err)
+			}
+			var lspClient lsp.Client
+			if len(lspConfig.ByExt) > 0 {
+				lspClient = lsp.NewRouter(cwd, lspConfig)
 			}
 
 			var projectSvc *projectstate.Service
@@ -175,6 +191,7 @@ func NewRootCommand() *cobra.Command {
 				MCP:      mcpManager,
 				Hooks:    hookRunner,
 				GitState: gitState,
+				LSP:      lspClient,
 			})
 
 			return app.Run(context.Background())
