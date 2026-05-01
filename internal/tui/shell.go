@@ -83,11 +83,12 @@ const (
 	viewSessions appView = "sessions"
 	viewTools    appView = "tools"
 	viewMCPs     appView = "mcps"
-	viewSettings appView = "settings"
-	viewChat     appView = "chat"
-	viewPlan     appView = "plan"
-	viewDiff     appView = "diff"
-	viewHub      appView = "hub"
+	viewSettings  appView = "settings"
+	viewChat      appView = "chat"
+	viewPlan      appView = "plan"
+	viewDiff      appView = "diff"
+	viewHub       appView = "hub"
+	viewMigration appView = "migration"
 )
 
 const shellSidebarWidth = 24
@@ -128,9 +129,10 @@ type shellModel struct {
 	yarnSettingsForm yarnSettingsForm
 	themeForm        themeForm
 	skillsForm       skillsForm
-	hubSettingsIndex int
-	statusMessage    string
-	lastEscTime      time.Time
+	hubSettingsIndex   int
+	migrationProposals []migrationProposal
+	statusMessage      string
+	lastEscTime        time.Time
 }
 
 func newShellModel(options ShellOptions) shellModel {
@@ -169,6 +171,25 @@ func newShellModel(options ShellOptions) shellModel {
 	m.loadExplorerDir(dir)
 	if options.InitialWorkspace != nil {
 		m.attachWorkspace(options.InitialWorkspace)
+	}
+	// Apply persisted theme from the global config so the Hub paints with
+	// the user's choice from the very first frame.
+	if g, err := globalconfig.Load(); err == nil && g.Theme != nil && *g.Theme != "" {
+		m.theme = GetTheme(*g.Theme)
+	}
+	// First-run migration check: if the user has Recent / Pinned workspaces
+	// with theme/models/yarn we now serve from the global config, surface
+	// the wizard before they touch anything else.
+	if !hubState.MigrationDone && options.InitialWorkspace == nil {
+		props := scanWorkspacesForMigration(hubState)
+		if len(props) > 0 {
+			m.migrationProposals = props
+			m.activeView = viewMigration
+		} else {
+			// Nothing to migrate; flip the flag so we don't keep scanning.
+			m.hubState.MigrationDone = true
+			m.saveHubState()
+		}
 	}
 	return m
 }
@@ -306,6 +327,12 @@ func (m *shellModel) handleEsc() (tea.Model, tea.Cmd) {
 		}
 		return *m, nil
 	}
+	if m.activeView == viewMigration {
+		// Esc dismisses the wizard without applying. Mark Migration done
+		// regardless so the wizard does not re-trigger on the next launch.
+		m.dismissMigration()
+		return *m, nil
+	}
 	if m.activeView != viewExplorer {
 		m.activeView = viewExplorer
 		m.selectSidebarView(viewExplorer)
@@ -402,6 +429,9 @@ func (m *shellModel) handleEnter() (tea.Model, tea.Cmd) {
 	}
 	if m.mode == modeHub && m.activePane == paneMain {
 		switch m.activeView {
+		case viewMigration:
+			m.acceptMigration()
+			return *m, nil
 		case viewExplorer:
 			m.enterExplorerSelection()
 			return *m, nil
@@ -690,6 +720,8 @@ func (m shellModel) hubView() string {
 
 func (m shellModel) renderHubMain() string {
 	switch m.activeView {
+	case viewMigration:
+		return m.renderMigrationWizard()
 	case viewExplorer:
 		return m.renderExplorer()
 	case viewRecent:
