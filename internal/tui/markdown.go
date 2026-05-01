@@ -178,15 +178,15 @@ func formatStreamingText(raw string, thinkEnabled bool, theme Theme) string {
 		if end < 0 {
 			// Still mid-stream inside <think> — no closing tag yet.
 			if thinkEnabled {
-				b.WriteString(theme.Muted.Italic(true).Render("« thinking: " + strings.TrimSpace(rest) + " »"))
+				b.WriteString(theme.Muted.Italic(true).Render("[ thinking: " + strings.TrimSpace(rest) + " ]"))
 			} else {
-				b.WriteString(theme.Muted.Render("[thinking…]"))
+				b.WriteString(theme.Muted.Render("[thinking...]"))
 			}
 			return b.String()
 		}
 		thinking := strings.TrimSpace(rest[:end])
 		if thinkEnabled {
-			b.WriteString(theme.Muted.Italic(true).Render("« thinking: " + thinking + " »"))
+			b.WriteString(theme.Muted.Italic(true).Render("[ thinking: " + thinking + " ]"))
 		} else {
 			b.WriteString(theme.Muted.Render("[thinking elided]"))
 		}

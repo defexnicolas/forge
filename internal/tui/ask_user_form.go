@@ -203,7 +203,7 @@ func (f askUserForm) View() string {
 
 	b.WriteString("\n")
 	if len(f.request.Options) > 0 {
-		b.WriteString(t.Muted.Render("  ↑/↓ select · Enter pick/submit · Esc skip · Shift+Enter newline"))
+		b.WriteString(t.Muted.Render("  Up/Dn select | Enter pick/submit | Esc skip | Shift+Enter newline"))
 	} else {
 		b.WriteString(t.Muted.Render("  Enter submit · Shift+Enter newline · Esc skip"))
 	}

@@ -91,7 +91,7 @@ func RenderPlanPanel(taskList []tasks.Task, hasPlan bool, height int, theme Them
 	return header + "\n" + phaseLine + "\n" + box.Render(content)
 }
 
-// renderPhaseIndicator draws EXPLORE → DESIGN → REVIEW → EXECUTE with the
+// renderPhaseIndicator draws EXPLORE -> DESIGN -> REVIEW -> EXECUTE with the
 // active phase highlighted. Kept single-line by abbreviating when the panel
 // width would otherwise force wrap.
 func renderPhaseIndicator(active planPhase, theme Theme) string {
@@ -114,7 +114,7 @@ func renderPhaseIndicator(active planPhase, theme Theme) string {
 		}
 		parts = append(parts, label)
 	}
-	return " " + strings.Join(parts, theme.Muted.Render(" → "))
+	return " " + strings.Join(parts, theme.Muted.Render(" -> "))
 }
 
 func min(a, b int) int {

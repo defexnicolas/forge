@@ -100,9 +100,9 @@ func FilterHistory(history []string, query string, currentIdx int) ([]string, []
 	for i, entry := range history {
 		entryLines := strings.Count(entry, "\n") + 1
 		if strings.Contains(strings.ToLower(entry), lower) {
-			marker := "> "
+			marker := "  "
 			if matchCount == currentIdx {
-				marker = "▶ "
+				marker = "> "
 			}
 			result[i] = marker + entry
 			positions = append(positions, lineOffset)

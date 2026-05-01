@@ -183,7 +183,7 @@ func (f approvalForm) View() string {
 		deny = t.ErrorStyle.Render("> " + deny + " <")
 	}
 	b.WriteString(approve + "    " + deny + "\n")
-	b.WriteString("\n" + t.Muted.Render("  ←/→ choose  ↑/↓ PgUp/PgDn Home/End scroll  Enter/y approve  Esc/n reject"))
+	b.WriteString("\n" + t.Muted.Render("  Left/Right choose  Up/Dn PgUp/PgDn Home/End scroll  Enter/y approve  Esc/n reject"))
 
 	return box.Render(b.String())
 }

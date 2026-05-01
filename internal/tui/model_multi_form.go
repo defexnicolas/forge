@@ -391,7 +391,7 @@ func (f modelMultiForm) viewReuseStep() string {
 	t := f.theme
 	role := f.roles[f.roleIdx]
 	var b strings.Builder
-	b.WriteString(t.TableHeader.Render("Model Multi — Reuse?"))
+	b.WriteString(t.TableHeader.Render("Model Multi -- Reuse?"))
 	b.WriteString("\n\n")
 	b.WriteString(t.Muted.Render(fmt.Sprintf("Role: %s (%d/%d)", role.label, f.roleIdx+1, len(f.roles))))
 	b.WriteString("\n")

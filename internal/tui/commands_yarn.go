@@ -375,7 +375,7 @@ func (m *model) yarnProbe() string {
 		return t.ErrorStyle.Render("Probe failed: " + err.Error())
 	}
 	if info == nil || info.LoadedContextLength <= 0 {
-		return t.Warning.Render("Provider did not report loaded_context_length — profile caps in effect.")
+		return t.Warning.Render("Provider did not report loaded_context_length -- profile caps in effect.")
 	}
 	detected := &config.DetectedContext{
 		ModelID:             info.ID,

@@ -839,7 +839,7 @@ func (m *model) handleLine(line string) tea.Cmd {
 	// If the agent is waiting for user input (ask_user tool), send the answer.
 	if m.pendingAskUser != nil {
 		m.pendingAskUser.Response <- line
-		m.history = append(m.history, "    "+t.Muted.Render("→ ")+line)
+		m.history = append(m.history, "    "+t.Muted.Render("-> ")+line)
 		m.pendingAskUser = nil
 		return nil
 	}

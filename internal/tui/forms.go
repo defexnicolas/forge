@@ -54,10 +54,10 @@ func (m *model) handleFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 			if req != nil {
 				req.Response <- answer
 				if answer == "" {
-					m.history = append(m.history, "    "+m.theme.Muted.Render("→ (skipped)"))
+					m.history = append(m.history, "    "+m.theme.Muted.Render("-> (skipped)"))
 				} else {
 					for _, line := range strings.Split(answer, "\n") {
-						m.history = append(m.history, "    "+m.theme.Muted.Render("→ ")+line)
+						m.history = append(m.history, "    "+m.theme.Muted.Render("-> ")+line)
 					}
 				}
 			}

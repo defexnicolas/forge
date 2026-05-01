@@ -367,7 +367,7 @@ func (f modelForm) viewModelStep() string {
 		}
 	}
 
-	content += "\n" + t.Muted.Render("  Up/Down  Enter: pick model → choose context  Esc: cancel")
+	content += "\n" + t.Muted.Render("  Up/Down  Enter: pick model -> choose context  Esc: cancel")
 	return content
 }
 

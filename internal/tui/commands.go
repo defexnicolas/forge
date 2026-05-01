@@ -740,12 +740,12 @@ func (m *model) setMode(name, goal string) string {
 			return m.theme.Muted.Render("Plan mode entered. Send a message describing what you want planned; forge will interview you before drafting.")
 		}
 		if m.agentRunning {
-			return m.theme.Warning.Render("Plan mode entered — agent still running, interview will not auto-start.")
+			return m.theme.Warning.Render("Plan mode entered -- agent still running, interview will not auto-start.")
 		}
 		m.agentEvents = m.agentRuntime.Run(context.Background(), planInterviewPrompt(goal, false))
 		m.agentRunning = true
 		m.pendingCommand = waitForAgentEvent(m.agentEvents)
-		return m.theme.Success.Render("Entering plan mode — starting interview...")
+		return m.theme.Success.Render("Entering plan mode -- starting interview...")
 	}
 	if name == "explore" && m.showPlan {
 		m.showPlan = false
@@ -754,7 +754,7 @@ func (m *model) setMode(name, goal string) string {
 	if name == "build" {
 		m.showPlan = true
 		m.recalcLayout()
-		return m.theme.Success.Render("Build mode entered — execution will work through the approved checklist and still ask approval for each edit.")
+		return m.theme.Success.Render("Build mode entered -- execution will work through the approved checklist and still ask approval for each edit.")
 	}
 	// Mode shown in status bar; no inline message.
 	return ""
