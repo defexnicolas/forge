@@ -118,7 +118,15 @@ func (s *Store) Update(id, title, status, notes string) (Task, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	task, err := s.getLocked(id)
+	resolvedID := strings.TrimSpace(id)
+	if resolvedID == "" {
+		var err error
+		resolvedID, err = s.resolveTaskIDLocked(title)
+		if err != nil {
+			return Task{}, err
+		}
+	}
+	task, err := s.getLocked(resolvedID)
 	if err != nil {
 		return Task{}, err
 	}
@@ -140,6 +148,36 @@ func (s *Store) Update(id, title, status, notes string) (Task, error) {
 		return Task{}, fmt.Errorf("update task: %w", err)
 	}
 	return task, nil
+}
+
+func (s *Store) resolveTaskIDLocked(title string) (string, error) {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return "", fmt.Errorf("task_update requires id or title")
+	}
+	list, err := s.listLocked()
+	if err != nil {
+		return "", err
+	}
+	lower := strings.ToLower(title)
+	for _, task := range list {
+		if strings.EqualFold(strings.TrimSpace(task.Title), title) {
+			return task.ID, nil
+		}
+	}
+	var matches []Task
+	for _, task := range list {
+		if strings.Contains(strings.ToLower(strings.TrimSpace(task.Title)), lower) {
+			matches = append(matches, task)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0].ID, nil
+	}
+	if len(matches) > 1 {
+		return "", fmt.Errorf("task_update title matched multiple tasks: %s", title)
+	}
+	return "", fmt.Errorf("task not found for title: %s", title)
 }
 
 // Clear removes the current executable checklist. This is only for explicit

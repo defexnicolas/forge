@@ -82,6 +82,7 @@ const (
 	viewPinned    appView = "pinned"
 	viewSessions  appView = "sessions"
 	viewTools     appView = "tools"
+	viewSkills    appView = "skills"
 	viewMCPs      appView = "mcps"
 	viewSettings  appView = "settings"
 	viewChat      appView = "chat"
@@ -169,6 +170,11 @@ func newShellModel(options ShellOptions) shellModel {
 		activeView:    viewExplorer,
 		explorerDir:   dir,
 		explorerIndex: 0,
+		// hubState carries the just-loaded Pinned/Recent/LastHubDir/MigrationDone
+		// from disk. Forgetting to wire it here means loadExplorerDir below
+		// overwrites the file with a zero-value HubState (only LastHubDir set),
+		// silently wiping pinned and recent across restarts.
+		hubState: hubState,
 	}
 	m.loadExplorerDir(dir)
 	if options.InitialWorkspace != nil {
@@ -221,28 +227,34 @@ func (m shellModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.rotatePane(1)
 				return m, m.resizeHubChat()
 			}
-			return m, m.forwardHubChat(msg)
+			cmd := m.forwardHubChat(msg)
+			return m, cmd
 		}
 		if m.mode == modeWorkspace && m.activePane == paneInput && !m.workspaceHasModal() {
 			if msg.String() == "ctrl+w" || msg.Type == tea.KeyF6 {
 				m.rotatePane(1)
 				return m, m.resizeWorkspace()
 			}
-			return m, m.forwardWorkspace(msg)
+			cmd := m.forwardWorkspace(msg)
+			return m, cmd
 		}
 		if m.hubChatHasModal() {
-			return m, m.forwardHubChat(msg)
+			cmd := m.forwardHubChat(msg)
+			return m, cmd
 		}
 		if m.workspaceHasModal() {
-			return m, m.forwardWorkspace(msg)
+			cmd := m.forwardWorkspace(msg)
+			return m, cmd
 		}
 		return m.handleKey(msg)
 	default:
 		if m.mode == modeHub && m.activeView == viewChat && m.hubChat != nil {
-			return m, m.forwardHubChat(msg)
+			cmd := m.forwardHubChat(msg)
+			return m, cmd
 		}
 		if m.workspace != nil {
-			return m, m.forwardWorkspace(msg)
+			cmd := m.forwardWorkspace(msg)
+			return m, cmd
 		}
 	}
 	return m, nil
@@ -333,10 +345,12 @@ func (m *shellModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	if m.workspace != nil {
-		return *m, m.forwardWorkspace(msg)
+		cmd := m.forwardWorkspace(msg)
+		return *m, cmd
 	}
 	if m.mode == modeHub && m.activeView == viewChat && m.hubChat != nil {
-		return *m, m.forwardHubChat(msg)
+		cmd := m.forwardHubChat(msg)
+		return *m, cmd
 	}
 	return *m, nil
 }
@@ -405,7 +419,8 @@ func (m *shellModel) handleUp() (tea.Model, tea.Cmd) {
 		}
 	}
 	if m.workspace != nil {
-		return *m, m.forwardWorkspace(tea.KeyMsg{Type: tea.KeyUp})
+		cmd := m.forwardWorkspace(tea.KeyMsg{Type: tea.KeyUp})
+		return *m, cmd
 	}
 	return *m, nil
 }
@@ -441,7 +456,8 @@ func (m *shellModel) handleDown() (tea.Model, tea.Cmd) {
 		}
 	}
 	if m.workspace != nil {
-		return *m, m.forwardWorkspace(tea.KeyMsg{Type: tea.KeyDown})
+		cmd := m.forwardWorkspace(tea.KeyMsg{Type: tea.KeyDown})
+		return *m, cmd
 	}
 	return *m, nil
 }
@@ -633,7 +649,7 @@ func (m *shellModel) resizeWorkspace() tea.Cmd {
 		Width:  max(40, m.width-shellSidebarWidth-1),
 		Height: max(10, m.height),
 	})
-	if workspace, ok := updated.(model); ok {
+	if workspace, ok := normalizeChildModel(updated); ok {
 		m.workspace = &workspace
 		m.syncWorkspaceFocus()
 	}
@@ -649,7 +665,7 @@ func (m *shellModel) resizeHubChat() tea.Cmd {
 		Width:  max(40, m.width-shellSidebarWidth-1),
 		Height: max(10, m.height),
 	})
-	if chat, ok := updated.(model); ok {
+	if chat, ok := normalizeChildModel(updated); ok {
 		m.hubChat = &chat
 		m.syncHubChatFocus()
 	}
@@ -662,7 +678,7 @@ func (m *shellModel) forwardWorkspace(msg tea.Msg) tea.Cmd {
 	}
 	m.syncWorkspaceFocus()
 	updated, cmd := m.workspace.Update(msg)
-	if workspace, ok := updated.(model); ok {
+	if workspace, ok := normalizeChildModel(updated); ok {
 		m.workspace = &workspace
 		m.syncWorkspaceFocus()
 	}
@@ -675,15 +691,31 @@ func (m *shellModel) forwardHubChat(msg tea.Msg) tea.Cmd {
 	}
 	m.syncHubChatFocus()
 	updated, cmd := m.hubChat.Update(msg)
-	if chat, ok := updated.(model); ok {
+	if chat, ok := normalizeChildModel(updated); ok {
 		m.hubChat = &chat
 		m.syncHubChatFocus()
 	}
 	return cmd
 }
 
+func normalizeChildModel(updated tea.Model) (model, bool) {
+	switch v := updated.(type) {
+	case model:
+		return v, true
+	case *model:
+		if v != nil {
+			return *v, true
+		}
+	}
+	return model{}, false
+}
+
 func (m *shellModel) syncWorkspaceFocus() {
 	if m.workspace == nil {
+		return
+	}
+	if m.workspaceHasModal() {
+		m.workspace.input.Blur()
 		return
 	}
 	if m.mode == modeWorkspace && m.activePane == paneInput {
@@ -695,6 +727,10 @@ func (m *shellModel) syncWorkspaceFocus() {
 
 func (m *shellModel) syncHubChatFocus() {
 	if m.hubChat == nil {
+		return
+	}
+	if m.hubChatHasModal() {
+		m.hubChat.input.Blur()
 		return
 	}
 	if m.mode == modeHub && m.activeView == viewChat && m.activePane == paneInput {
@@ -751,6 +787,7 @@ func (m shellModel) currentSidebarItems() []shellSidebarItem {
 			{View: viewDiff, Label: "Diff", Hint: "git diff"},
 			{View: viewSessions, Label: "Sessions", Hint: "workspace logs"},
 			{View: viewTools, Label: "Tools", Hint: "registered tools"},
+			{View: viewSkills, Label: "Skills", Hint: "installed skills (use /skills to install more)"},
 			{View: viewMCPs, Label: "MCPs", Hint: "connected servers"},
 			{View: viewSettings, Label: "Settings", Hint: "workspace config"},
 			{View: viewHub, Label: "Hub", Hint: "close workspace"},
@@ -804,6 +841,9 @@ func (m *shellModel) activateWorkspaceSidebar() tea.Cmd {
 	case viewTools:
 		m.activeView = viewTools
 		m.pushWorkspacePanelOutput("tools", m.workspace.describeTools())
+	case viewSkills:
+		m.activeView = viewSkills
+		m.pushWorkspacePanelOutput("skills", m.workspace.describeWorkspaceSkills())
 	case viewMCPs:
 		m.activeView = viewMCPs
 		if m.workspace.options.MCP != nil {
@@ -857,6 +897,7 @@ func (m *shellModel) ensureHubChatSession() tea.Cmd {
 	}
 	_ = m.closeHubChat()
 	chat := newModel(session.Options)
+	_ = chat.agentRuntime.SetMode("chat")
 	chat.theme = m.theme
 	m.hubChatSession = session
 	m.hubChat = &chat
@@ -969,6 +1010,11 @@ func (m shellModel) renderHubMain() string {
 			return m.workspace.describeTools()
 		}
 		return m.theme.Muted.Render("Open a workspace to inspect registered tools.")
+	case viewSkills:
+		if m.workspace != nil {
+			return m.workspace.describeWorkspaceSkills()
+		}
+		return m.theme.Muted.Render("Open a workspace to inspect installed skills.")
 	case viewMCPs:
 		if m.workspace != nil && m.workspace.options.MCP != nil {
 			return m.workspace.options.MCP.Describe()
@@ -1017,7 +1063,14 @@ func (m shellModel) explorerVisibleLines() []string {
 		if i == m.explorerIndex {
 			prefix = "> "
 		}
-		lines = append(lines, prefix+m.truncateHubText(name))
+		// Star pinned directories so the user can see at a glance whether
+		// the current selection is already in the Pinned list — without
+		// this, P toggles silently and feels broken.
+		marker := " "
+		if entry.IsDir && m.hubState.IsPinned(entry.Path) {
+			marker = "*"
+		}
+		lines = append(lines, prefix+marker+" "+m.truncateHubText(name))
 	}
 	if len(lines) == 0 {
 		lines = append(lines, m.theme.Muted.Render("  No entries"))
@@ -1071,7 +1124,7 @@ func (m shellModel) renderSettings() string {
 		items := m.hubSettingsItems()
 		if m.hubSettingsIndex >= 0 && m.hubSettingsIndex < len(items) {
 			if items[m.hubSettingsIndex].Scope == scopeHub {
-				label = "Editing Hub default (~/.codex/forge/global.toml)"
+				label = "Editing Hub default (~/.forge/global.toml)"
 			} else {
 				label = "Editing workspace override: " + m.hubSettingsTarget()
 			}
@@ -1204,8 +1257,8 @@ type hubSettingsItem struct {
 
 func (m *shellModel) hubSettingsItems() []hubSettingsItem {
 	return []hubSettingsItem{
-		// Hub defaults: persist to ~/.codex/forge/global.toml. Apply to
-		// every workspace that does not override.
+		// Hub defaults: persist to ~/.forge/global.toml. Apply to every
+		// workspace that does not override.
 		{
 			Label: "Theme (global)",
 			Hint:  "persist UI theme as default for every workspace",
@@ -1216,8 +1269,8 @@ func (m *shellModel) hubSettingsItems() []hubSettingsItem {
 			},
 		},
 		{
-			Label: "Skills (global)",
-			Hint:  "browse and install skills into ~/.codex/skills",
+			Label: "Skills (skills.sh)",
+			Hint:  "browse skills.sh; install into ~/.forge/skills",
 			Scope: scopeHub,
 			Open: func(m *shellModel) {
 				m.openHubSkillsBrowser()

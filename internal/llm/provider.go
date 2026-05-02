@@ -130,11 +130,18 @@ func (r *Registry) Names() []string {
 var ErrProviderNotConfigured = errors.New("provider is not configured")
 var ErrNotSupported = errors.New("operation not supported by this provider")
 
+// ErrIdleTimeout is returned when a streaming request is cancelled because no
+// SSE chunk arrived within the configured idle window. It is intentionally
+// distinct from context.DeadlineExceeded so callers can tell "provider went
+// silent" apart from "wall-clock deadline reached" in logs and metrics, while
+// still being classified as a provider timeout for retry purposes.
+var ErrIdleTimeout = errors.New("provider idle timeout: no chunk received within idle window")
+
 func IsProviderTimeout(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrIdleTimeout) {
 		return true
 	}
 	var netErr net.Error

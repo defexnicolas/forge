@@ -25,7 +25,22 @@ func (r *Runtime) executeTool(ctx context.Context, call ToolCall, events chan<- 
 			return &result, "Tool result for " + call.Name + ": blocked by hook: " + err.Error()
 		}
 	}
+	// read_file fast-path: serve from per-turn cache if we already read this
+	// path in the current turn. The agent often re-reads the same file
+	// across consecutive steps; without this each one is a wasted round-trip.
+	if call.Name == "read_file" {
+		if cached, obs, ok := r.lookupReadCache(call.Input); ok {
+			return cached, obs
+		}
+	}
 	result, observation := r.executeToolInner(ctx, call, events)
+	if call.Name == "read_file" && result != nil && strings.TrimSpace(result.Summary) != "" {
+		// Only cache successful reads — failed reads (parse error, missing
+		// file) leave Content empty and the model should retry, not stick.
+		if len(result.Content) > 0 {
+			r.storeReadCache(call.Input, result, observation)
+		}
+	}
 	var changed []string
 	if result != nil {
 		changed = result.ChangedFiles
@@ -34,6 +49,15 @@ func (r *Runtime) executeTool(ctx context.Context, call ToolCall, events chan<- 
 		// Any file-mutating tool invalidates cached preflight findings —
 		// those were computed against pre-mutation state.
 		r.InvalidatePreflightCache()
+		// Drop just the affected paths from the read cache so the next
+		// read_file on those paths sees the post-mutation bytes.
+		r.invalidateReadCachePaths(changed)
+	}
+	if call.Name == "run_command" {
+		// run_command can write any file (build outputs, generated code,
+		// etc.) and we have no way to enumerate them from the result —
+		// flush the entire read cache to be safe.
+		r.flushReadCache()
 	}
 	if r.Hooks != nil {
 		r.Hooks.RunAfter("after:tool_call", call.Name, changed)
@@ -504,7 +528,7 @@ func (r *Runtime) executeCommand(ctx context.Context, call ToolCall, events chan
 		result := tools.Result{Title: "run_command", Summary: reason}
 		return &result, "Tool result for run_command: " + reason
 	}
-	if decision == permissions.Ask {
+	if decision == permissions.Ask && !r.autoApproveMode() {
 		request := &ApprovalRequest{
 			ID:       fmt.Sprintf("approval-command-%p", &call),
 			ToolName: "run_command",
@@ -566,7 +590,16 @@ func (r *Runtime) requestApproval(ctx context.Context, toolName string, input js
 		plan:        plan,
 		beforeApply: beforeApply,
 	}
-	events <- Event{Type: EventApproval, ToolName: toolName, Input: input, Approval: request}
+	if r.autoApproveMode() {
+		// Auto-approve mode: skip the interactive prompt entirely. The
+		// mutation still flows through prepareMutation / patch.Apply /
+		// undoStack below, so the audit trail (diff in Result.Content,
+		// undo entry, RefreshGitSessionState) is identical to the
+		// approved path. Only the human round-trip is removed.
+		request.Response <- ApprovalResponse{Approved: true}
+	} else {
+		events <- Event{Type: EventApproval, ToolName: toolName, Input: input, Approval: request}
+	}
 	select {
 	case <-ctx.Done():
 		result := tools.Result{Title: toolName, Summary: ctx.Err().Error()}
@@ -847,6 +880,11 @@ func (r *Runtime) completeMatchingTask(summary string) {
 // the turn-chain. The model can re-invoke the tool if it needs the detail
 // again; that's cheaper than paying to re-prefill the old result on every
 // subsequent step.
+//
+// The stub names the originating tool when it can be inferred from the
+// existing observation prefix ("Tool result for <name>: ..."). Naming the
+// tool helps the model decide whether re-calling is worth the round-trip:
+// re-reading a file is cheap, re-running a long shell command is not.
 func compactOldToolResults(messages []llm.Message, keep int) {
 	if keep < 0 {
 		keep = 0
@@ -863,23 +901,123 @@ func compactOldToolResults(messages []llm.Message, keep int) {
 	stubCount := len(toolIdx) - keep
 	for i := 0; i < stubCount; i++ {
 		idx := toolIdx[i]
-		if strings.HasPrefix(messages[idx].Content, "[compacted]") {
+		content := messages[idx].Content
+		if strings.HasPrefix(content, "[compacted]") {
 			continue
 		}
-		messages[idx].Content = "[compacted] earlier tool result omitted — re-call the tool if you need the content again."
+		name := extractToolNameFromObservation(content)
+		if name == "" {
+			messages[idx].Content = "[compacted] earlier tool result omitted — re-call the tool if you need the content again."
+			continue
+		}
+		messages[idx].Content = "[compacted] earlier " + name + " result omitted — re-call " + name + " if you need it again."
 	}
 }
 
-func summarizeResult(result tools.Result) string {
-	payload, err := json.Marshal(result)
-	if err != nil {
-		return result.Summary
+// extractToolNameFromObservation parses "Tool result for <name>: ..." (the
+// stable prefix produced by executeToolInner) and returns the bare tool name.
+// Returns "" if the prefix is missing — preserving the generic stub.
+func extractToolNameFromObservation(content string) string {
+	const prefix = "Tool result for "
+	if !strings.HasPrefix(content, prefix) {
+		return ""
 	}
-	if len(payload) > 16000 {
-		payload = payload[:16000]
+	rest := content[len(prefix):]
+	colon := strings.IndexByte(rest, ':')
+	if colon <= 0 {
+		return ""
+	}
+	name := strings.TrimSpace(rest[:colon])
+	// Defensively cap length so a malformed observation cannot inject a
+	// novel-length string into the prompt.
+	if len(name) > 64 {
+		return ""
+	}
+	return name
+}
+
+// keepLastToolResultsForMode chooses how many recent tool results survive
+// compactOldToolResults. Build mode runs many more tool calls per turn than
+// plan/explore (read → analyze → edit → verify per task), so the prefill
+// savings from a tighter window are larger there.
+func keepLastToolResultsForMode(mode string) int {
+	if mode == "build" {
+		return 2
+	}
+	return 3
+}
+
+func summarizeResult(result tools.Result) string {
+	compacted := compactResultForPrompt(result)
+	payload, err := json.Marshal(compacted)
+	if err != nil {
+		return compacted.Summary
+	}
+	limit := 8000
+	if isReadFileResult(result) {
+		limit = 14000
+	}
+	if len(payload) > limit {
+		payload = payload[:limit]
 		return string(payload) + "\n[truncated]"
 	}
 	return string(payload)
+}
+
+func compactResultForPrompt(result tools.Result) tools.Result {
+	out := result
+	if isReadFileResult(out) {
+		if len(out.Content) > 1 {
+			out.Content = append([]tools.ContentBlock(nil), out.Content[:1]...)
+		}
+		for i := range out.Content {
+			out.Content[i].Text = compactPromptText(out.Content[i].Text, 9000)
+		}
+		if out.Summary != "" {
+			out.Summary = compactPromptText(out.Summary, 400)
+		}
+		return out
+	}
+	if len(out.Content) > 2 {
+		out.Content = append([]tools.ContentBlock(nil), out.Content[:2]...)
+	}
+	for i := range out.Content {
+		out.Content[i].Text = compactPromptText(out.Content[i].Text, 2800)
+	}
+	if out.Summary != "" {
+		out.Summary = compactPromptText(out.Summary, 1200)
+	}
+	return out
+}
+
+func isReadFileResult(result tools.Result) bool {
+	if strings.EqualFold(strings.TrimSpace(result.Title), "Read file") {
+		return true
+	}
+	if len(result.Content) == 1 && strings.TrimSpace(result.Content[0].Path) != "" && len(result.ChangedFiles) == 0 {
+		return true
+	}
+	return false
+}
+
+func compactPromptText(text string, limit int) string {
+	if limit <= 0 || len(text) <= limit {
+		return text
+	}
+	if limit < 64 {
+		return text[:limit]
+	}
+	marker := "\n[...truncated...]\n"
+	head := (limit * 2) / 3
+	tail := limit - head - len(marker)
+	if tail < 16 {
+		tail = 16
+		head = limit - tail - len(marker)
+	}
+	if head < 16 {
+		head = 16
+	}
+	return text[:head] + marker + text[len(text)-tail:]
 }
 
 func systemPrompt(nativeToolCalling bool, modeName string, policy SprintPolicy) string {
@@ -893,6 +1031,10 @@ func systemPrompt(nativeToolCalling bool, modeName string, policy SprintPolicy) 
 	}
 
 	if nativeToolCalling {
+		suffix := "If you have enough information, answer normally without calling a tool."
+		if modeName == "build" {
+			suffix = "If checklist tasks remain, do not answer normally. Return exactly one tool call for the next action. Only answer in prose when all tasks are complete or when blocked and sending the user back to plan mode."
+		}
 		return strings.TrimSpace(modePrefix + `You are Forge, a coding agent inside a terminal workbench.
 
 You have access to tools via function calling. Use them to read files, search code, run commands, and make edits. Edits require user approval and should be small and reversible.
@@ -907,7 +1049,7 @@ For full planning documents, use plan_write and plan_get. Keep executable progre
 
 For visible plans, prefer task_create / task_list / task_update for incremental changes. Use todo_write ONLY when the user explicitly asks for a fresh plan — it replaces the whole list and will be rejected if called with empty items while tasks exist.
 
-If you have enough information, answer normally without calling a tool.`)
+` + suffix)
 	}
 
 	// Build dynamic tool lists based on the current policy.
@@ -978,7 +1120,11 @@ If you have enough information, answer normally without calling a tool.`)
 		b.WriteString("Approval tools: " + strings.Join(askTools, ", ") + "\n")
 	}
 
-	b.WriteString("\nIf you have enough information, answer normally without a tool_call block.")
+	if modeName == "build" {
+		b.WriteString("\nIf checklist tasks remain, do not answer normally without a tool_call block. Return exactly one tool_call for the next action. Only answer in prose when all tasks are complete or when blocked and sending the user back to plan mode.")
+	} else {
+		b.WriteString("\nIf you have enough information, answer normally without a tool_call block.")
+	}
 
 	return strings.TrimSpace(b.String())
 }

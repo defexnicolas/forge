@@ -87,10 +87,10 @@ type taskUpdateTool struct{}
 
 func (taskUpdateTool) Name() string { return "task_update" }
 func (taskUpdateTool) Description() string {
-	return "Update a task's status (pending|in_progress|completed), title, or notes. Prefer this over todo_write for incremental progress."
+	return "Update a task's status (pending|in_progress|completed), title, or notes. Prefer id when available; if id is omitted, title may be used to target an existing task during plan refinement."
 }
 func (taskUpdateTool) Schema() json.RawMessage {
-	return json.RawMessage(`{"type":"object","required":["id"],"properties":{"id":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed","cancelled"]},"title":{"type":"string"},"notes":{"type":"string"}}}`)
+	return json.RawMessage(`{"type":"object","properties":{"id":{"type":"string","description":"Preferred stable task ID, e.g. plan-1"},"title":{"type":"string","description":"Task title. If id is omitted, Forge will try to match an existing task by title."},"status":{"type":"string","enum":["pending","in_progress","completed","cancelled"]},"notes":{"type":"string"}}}`)
 }
 func (taskUpdateTool) Permission(Context, json.RawMessage) PermissionRequest {
 	return PermissionRequest{Decision: PermissionAllow}

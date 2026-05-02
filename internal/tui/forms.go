@@ -366,6 +366,9 @@ func (m *model) runPlanExecution(line string) tea.Cmd {
 	m.history = append(m.history, m.theme.SeparatorLine(m.width-4))
 	m.history = append(m.history, m.theme.IndicatorAgent.Render("* ")+m.theme.AgentPrefix.Render("forge"))
 	m.history = append(m.history, "")
+	if strings.EqualFold(strings.TrimSpace(line), "Execute the approved plan.") {
+		line = "Execute the approved plan. Use the plan/checklist digest already in context first; only call plan_get or task_list if that digest is insufficient."
+	}
 	m.agentEvents = m.agentRuntime.Run(context.Background(), line)
 	m.agentRunning = true
 	return waitForAgentEvent(m.agentEvents)

@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"forge/internal/config"
@@ -163,10 +164,14 @@ type Runtime struct {
 	// (from a prior session or a manual load) would stay on whatever slot
 	// count LM Studio picked, typically 1.
 	startupReloadDone    bool
-	LastTurnDuration     time.Duration
-	LastTurnTokensIn     int
-	LastTurnTokensOut    int
-	LastTurnTokensPerSec float64
+	LastTurnDuration      time.Duration
+	LastTurnTokensIn      int
+	LastTurnTokensOut     int
+	LastTurnTokensPerSec  float64
+	LastTurnStepsUsed     int
+	LastTurnReadOnlySteps int
+	LastTurnMutatingSteps int
+	LastTurnCacheHits     int
 	mu                   sync.Mutex
 	undoStack            []UndoEntry
 	// systemPromptCache memoizes the rendered system prompt by (nativeTools |
@@ -186,6 +191,17 @@ type Runtime struct {
 	// currently-loaded model on LM Studio, causing thrash and starving the
 	// real turn. Held only around the LoadModel call itself — not inference.
 	loadMu sync.Mutex
+	// readCache memoizes read_file results within a single turn. Reset at
+	// the top of run() so a new turn always sees fresh disk state. Mutating
+	// tools (edit_file/write_file/apply_patch) invalidate matching paths;
+	// run_command flushes the whole cache because it can write arbitrarily.
+	readCache *readCacheStore
+	// Per-turn step efficiency counters. Reset at the top of run() and
+	// surfaced through LastTurn* fields after the turn completes. Atomic
+	// because parallel execute_task may bump turnStepsUsed concurrently.
+	turnStepsUsed     atomic.Int64
+	turnReadOnlySteps atomic.Int64
+	turnMutatingSteps atomic.Int64
 	// EventTee, if set, receives a copy of every event emitted by Run. Used
 	// by /remote-control to broadcast to connected web clients.
 	EventTee EventTee
@@ -208,13 +224,17 @@ type preflightCacheEntry struct {
 const preflightCacheTTL = 10 * time.Minute
 
 func NewRuntime(cwd string, cfg config.Config, registry *tools.Registry, providers *llm.Registry) *Runtime {
+	maxSteps := cfg.Runtime.MaxSteps
+	if maxSteps <= 0 {
+		maxSteps = 40
+	}
 	runtime := &Runtime{
 		CWD:       cwd,
 		Config:    cfg,
 		Tools:     registry,
 		Providers: providers,
 		Builder:   contextbuilder.NewBuilder(cwd, cfg, registry),
-		MaxSteps:  40,
+		MaxSteps:  maxSteps,
 		Mode:      "plan",
 		Policy:    NewPlanPolicy(),
 		Commands:  permissions.DefaultCommandPolicy(),
@@ -751,11 +771,17 @@ func looksLikePlanOnlyResponse(content string) bool {
 }
 
 func looksLikePlanExecutionIntent(message string) bool {
-	lower := strings.ToLower(message)
+	lower := strings.TrimSpace(strings.ToLower(message))
+	if strings.HasPrefix(lower, "plan refinement request:") || strings.HasPrefix(lower, "new plan goal:") {
+		return false
+	}
+	if len(strings.Fields(lower)) > 6 {
+		return false
+	}
 	for _, phrase := range []string{
-		"execute", "implement", "build", "continue", "resume",
-		"carry out", "do it", "run the plan", "execute the plan", "approved plan",
-		"ejecut", "implement", "constru", "contin", "sigue", "hazlo", "hacerlo",
+		"execute", "run the plan", "execute the plan", "build it",
+		"do it", "go ahead", "proceed", "start", "let's go", "run it",
+		"ejecuta", "hazlo", "hacerlo", "adelante", "dale", "procede", "implementa",
 	} {
 		if strings.Contains(lower, phrase) {
 			return true
@@ -867,7 +893,7 @@ func (r *Runtime) planContextBlock(userMessage, switchedFrom string) string {
 		}
 	case "build":
 		if planSummary != "" {
-			lines = append(lines, fmt.Sprintf("Approved plan in scope: %s. If you have not loaded it yet this turn, call plan_get once.", planSummary))
+			lines = append(lines, fmt.Sprintf("Approved plan in scope: %s. Use the digest below first; call plan_get only if that digest is insufficient.", planSummary))
 		}
 		if digest := compactPlanDigest(planDoc, taskList); hasPlanDoc && digest != "" {
 			lines = append(lines, digest)
@@ -967,9 +993,17 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 	r.mu.Lock()
 	r.activeEvents = events
 	r.mu.Unlock()
+	r.turnStepsUsed.Store(0)
+	r.turnReadOnlySteps.Store(0)
+	r.turnMutatingSteps.Store(0)
+	r.resetReadCache()
 	defer func() {
 		r.mu.Lock()
 		r.activeEvents = nil
+		r.LastTurnStepsUsed = int(r.turnStepsUsed.Load())
+		r.LastTurnReadOnlySteps = int(r.turnReadOnlySteps.Load())
+		r.LastTurnMutatingSteps = int(r.turnMutatingSteps.Load())
+		r.LastTurnCacheHits = r.readCacheHits()
 		r.mu.Unlock()
 		r.LastTurnDuration = time.Since(turnStart)
 	}()
@@ -1012,6 +1046,12 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 	if r.Mode == "explore" {
 		roleConfig = config.ConfigForTaskRole(r.Config, role, r.roleModel(role))
 	}
+	if r.Mode == "build" {
+		// Build mode already gets the approved plan/checklist digest in the
+		// prompt. Dropping recent session timeline here keeps follow-up build
+		// turns materially smaller after a long plan/build/refine cycle.
+		roleConfig.Context.Yarn.HistoryEvents = 0
+	}
 	snapshot := r.buildSnapshot(userMessage, roleConfig)
 	r.LastTurnTokensOut = 0
 	r.LastTurnTokensPerSec = 0
@@ -1036,7 +1076,7 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 				"After the interview, call plan_write AND todo_write in the same turn so the user ends with both artifacts."
 		}
 		if r.Mode == "build" {
-			handoff += "You are the executor: read the plan and checklist, take the next pending task, and edit files directly with edit_file/write_file/apply_patch (each prompts for approval). After each task call task_update(status=\"completed\"). Do NOT call execute_task, plan_write, or todo_write."
+			handoff += "You are the executor: use the plan/checklist digest already in prompt first, and only call plan_get/task_list if the digest is insufficient. Then take the next pending task and edit files directly with edit_file/write_file/apply_patch (each prompts for approval). After each task call task_update(status=\"completed\"). Do NOT call execute_task, plan_write, or todo_write."
 		}
 		r.ModeSwitchedFrom = ""
 	}
@@ -1083,6 +1123,13 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 	if maxSteps <= 0 {
 		maxSteps = 40
 	}
+	// Build mode legitimately needs more steps than plan mode: each
+	// task runs read → analyze → edit → verify, and a feature with N
+	// tasks easily multiplies that. MaxStepsBuild lets the user lift
+	// the cap just for build without making plan-mode interviews wander.
+	if r.Mode == "build" && r.Config.Runtime.MaxStepsBuild > maxSteps {
+		maxSteps = r.Config.Runtime.MaxStepsBuild
+	}
 	r.LastModelUsed = model
 
 	// Build tool definitions for native mode.
@@ -1112,6 +1159,8 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 	lastFailedTool := ""
 	consecutiveToolFailures := 0
 	consecutiveReadOnly := 0
+	lastBuildReadPath := ""
+	sameBuildReadPathCount := 0
 	planModeReprompts := 0
 	taskAttempts := map[string]int{}
 	blockedTaskRetries := map[string]bool{}
@@ -1123,8 +1172,9 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 	for step := 0; step < maxSteps; step++ {
 		// Bound the growth of tool-result payloads in the step history. Keeps
 		// the last few verbatim and stubs the rest — the model can re-invoke
-		// a tool if it still needs the detail.
-		compactOldToolResults(messages, 3)
+		// a tool if it still needs the detail. Build mode keeps fewer (2)
+		// because each task fans out into more tool calls per turn.
+		compactOldToolResults(messages, keepLastToolResultsForMode(r.Mode))
 
 		req := llm.ChatRequest{
 			Model:    model,
@@ -1176,15 +1226,36 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 			}
 			messages = append(messages, assistantMsg)
 
+			// Pre-execute parallelizable batches (multiple execute_task calls
+			// in a single response) concurrently. Mixed batches and single-
+			// tool batches stay sequential; only N>1 pure execute_task
+			// batches take the fast path. Returns nil for the sequential
+			// case so the loop below behaves identically.
+			preComputed := r.maybePreExecuteParallelExecuteTasks(ctx, toolCalls, events)
+
 			// Execute each tool call and append role:tool responses.
 			allDone := true
 			for _, tc := range toolCalls {
 				agentCall := FromNativeToolCall(tc)
 				events <- Event{Type: EventToolCall, ToolName: agentCall.Name, Input: agentCall.Input}
 
-				result, observation := r.executeTool(ctx, agentCall, events)
+				var result *tools.Result
+				var observation string
+				cacheHitsBefore := r.readCacheHits()
+				if pre, ok := preComputed[tc.ID]; ok {
+					result, observation = pre.result, pre.observation
+				} else {
+					result, observation = r.executeTool(ctx, agentCall, events)
+				}
+				cacheHit := r.readCacheHits() > cacheHitsBefore
 				if result != nil {
 					events <- Event{Type: EventToolResult, ToolName: agentCall.Name, Result: result, Text: result.Summary}
+				}
+				r.turnStepsUsed.Add(1)
+				if isMutatingToolCall(agentCall.Name) {
+					r.turnMutatingSteps.Add(1)
+				} else {
+					r.turnReadOnlySteps.Add(1)
 				}
 				if agentCall.Name == "execute_task" && result != nil {
 					taskID := executeTaskIDFromInput(agentCall.Input)
@@ -1192,6 +1263,24 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 						lastExecuteTaskFailure[meta.TaskID] = meta
 					} else if taskID != "" {
 						delete(lastExecuteTaskFailure, taskID)
+					}
+				}
+				if shouldRefundToolStep(agentCall.Name) {
+					step--
+				}
+				if err := r.enforceRepeatedReadFileGuard(agentCall.Name, agentCall.Input, &lastBuildReadPath, &sameBuildReadPathCount); err != nil {
+					events <- Event{Type: EventError, Error: err}
+					events <- Event{Type: EventDone}
+					return
+				}
+				// Cache-served reads did no real work — skip the read-only
+				// progress guard so the cache helps the agent rather than
+				// using up its exploration budget twice as fast.
+				if !cacheHit {
+					if err := r.enforceToolProgressGuard(agentCall.Name, &consecutiveReadOnly, &noProgressSteps); err != nil {
+						events <- Event{Type: EventError, Error: err}
+						events <- Event{Type: EventDone}
+						return
 					}
 				}
 
@@ -1296,6 +1385,19 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 		parseFailures = 0 // reset on successful parse
 
 		if !parsed.Found {
+			if r.Mode == "build" && r.hasActiveChecklistTasks() {
+				noProgressSteps++
+				if noProgressSteps >= r.maxNoProgressSteps() {
+					events <- Event{Type: EventError, Error: fmt.Errorf("stopped: %d build response(s) in prose with checklist tasks still active", noProgressSteps)}
+					events <- Event{Type: EventDone}
+					return
+				}
+				messages = append(messages,
+					llm.Message{Role: "assistant", Content: accumulated},
+					llm.Message{Role: "user", Content: "You are in BUILD mode and checklist tasks still remain. Do not summarize or restate gaps. Return exactly one valid tool_call for the next action now: usually task_update(status=\"in_progress\"), read_file, edit_file, write_file, apply_patch, or run_command. Only answer in prose if you are blocked and need the user to switch back to plan mode."},
+				)
+				continue
+			}
 			// Detect leaked / partial <tool_call tags that none of the parsers
 			// recognized (unclosed angle bracket, missing close tag, junk
 			// between tag and JSON). Without this, the raw fragment would
@@ -1363,9 +1465,17 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 		}
 		events <- Event{Type: EventToolCall, ToolName: parsed.Call.Name, Input: parsed.Call.Input}
 
+		cacheHitsBefore := r.readCacheHits()
 		result, observation := r.executeTool(ctx, parsed.Call, events)
+		cacheHit := r.readCacheHits() > cacheHitsBefore
 		if result != nil {
 			events <- Event{Type: EventToolResult, ToolName: parsed.Call.Name, Result: result, Text: result.Summary}
+		}
+		r.turnStepsUsed.Add(1)
+		if isMutatingToolCall(parsed.Call.Name) {
+			r.turnMutatingSteps.Add(1)
+		} else {
+			r.turnReadOnlySteps.Add(1)
 		}
 
 		// Don't charge non-productive calls against the step budget:
@@ -1377,15 +1487,28 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 			step--
 		}
 
+		if err := r.enforceRepeatedReadFileGuard(parsed.Call.Name, parsed.Call.Input, &lastBuildReadPath, &sameBuildReadPathCount); err != nil {
+			events <- Event{Type: EventError, Error: err}
+			events <- Event{Type: EventDone}
+			return
+		}
+
 		// No-progress stall guard: the planner should be dispatching
 		// execute_task or mutating tools (plan_write / todo_write /
 		// task_update). Long runs of read-only exploration without any of
 		// those signals an aimless loop; stop so the cap isn't burned.
+		// A cache-served read did no real work — exempt it so the cache
+		// doesn't help latency at the cost of burning the read budget.
 		if isMutatingToolCall(parsed.Call.Name) || parsed.Call.Name == "execute_task" {
 			consecutiveReadOnly = 0
 			noProgressSteps = 0
-		} else if isReadOnlyExploration(parsed.Call.Name) {
+		} else if isReadOnlyExploration(parsed.Call.Name) && !cacheHit {
 			consecutiveReadOnly++
+			if r.Mode == "build" && consecutiveReadOnly >= r.maxBuilderReadLoops() {
+				events <- Event{Type: EventError, Error: fmt.Errorf("stopped: %d consecutive read-only tool calls in build mode with no edits yet — choose the next task action or ask for refinement instead of continuing to read", consecutiveReadOnly)}
+				events <- Event{Type: EventDone}
+				return
+			}
 			if consecutiveReadOnly >= r.maxConsecutiveReadOnly() {
 				events <- Event{Type: EventError, Error: fmt.Errorf("stopped: %d consecutive read-only tool calls with no edits — dispatch execute_task, call plan_write / todo_write, or answer the user directly", consecutiveReadOnly)}
 				events <- Event{Type: EventDone}
@@ -1481,6 +1604,21 @@ func isMutatingToolCall(name string) bool {
 	return false
 }
 
+func shouldRefundToolStep(name string) bool {
+	switch name {
+	case "ask_user", "task_list", "plan_get", "git_status":
+		return true
+	case "execute_task":
+		// The real work runs inside the builder subagent's separate step
+		// budget (subagentStepLimit). Charging the parent for orchestrating
+		// the dispatch made a 7-task plan eat ~10 parent steps per task and
+		// hit the cap before finishing. Per-task accounting lives on the
+		// subagent now; the parent's MaxSteps governs orchestration only.
+		return true
+	}
+	return false
+}
+
 // isReadOnlyExploration returns true for tools that merely inspect state
 // without changing it. Long runs of these with no mutation in between signal
 // an aimless-exploration stall.
@@ -1490,6 +1628,72 @@ func isReadOnlyExploration(name string) bool {
 		return true
 	}
 	return false
+}
+
+func (r *Runtime) enforceToolProgressGuard(name string, consecutiveReadOnly, noProgressSteps *int) error {
+	if isMutatingToolCall(name) || name == "execute_task" {
+		*consecutiveReadOnly = 0
+		*noProgressSteps = 0
+		return nil
+	}
+	if !isReadOnlyExploration(name) {
+		return nil
+	}
+	*consecutiveReadOnly++
+	if r.Mode == "build" && *consecutiveReadOnly >= r.maxBuilderReadLoops() {
+		return fmt.Errorf("stopped: %d consecutive read-only tool calls in build mode with no edits yet — choose the next task action or ask for refinement instead of continuing to read", *consecutiveReadOnly)
+	}
+	if r.Mode == "build" {
+		return nil
+	}
+	if *consecutiveReadOnly >= r.maxConsecutiveReadOnly() {
+		return fmt.Errorf("stopped: %d consecutive read-only tool calls with no edits — dispatch execute_task, call plan_write / todo_write, or answer the user directly", *consecutiveReadOnly)
+	}
+	return nil
+}
+
+func (r *Runtime) enforceRepeatedReadFileGuard(name string, input json.RawMessage, lastBuildReadPath *string, sameBuildReadPathCount *int) error {
+	if r.Mode != "build" {
+		*lastBuildReadPath = ""
+		*sameBuildReadPathCount = 0
+		return nil
+	}
+	if isMutatingToolCall(name) || name == "execute_task" {
+		*lastBuildReadPath = ""
+		*sameBuildReadPathCount = 0
+		return nil
+	}
+	if name != "read_file" {
+		*lastBuildReadPath = ""
+		*sameBuildReadPathCount = 0
+		return nil
+	}
+	path := readFilePathFromInput(input)
+	if path == "" {
+		*lastBuildReadPath = ""
+		*sameBuildReadPathCount = 0
+		return nil
+	}
+	if strings.EqualFold(path, *lastBuildReadPath) {
+		*sameBuildReadPathCount++
+	} else {
+		*lastBuildReadPath = path
+		*sameBuildReadPathCount = 1
+	}
+	if *sameBuildReadPathCount >= 3 {
+		return fmt.Errorf("stopped: repeated read_file on %s in build mode (%d times) with no edits yet — stop chunking the same file and either edit it or ask for refinement", path, *sameBuildReadPathCount)
+	}
+	return nil
+}
+
+func readFilePathFromInput(input json.RawMessage) string {
+	var req struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal(input, &req); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(req.Path)
 }
 
 func (r *Runtime) hasActiveChecklistTasks() bool {
@@ -1684,7 +1888,7 @@ func (r *Runtime) streamResponseWithInput(ctx context.Context, provider llm.Prov
 	emitProgress("waiting_on_provider", false)
 	requestCtx, cancel := withOptionalTimeout(ctx, r.requestTimeout())
 	defer cancel()
-	stream, err := provider.Stream(requestCtx, req)
+	stream, err := r.streamProvider(requestCtx, provider, req)
 	if err != nil {
 		if len(req.Tools) > 0 && llm.IsToolCallingUnsupported(err) {
 			fallbackReq := req

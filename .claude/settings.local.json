@@ -41,7 +41,9 @@
       "Bash(cp forge.exe \"C:/Users/nicod/Downloads/snake29/forge.exe\")",
       "Read(//c/Users/nicod/Downloads/snake29/**)",
       "Bash(xargs basename *)",
-      "Bash(go add *)"
+      "Bash(go add *)",
+      "Read(//c/Users/nicod/.forge/**)",
+      "Read(//c/Users/nicod/.codex/forge/**)"
     ]
   }
 }

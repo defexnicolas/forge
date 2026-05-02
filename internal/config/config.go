@@ -96,9 +96,24 @@ type ContextConfig struct {
 }
 
 type RuntimeConfig struct {
-	RequestTimeoutSeconds  int  `toml:"request_timeout_seconds"`
-	SubagentTimeoutSeconds int  `toml:"subagent_timeout_seconds"`
-	TaskTimeoutSeconds     int  `toml:"task_timeout_seconds"`
+	// RequestTimeoutSeconds is the wall-clock deadline applied to a single
+	// LLM request (Stream or Chat). 0 disables the deadline — useful for
+	// slow local models where prompt processing alone can exceed minutes.
+	// When disabled, RequestIdleTimeoutSeconds is the only safety net.
+	RequestTimeoutSeconds int `toml:"request_timeout_seconds"`
+	// RequestIdleTimeoutSeconds cancels a streaming request if no SSE chunk
+	// is received within this window. The timer arms on the first chunk, so
+	// long prompt-processing pauses before any token is emitted do not
+	// trigger it. 0 disables idle detection entirely.
+	RequestIdleTimeoutSeconds int  `toml:"request_idle_timeout_seconds"`
+	SubagentTimeoutSeconds    int  `toml:"subagent_timeout_seconds"`
+	TaskTimeoutSeconds        int  `toml:"task_timeout_seconds"`
+	// MaxSteps is the per-turn cap on (LLM call + tool result) iterations.
+	// 0 falls back to the built-in default (40). MaxStepsBuild, when > 0,
+	// overrides this in build mode where multi-task implementations
+	// legitimately need more steps than a plan-mode interview.
+	MaxSteps               int  `toml:"max_steps"`
+	MaxStepsBuild          int  `toml:"max_steps_build"`
 	MaxNoProgressSteps     int  `toml:"max_no_progress_steps"`
 	MaxEmptyResponses      int  `toml:"max_empty_responses"`
 	MaxSameToolFailures    int  `toml:"max_same_tool_failures"`
@@ -346,6 +361,12 @@ func applyGlobalDefaults(cfg *Config, g globalconfig.GlobalConfig, keys map[stri
 	if g.Yarn != nil {
 		applyYarnDefaults(&cfg.Context, g.Yarn, keys)
 	}
+	if g.Runtime != nil {
+		applyRuntimeDefaults(&cfg.Runtime, g.Runtime, keys)
+	}
+	if g.ApprovalProfile != nil && (!keys["approval_profile"] || cfg.ApprovalProfile == Defaults().ApprovalProfile) {
+		cfg.ApprovalProfile = *g.ApprovalProfile
+	}
 	if g.Skills != nil {
 		applySkillsDefaults(&cfg.Skills, g.Skills, keys)
 	}
@@ -398,6 +419,49 @@ func applyYarnDefaults(ctx *ContextConfig, g *globalconfig.YarnDefaults, keys ma
 	if g.RenderHeadLine != nil && !keys["context.yarn.render_head_lines"] {
 		ctx.Yarn.RenderHeadLines = *g.RenderHeadLine
 	}
+}
+
+// applyRuntimeDefaults overlays a global runtime block onto the workspace
+// runtime config. A workspace value wins UNLESS it still matches the
+// built-in default (the fresh-scaffold case where init.go materialised
+// every default into .forge/config.toml — without this escape, the global
+// would be permanently shadowed by untouched scaffold values).
+//
+// Runtime fields use 0 / negative as semantically valid ("no deadline",
+// "use built-in"), so the apply helpers explicitly use pointer-non-nil as
+// the "user set this" signal — never zero-value comparison.
+func applyRuntimeDefaults(rt *RuntimeConfig, g *globalconfig.RuntimeDefaults, keys map[string]bool) {
+	defaults := Defaults().Runtime
+	applyInt := func(name string, target *int, val *int, def int) {
+		if val == nil {
+			return
+		}
+		if !keys["runtime."+name] || *target == def {
+			*target = *val
+		}
+	}
+	applyBool := func(name string, target *bool, val *bool, def bool) {
+		if val == nil {
+			return
+		}
+		if !keys["runtime."+name] || *target == def {
+			*target = *val
+		}
+	}
+	applyInt("request_timeout_seconds", &rt.RequestTimeoutSeconds, g.RequestTimeoutSeconds, defaults.RequestTimeoutSeconds)
+	applyInt("request_idle_timeout_seconds", &rt.RequestIdleTimeoutSeconds, g.RequestIdleTimeoutSeconds, defaults.RequestIdleTimeoutSeconds)
+	applyInt("subagent_timeout_seconds", &rt.SubagentTimeoutSeconds, g.SubagentTimeoutSeconds, defaults.SubagentTimeoutSeconds)
+	applyInt("task_timeout_seconds", &rt.TaskTimeoutSeconds, g.TaskTimeoutSeconds, defaults.TaskTimeoutSeconds)
+	applyInt("max_steps", &rt.MaxSteps, g.MaxSteps, defaults.MaxSteps)
+	applyInt("max_steps_build", &rt.MaxStepsBuild, g.MaxStepsBuild, defaults.MaxStepsBuild)
+	applyInt("max_no_progress_steps", &rt.MaxNoProgressSteps, g.MaxNoProgressSteps, defaults.MaxNoProgressSteps)
+	applyInt("max_empty_responses", &rt.MaxEmptyResponses, g.MaxEmptyResponses, defaults.MaxEmptyResponses)
+	applyInt("max_same_tool_failures", &rt.MaxSameToolFailures, g.MaxSameToolFailures, defaults.MaxSameToolFailures)
+	applyInt("max_consecutive_read_only", &rt.MaxConsecutiveReadOnly, g.MaxConsecutiveReadOnly, defaults.MaxConsecutiveReadOnly)
+	applyInt("max_planner_summary_steps", &rt.MaxPlannerSummarySteps, g.MaxPlannerSummarySteps, defaults.MaxPlannerSummarySteps)
+	applyInt("max_builder_read_loops", &rt.MaxBuilderReadLoops, g.MaxBuilderReadLoops, defaults.MaxBuilderReadLoops)
+	applyBool("retry_on_provider_timeout", &rt.RetryOnProviderTimeout, g.RetryOnProviderTimeout, defaults.RetryOnProviderTimeout)
+	applyBool("inline_builder", &rt.InlineBuilder, g.InlineBuilder, defaults.InlineBuilder)
 }
 
 func applySkillsDefaults(s *SkillsConfig, g *globalconfig.SkillsDefaults, keys map[string]bool) {
@@ -512,15 +576,24 @@ func Defaults() Config {
 			},
 		},
 		Runtime: RuntimeConfig{
-			RequestTimeoutSeconds:  45,
-			SubagentTimeoutSeconds: 90,
-			TaskTimeoutSeconds:     180,
-			MaxNoProgressSteps:     3,
-			MaxEmptyResponses:      2,
-			MaxSameToolFailures:    2,
-			MaxConsecutiveReadOnly: 6,
+			RequestTimeoutSeconds:     45,
+			RequestIdleTimeoutSeconds: 120,
+			SubagentTimeoutSeconds:    90,
+			TaskTimeoutSeconds:        180,
+			MaxSteps:                  40,
+			MaxStepsBuild:             80,
+			MaxNoProgressSteps:        3,
+			MaxEmptyResponses:         2,
+			MaxSameToolFailures:       2,
+			// Plan-mode interviews legitimately read several files before
+			// planning (README, entry point, test, config). Bumped from
+			// 6 -> 10 so moderate codebases don't trip the guard before
+			// the planner can dispatch plan_write / todo_write.
+			MaxConsecutiveReadOnly: 10,
 			MaxPlannerSummarySteps: 2,
-			MaxBuilderReadLoops:    4,
+			// Build-mode reads (read → analyze → edit → verify per task)
+			// also need more headroom than the original 8.
+			MaxBuilderReadLoops: 12,
 		},
 		Git: GitConfig{
 			AutoInit:               true,
@@ -668,14 +741,14 @@ func Normalize(cfg *Config) {
 	if cfg.Context.Task.HistoryEvents <= 0 {
 		cfg.Context.Task.HistoryEvents = defaults.Context.Task.HistoryEvents
 	}
-	if cfg.Runtime.RequestTimeoutSeconds <= 0 {
-		cfg.Runtime.RequestTimeoutSeconds = defaults.Runtime.RequestTimeoutSeconds
-	}
-	if cfg.Runtime.SubagentTimeoutSeconds <= 0 {
-		cfg.Runtime.SubagentTimeoutSeconds = defaults.Runtime.SubagentTimeoutSeconds
-	}
-	if cfg.Runtime.TaskTimeoutSeconds <= 0 {
-		cfg.Runtime.TaskTimeoutSeconds = defaults.Runtime.TaskTimeoutSeconds
+	// RequestTimeoutSeconds, SubagentTimeoutSeconds, TaskTimeoutSeconds:
+	// 0 (or negative) is a valid, intentional setting meaning "no deadline".
+	// Do not coerce to defaults — that change of contract is what blocked
+	// users from disabling the wall-clock timeout when running slow local
+	// models. Defaults() still seeds 45/90/180 for fresh configs; the user
+	// must explicitly write 0 to opt out.
+	if cfg.Runtime.RequestIdleTimeoutSeconds < 0 {
+		cfg.Runtime.RequestIdleTimeoutSeconds = defaults.Runtime.RequestIdleTimeoutSeconds
 	}
 	if cfg.Runtime.MaxNoProgressSteps <= 0 {
 		cfg.Runtime.MaxNoProgressSteps = defaults.Runtime.MaxNoProgressSteps
@@ -704,20 +777,25 @@ func Normalize(cfg *Config) {
 	if cfg.ModelLoading.ParallelSlots <= 0 {
 		cfg.ModelLoading.ParallelSlots = defaults.ModelLoading.ParallelSlots
 	}
+	// Subagent concurrency follows ParallelSlots when the user has not set
+	// it explicitly. The old behaviour capped at the built-in default of 2,
+	// which silently wasted backend slots whenever the user bumped
+	// parallel_slots to 4+. The user-facing contract is now: "however many
+	// slots LM Studio has, that's how many subagents run concurrently".
 	if cfg.Build.Subagents.Concurrency <= 0 {
-		cfg.Build.Subagents.Concurrency = minPositive(cfg.ModelLoading.ParallelSlots, defaults.Build.Subagents.Concurrency)
+		cfg.Build.Subagents.Concurrency = cfg.ModelLoading.ParallelSlots
 	}
 	if len(cfg.Build.Subagents.Roles) == 0 {
 		cfg.Build.Subagents.Roles = append([]string(nil), defaults.Build.Subagents.Roles...)
 	}
 	if cfg.Explore.Subagents.Concurrency <= 0 {
-		cfg.Explore.Subagents.Concurrency = defaults.Explore.Subagents.Concurrency
+		cfg.Explore.Subagents.Concurrency = cfg.ModelLoading.ParallelSlots
 	}
 	if len(cfg.Explore.Subagents.Roles) == 0 {
 		cfg.Explore.Subagents.Roles = append([]string(nil), defaults.Explore.Subagents.Roles...)
 	}
 	if cfg.Plan.Subagents.Concurrency <= 0 {
-		cfg.Plan.Subagents.Concurrency = defaults.Plan.Subagents.Concurrency
+		cfg.Plan.Subagents.Concurrency = cfg.ModelLoading.ParallelSlots
 	}
 	if len(cfg.Plan.Subagents.Roles) == 0 {
 		cfg.Plan.Subagents.Roles = append([]string(nil), defaults.Plan.Subagents.Roles...)

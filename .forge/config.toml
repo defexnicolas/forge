@@ -1,5 +1,16 @@
 default_agent = 'build'
-approval_profile = 'normal'
+# 'auto' = bypass per-mutation approval prompts (write_file/edit_file/
+# apply_patch/run_command). The audit trail (diff in tool result, undo
+# stack, git snapshot) is preserved. 'normal' restores the per-action
+# prompt.
+approval_profile = 'auto'
+
+[model_loading]
+# All slots LM Studio supports. Subagent fan-out (build / explore) follows
+# this value when their concurrency isn't explicitly set lower.
+enabled = true
+strategy = 'parallel'
+parallel_slots = 4
 
 [providers]
 [providers.default]
@@ -32,10 +43,25 @@ max_file_bytes = 30000
 history_events = 12
 
 [runtime]
-request_timeout_seconds = 1800
-subagent_timeout_seconds = 3600
-task_timeout_seconds = 7200
+# 0 = no wall-clock deadline. With slow local models (LM Studio + 12k-token
+# prompts), prompt processing alone can exceed any sane wall-clock cap.
+# request_idle_timeout_seconds is the safety net: it cancels the request if
+# the provider stops emitting SSE chunks for that long *after* the first
+# chunk, so dead/hung backends still surface as timeouts.
+request_timeout_seconds = 0
+request_idle_timeout_seconds = 180
+subagent_timeout_seconds = 0
+task_timeout_seconds = 0
 retry_on_provider_timeout = true
+# Read-budget guards. Higher than the old 6/8 because plan-mode interviews
+# and build-mode multi-task work both legitimately read several files
+# before doing anything mutating. Cache-served reads no longer count.
+max_consecutive_read_only = 10
+max_builder_read_loops = 12
+# Build mode legitimately runs longer (multi-task implementations).
+# Plan mode stays at the safer 40 default.
+max_steps = 40
+max_steps_build = 120
 
 [skills]
 cli = 'npx'

@@ -12,6 +12,8 @@ type Mode struct {
 
 // DefaultModes returns the agent operating modes.
 //
+// chat: general conversation. Read-only.
+//
 // plan: design + write the plan + checklist, then hand off. No editing.
 // build: execute the approved checklist directly (read + edit_file/write_file/
 //
@@ -23,6 +25,15 @@ type Mode struct {
 // not modes.
 func DefaultModes() map[string]Mode {
 	return map[string]Mode{
+		"chat": {
+			Name:        "chat",
+			Description: "General conversation. Answers directly, using read-only tools only when needed.",
+			Policy:      NewChatPolicy(),
+			Prompt: "You are in chat mode. Have a normal conversation and answer the user's question directly.\n" +
+				"Prefer a concise, useful answer over planning. Only use tools when they materially improve accuracy, such as reading files or checking repository state.\n" +
+				"Do NOT create plans, checklists, or interviews unless the user explicitly asks for planning or more structured discovery.\n" +
+				"Do NOT edit files or propose execution steps unless the user asks for implementation work.",
+		},
 		"plan": {
 			Name:        "plan",
 			Description: "Planner. Designs the work and writes the plan + checklist. Does not edit files.",
@@ -42,11 +53,13 @@ func DefaultModes() map[string]Mode {
 			Description: "Executor. Reads the approved plan and checklist and works through tasks directly with editor tools.",
 			Policy:      NewBuildPolicy(),
 			Prompt: "You are in build mode. There is an approved plan and a checklist of tasks; your job is to execute them directly.\n" +
-				"STEP 1: If you have not seen the plan/checklist yet this turn, call plan_get and task_list once to load them.\n" +
+				"STEP 1: First use the plan/checklist digest already present in the prompt. Only call plan_get or task_list if that digest is insufficient, stale, or missing details you need for the next task.\n" +
 				"STEP 2: Pick the next pending task in order. Mark it in_progress with task_update before you start the work.\n" +
 				"STEP 3: Do the work directly with editor tools — read_file the files you need, then call edit_file / write_file / apply_patch. Each mutation will prompt the user for approval; do NOT batch edits across multiple files in one tool call.\n" +
 				"STEP 4: When the task is finished, call task_update(status=\"completed\") with a short summary of what you changed. Then move to the next pending task.\n" +
 				"Do NOT call execute_task, spawn_subagent, plan_write, or todo_write — you are the executor, not the planner. If the plan needs to change, stop and tell the user to switch back to plan mode.\n" +
+				"Do NOT narrate your understanding, restate the checklist, or summarize gaps while tasks remain. Once you have enough context for the next action, return exactly one tool call.\n" +
+				"If tasks remain, prose-only responses are invalid unless you are explicitly blocked and need the user to switch back to plan mode.\n" +
 				"FILE SIZE LIMIT: keep every produced file at or below ~600 lines. If a single task implies a file >600 lines, stop, tell the user the checklist needs to be re-split, and switch them back to plan mode.\n" +
 				"Stop when there are no pending tasks left, and give a brief summary of what was done.",
 		},

@@ -17,7 +17,7 @@ func (m shellModel) renderMigrationWizard() string {
 		m.theme.Accent.Render("Hub migration wizard"),
 		m.theme.Muted.Render("Detected workspace configs that can become Hub defaults so every workspace inherits them."),
 		"",
-		m.theme.StatusValue.Render("What will move into ~/.codex/forge/global.toml:"),
+		m.theme.StatusValue.Render("What will move into ~/.forge/global.toml:"),
 		"",
 	}
 	for _, p := range m.migrationProposals {

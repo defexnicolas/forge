@@ -74,6 +74,18 @@ func NewPlanPolicy() SprintPolicy {
 	return SprintPolicy{allowed: allowed, ask: map[string]bool{}}
 }
 
+func NewChatPolicy() SprintPolicy {
+	allowed := map[string]bool{}
+	for _, name := range []string{
+		"read_file", "list_files", "search_text", "search_files",
+		"git_status", "git_diff",
+		"ask_user",
+	} {
+		allowed[name] = true
+	}
+	return SprintPolicy{allowed: allowed, ask: map[string]bool{}}
+}
+
 // NewBuildPolicy returns the policy for the executor mode: read tools allowed
 // outright, mutating tools require per-call approval, and planning/dispatch
 // tools are denied so the executor cannot re-plan or recurse into subagents.

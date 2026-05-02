@@ -51,14 +51,17 @@ func TestDefaultsUseRecommendedYarnProfile(t *testing.T) {
 		t.Fatalf("unexpected task context defaults: %#v", cfg.Context.Task)
 	}
 	if cfg.Runtime.RequestTimeoutSeconds != 45 ||
+		cfg.Runtime.RequestIdleTimeoutSeconds != 120 ||
 		cfg.Runtime.SubagentTimeoutSeconds != 90 ||
 		cfg.Runtime.TaskTimeoutSeconds != 180 ||
+		cfg.Runtime.MaxSteps != 40 ||
+		cfg.Runtime.MaxStepsBuild != 80 ||
 		cfg.Runtime.MaxNoProgressSteps != 3 ||
 		cfg.Runtime.MaxEmptyResponses != 2 ||
 		cfg.Runtime.MaxSameToolFailures != 2 ||
-		cfg.Runtime.MaxConsecutiveReadOnly != 6 ||
+		cfg.Runtime.MaxConsecutiveReadOnly != 10 ||
 		cfg.Runtime.MaxPlannerSummarySteps != 2 ||
-		cfg.Runtime.MaxBuilderReadLoops != 4 ||
+		cfg.Runtime.MaxBuilderReadLoops != 12 ||
 		cfg.Runtime.RetryOnProviderTimeout {
 		t.Fatalf("unexpected runtime defaults: %#v", cfg.Runtime)
 	}
@@ -88,7 +91,10 @@ func TestNormalizeBackfillsMultiModelDefaults(t *testing.T) {
 	if cfg.Context.Task.BudgetTokens != 4000 || cfg.Context.Task.MaxNodes != 6 {
 		t.Fatalf("expected task context defaults, got %#v", cfg.Context.Task)
 	}
-	if cfg.Runtime.RequestTimeoutSeconds != 45 || cfg.Runtime.MaxBuilderReadLoops != 4 {
+	// RequestTimeoutSeconds is no longer backfilled by Normalize — 0 is a
+	// valid "no deadline" setting. Only the safety-net knobs that must have
+	// a positive value are still normalized.
+	if cfg.Runtime.MaxBuilderReadLoops != 12 {
 		t.Fatalf("expected runtime defaults, got %#v", cfg.Runtime)
 	}
 	if cfg.Git.BaselineCommitMessage == "" || cfg.Git.SnapshotCommitMessage == "" {
@@ -129,6 +135,39 @@ func TestConfigForTaskRoleUsesSmallContext(t *testing.T) {
 	}
 }
 
+func TestNormalizePreservesZeroTimeouts(t *testing.T) {
+	// Explicit 0 must survive Normalize: that is how the user opts out of
+	// wall-clock deadlines on slow local-model setups. Regression for the
+	// "context deadline exceeded in PLAN/BUILD/refine" bug.
+	cfg := Config{
+		Models: map[string]string{"chat": "qwen"},
+		Runtime: RuntimeConfig{
+			RequestTimeoutSeconds:     0,
+			SubagentTimeoutSeconds:    0,
+			TaskTimeoutSeconds:        0,
+			RequestIdleTimeoutSeconds: 0,
+		},
+	}
+	Normalize(&cfg)
+	if cfg.Runtime.RequestTimeoutSeconds != 0 ||
+		cfg.Runtime.SubagentTimeoutSeconds != 0 ||
+		cfg.Runtime.TaskTimeoutSeconds != 0 ||
+		cfg.Runtime.RequestIdleTimeoutSeconds != 0 {
+		t.Fatalf("Normalize coerced explicit zero timeouts: %#v", cfg.Runtime)
+	}
+}
+
+func TestNormalizeBackfillsNegativeIdleTimeout(t *testing.T) {
+	cfg := Config{
+		Models:  map[string]string{"chat": "qwen"},
+		Runtime: RuntimeConfig{RequestIdleTimeoutSeconds: -1},
+	}
+	Normalize(&cfg)
+	if cfg.Runtime.RequestIdleTimeoutSeconds != 120 {
+		t.Fatalf("RequestIdleTimeoutSeconds = %d, want 120 (default)", cfg.Runtime.RequestIdleTimeoutSeconds)
+	}
+}
+
 func TestNormalizeDerivesBuildConcurrencyFromParallelSlots(t *testing.T) {
 	cfg := Config{
 		Models: map[string]string{"chat": "qwen"},
@@ -137,8 +176,17 @@ func TestNormalizeDerivesBuildConcurrencyFromParallelSlots(t *testing.T) {
 		},
 	}
 	Normalize(&cfg)
-	if cfg.Build.Subagents.Concurrency != 2 {
-		t.Fatalf("concurrency = %d, want capped default 2", cfg.Build.Subagents.Concurrency)
+	// Subagent concurrency now follows ParallelSlots so the user's
+	// hardware/backend slot count drives the fan-out — bumping
+	// parallel_slots no longer leaves slots silently idle.
+	if cfg.Build.Subagents.Concurrency != 4 {
+		t.Fatalf("Build concurrency = %d, want 4 (matches ParallelSlots)", cfg.Build.Subagents.Concurrency)
+	}
+	if cfg.Explore.Subagents.Concurrency != 4 {
+		t.Fatalf("Explore concurrency = %d, want 4 (matches ParallelSlots)", cfg.Explore.Subagents.Concurrency)
+	}
+	if cfg.Plan.Subagents.Concurrency != 4 {
+		t.Fatalf("Plan concurrency = %d, want 4 (matches ParallelSlots)", cfg.Plan.Subagents.Concurrency)
 	}
 	if len(cfg.Build.Subagents.Roles) == 0 {
 		t.Fatalf("expected default build subagent roles")
@@ -235,6 +283,74 @@ chat = "workspace-chat"
 	}
 	if cfg.Skills.CLI != "pnpx" {
 		t.Errorf("global skills.cli should win when workspace at default 'npx', got %q", cfg.Skills.CLI)
+	}
+}
+
+// TestLoadWithGlobalAppliesRuntimeDefaults verifies the runtime block from
+// global.toml flows into a workspace that does not set those fields. This is
+// what lets a slow-local-model setup configure timeouts/step caps once and
+// have every workspace inherit them.
+func TestLoadWithGlobalAppliesRuntimeDefaults(t *testing.T) {
+	t.Setenv("FORGE_GLOBAL_HOME", t.TempDir())
+	cwd := t.TempDir()
+	// Workspace omits runtime — global should fill in.
+	writeWorkspaceConfig(t, cwd, `
+[models]
+chat = "workspace-chat"
+`)
+	zero := 0
+	idle := 180
+	stepsBuild := 120
+	auto := "auto"
+	writeGlobal(t, globalconfig.GlobalConfig{
+		ApprovalProfile: &auto,
+		Runtime: &globalconfig.RuntimeDefaults{
+			RequestTimeoutSeconds:     &zero,
+			RequestIdleTimeoutSeconds: &idle,
+			MaxStepsBuild:             &stepsBuild,
+		},
+	})
+
+	cfg, err := LoadWithGlobal(cwd)
+	if err != nil {
+		t.Fatalf("LoadWithGlobal: %v", err)
+	}
+	if cfg.Runtime.RequestTimeoutSeconds != 0 {
+		t.Errorf("global request_timeout_seconds=0 should win on unset workspace, got %d", cfg.Runtime.RequestTimeoutSeconds)
+	}
+	if cfg.Runtime.RequestIdleTimeoutSeconds != 180 {
+		t.Errorf("global idle timeout should apply, got %d", cfg.Runtime.RequestIdleTimeoutSeconds)
+	}
+	if cfg.Runtime.MaxStepsBuild != 120 {
+		t.Errorf("global max_steps_build should apply, got %d", cfg.Runtime.MaxStepsBuild)
+	}
+	if cfg.ApprovalProfile != "auto" {
+		t.Errorf("global approval_profile should apply, got %q", cfg.ApprovalProfile)
+	}
+}
+
+// TestLoadWithGlobalRuntimeRespectsWorkspaceOverride verifies a workspace
+// that explicitly writes a runtime field still wins over the global value.
+func TestLoadWithGlobalRuntimeRespectsWorkspaceOverride(t *testing.T) {
+	t.Setenv("FORGE_GLOBAL_HOME", t.TempDir())
+	cwd := t.TempDir()
+	writeWorkspaceConfig(t, cwd, `
+[runtime]
+request_timeout_seconds = 1800
+`)
+	zero := 0
+	writeGlobal(t, globalconfig.GlobalConfig{
+		Runtime: &globalconfig.RuntimeDefaults{
+			RequestTimeoutSeconds: &zero,
+		},
+	})
+
+	cfg, err := LoadWithGlobal(cwd)
+	if err != nil {
+		t.Fatalf("LoadWithGlobal: %v", err)
+	}
+	if cfg.Runtime.RequestTimeoutSeconds != 1800 {
+		t.Errorf("workspace runtime override should win, got %d", cfg.Runtime.RequestTimeoutSeconds)
 	}
 }
 

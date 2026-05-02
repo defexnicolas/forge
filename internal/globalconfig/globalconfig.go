@@ -1,7 +1,15 @@
 // Package globalconfig is the user-level (cross-workspace) defaults layer.
-// Whatever the user sets in ~/.codex/forge/global.toml becomes the default
-// for every workspace; an individual workspace's .forge/config.toml still
-// wins for any field it sets.
+// Whatever the user sets in ~/.forge/global.toml becomes the default for
+// every workspace; an individual workspace's .forge/config.toml still wins
+// for any field it sets.
+//
+// Path history: forge originally lived under ~/.codex/forge/ to coexist
+// with the Codex CLI. Since the product is forge, the home moved to
+// ~/.forge/. Migrate() copies the legacy paths over on first launch so
+// existing users do not lose state. Skills are intentionally still scanned
+// from ~/.codex/skills/ as a secondary read source — the skills CLI
+// installs there when invoked with --agent codex, and we want the user to
+// keep any skills they already share with the Codex CLI ecosystem.
 //
 // The package is intentionally small: it only loads/saves the file and
 // exposes the raw structure. The merge into `config.Config` lives in
@@ -24,16 +32,18 @@ import (
 	"github.com/pelletier/go-toml/v2"
 )
 
-// GlobalConfig is the on-disk shape of ~/.codex/forge/global.toml.
+// GlobalConfig is the on-disk shape of ~/.forge/global.toml.
 type GlobalConfig struct {
-	Theme          *string                  `toml:"theme,omitempty"`
-	Providers      map[string]ProviderEntry `toml:"providers,omitempty"`
-	Models         map[string]string        `toml:"models,omitempty"`
-	DetectedByRole map[string]DetectedModel `toml:"detected_by_role,omitempty"`
-	ModelLoading   *ModelLoadingDefaults    `toml:"model_loading,omitempty"`
-	Yarn           *YarnDefaults            `toml:"yarn,omitempty"`
-	Skills         *SkillsDefaults          `toml:"skills,omitempty"`
-	Plugins        *PluginsDefaults         `toml:"plugins,omitempty"`
+	Theme           *string                  `toml:"theme,omitempty"`
+	ApprovalProfile *string                  `toml:"approval_profile,omitempty"`
+	Providers       map[string]ProviderEntry `toml:"providers,omitempty"`
+	Models          map[string]string        `toml:"models,omitempty"`
+	DetectedByRole  map[string]DetectedModel `toml:"detected_by_role,omitempty"`
+	ModelLoading    *ModelLoadingDefaults    `toml:"model_loading,omitempty"`
+	Yarn            *YarnDefaults            `toml:"yarn,omitempty"`
+	Skills          *SkillsDefaults          `toml:"skills,omitempty"`
+	Plugins         *PluginsDefaults         `toml:"plugins,omitempty"`
+	Runtime         *RuntimeDefaults         `toml:"runtime,omitempty"`
 }
 
 // ProviderEntry mirrors config.ProviderConfig but every field is a pointer
@@ -95,44 +105,152 @@ type PluginsDefaults struct {
 	EnabledByDefault []string `toml:"enabled_by_default,omitempty"`
 }
 
-// Path returns the absolute path of the global config file. FORGE_GLOBAL_HOME
-// overrides the default location for testing.
-func Path() string {
+// RuntimeDefaults captures cross-workspace agent-runtime defaults: timeouts,
+// step caps, and the read-only / no-progress safety guards. Setting these
+// globally lets a slow-local-model setup (or any other tuning) apply to
+// every workspace the user opens, without editing each .forge/config.toml.
+//
+// Pointers everywhere so "field unset" is distinguishable from "field
+// deliberately set to zero" — important for timeouts where 0 means "no
+// deadline" rather than "use default".
+type RuntimeDefaults struct {
+	RequestTimeoutSeconds     *int  `toml:"request_timeout_seconds,omitempty"`
+	RequestIdleTimeoutSeconds *int  `toml:"request_idle_timeout_seconds,omitempty"`
+	SubagentTimeoutSeconds    *int  `toml:"subagent_timeout_seconds,omitempty"`
+	TaskTimeoutSeconds        *int  `toml:"task_timeout_seconds,omitempty"`
+	MaxSteps                  *int  `toml:"max_steps,omitempty"`
+	MaxStepsBuild             *int  `toml:"max_steps_build,omitempty"`
+	MaxNoProgressSteps        *int  `toml:"max_no_progress_steps,omitempty"`
+	MaxEmptyResponses         *int  `toml:"max_empty_responses,omitempty"`
+	MaxSameToolFailures       *int  `toml:"max_same_tool_failures,omitempty"`
+	MaxConsecutiveReadOnly    *int  `toml:"max_consecutive_read_only,omitempty"`
+	MaxPlannerSummarySteps    *int  `toml:"max_planner_summary_steps,omitempty"`
+	MaxBuilderReadLoops       *int  `toml:"max_builder_read_loops,omitempty"`
+	RetryOnProviderTimeout    *bool `toml:"retry_on_provider_timeout,omitempty"`
+	InlineBuilder             *bool `toml:"inline_builder,omitempty"`
+}
+
+// HomeDir returns the user-level forge home (~/.forge by default). All
+// forge-owned state — global config, hub state, internal cache — lives
+// here. FORGE_GLOBAL_HOME overrides for tests.
+func HomeDir() string {
 	if env := os.Getenv("FORGE_GLOBAL_HOME"); env != "" {
-		return filepath.Join(env, "global.toml")
+		return env
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		// Last-resort fallback: relative to the cwd. Better than panicking
 		// on a system without a home dir.
-		return filepath.Join(".forge_global.toml")
+		return ".forge_global"
 	}
-	return filepath.Join(home, ".codex", "forge", "global.toml")
+	return filepath.Join(home, ".forge")
 }
 
-// CacheDir returns the global skills cache directory. Same env override.
+// Path returns the absolute path of the global config file.
+func Path() string {
+	return filepath.Join(HomeDir(), "global.toml")
+}
+
+// CacheDir returns the global skills cache directory.
 func CacheDir() string {
-	if env := os.Getenv("FORGE_GLOBAL_HOME"); env != "" {
-		return filepath.Join(env, "cache", "skills")
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return filepath.Join(".forge_global", "cache", "skills")
-	}
-	return filepath.Join(home, ".codex", "cache", "skills")
+	return filepath.Join(HomeDir(), "cache", "skills")
 }
 
-// SkillsInstallDir returns where globally-installed skills live (target of
-// `npx skills add ...` when the Hub triggers it).
+// SkillsInstallDir returns where Hub-triggered skill installs land. Note
+// that skills installed via the external `npx skills` CLI with --agent
+// codex still go to ~/.codex/skills/ — that's the CLI's choice, and the
+// Manager's searchDirs() reads from both locations so either works.
 func SkillsInstallDir() string {
-	if env := os.Getenv("FORGE_GLOBAL_HOME"); env != "" {
-		return filepath.Join(env, "skills")
+	return filepath.Join(HomeDir(), "skills")
+}
+
+// LegacyHomeDir returns the pre-migration ~/.codex/forge home. Used by
+// Migrate() to detect and copy old state on first launch.
+func LegacyHomeDir() string {
+	if env := os.Getenv("FORGE_LEGACY_HOME"); env != "" {
+		return env
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return filepath.Join(".forge_global", "skills")
+		return ""
 	}
-	return filepath.Join(home, ".codex", "skills")
+	return filepath.Join(home, ".codex")
+}
+
+// Migrate copies pre-existing files from ~/.codex/forge/ into ~/.forge/
+// the first time forge runs after the home directory move. Idempotent:
+// only copies when the destination is missing. Quietly succeeds when there
+// is nothing to migrate (fresh install, or already migrated).
+func Migrate() error {
+	legacy := LegacyHomeDir()
+	if legacy == "" {
+		return nil
+	}
+	target := HomeDir()
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		return err
+	}
+	moves := []struct{ from, to string }{
+		{filepath.Join(legacy, "forge", "global.toml"), filepath.Join(target, "global.toml")},
+		// Hub state lived at ~/.codex/memories/forge_hub_state.json; it
+		// moves to ~/.forge/hub_state.json (no "forge_" prefix needed —
+		// it is already inside the forge home).
+		{filepath.Join(legacy, "memories", "forge_hub_state.json"), filepath.Join(target, "hub_state.json")},
+	}
+	for _, m := range moves {
+		if _, err := os.Stat(m.to); err == nil {
+			continue // already migrated
+		}
+		data, err := os.ReadFile(m.from)
+		if err != nil {
+			continue // legacy file missing — nothing to do
+		}
+		if err := os.WriteFile(m.to, data, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// LoadedKeys returns the set of dotted TOML keys explicitly present in the
+// user's global config. Mirrors config.WorkspaceKeys so callers (e.g. the
+// settings panel) can tell "value matches builtin coincidentally" from
+// "user explicitly set this in ~/.codex/forge/global.toml". A missing or
+// malformed file yields an empty set, not an error — the file being missing
+// is the normal "user has not customized anything" case.
+func LoadedKeys() map[string]bool {
+	path := Path()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return map[string]bool{}
+	}
+	var raw map[string]any
+	if err := toml.Unmarshal(data, &raw); err != nil {
+		return map[string]bool{}
+	}
+	out := map[string]bool{}
+	collectKeys(raw, "", out)
+	return out
+}
+
+func collectKeys(value any, prefix string, out map[string]bool) {
+	m, ok := value.(map[string]any)
+	if !ok {
+		if prefix != "" {
+			out[prefix] = true
+		}
+		return
+	}
+	if prefix != "" {
+		out[prefix] = true
+	}
+	for k, v := range m {
+		key := k
+		if prefix != "" {
+			key = prefix + "." + k
+		}
+		collectKeys(v, key, out)
+	}
 }
 
 // Load reads the global config file. A missing file returns an empty

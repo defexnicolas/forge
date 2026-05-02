@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"forge/internal/config"
@@ -27,9 +28,11 @@ func NewOpenAICompatible(name string, cfg config.ProviderConfig) *OpenAICompatib
 	return &OpenAICompatible{
 		name: name,
 		cfg:  cfg,
-		client: &http.Client{
-			Timeout: 90 * time.Second,
-		},
+		// Do not impose a second hard timeout here. The runtime already wraps
+		// requests in a context with the configured request timeout, and a
+		// fixed client timeout can fire first and ignore that higher-level
+		// configuration.
+		client: &http.Client{},
 	}
 }
 
@@ -101,6 +104,20 @@ func (p *OpenAICompatible) Chat(ctx context.Context, req ChatRequest) (*ChatResp
 }
 
 func (p *OpenAICompatible) Stream(ctx context.Context, req ChatRequest) (<-chan ChatEvent, error) {
+	return p.StreamWithIdle(ctx, req, 0)
+}
+
+// StreamWithIdle is Stream with an idle-timeout watchdog. If idle > 0, the
+// request is cancelled when no SSE chunk has arrived within `idle` after the
+// first chunk was received. The watchdog deliberately does not arm during the
+// initial prompt-processing window — local backends like LM Studio can spend
+// many minutes processing a 12k-token prompt before emitting any token, and
+// killing the request during that window would defeat the purpose.
+//
+// When the watchdog fires, the error event delivered through the events
+// channel is rewritten to ErrIdleTimeout so callers can distinguish "provider
+// went silent mid-stream" from a wall-clock context deadline.
+func (p *OpenAICompatible) StreamWithIdle(ctx context.Context, req ChatRequest, idle time.Duration) (<-chan ChatEvent, error) {
 	if p.cfg.BaseURL == "" {
 		return nil, ErrProviderNotConfigured
 	}
@@ -114,8 +131,13 @@ func (p *OpenAICompatible) Stream(ctx context.Context, req ChatRequest) (<-chan 
 		return nil, err
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint("/chat/completions"), bytes.NewReader(body))
+	// Derived context so the watchdog can cancel the in-flight request
+	// without affecting the caller's ctx.
+	streamCtx, streamCancel := context.WithCancel(ctx)
+
+	httpReq, err := http.NewRequestWithContext(streamCtx, http.MethodPost, p.endpoint("/chat/completions"), bytes.NewReader(body))
 	if err != nil {
+		streamCancel()
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -128,30 +150,109 @@ func (p *OpenAICompatible) Stream(ctx context.Context, req ChatRequest) (<-chan 
 	streamClient := &http.Client{}
 	resp, err := streamClient.Do(httpReq)
 	if err != nil {
+		streamCancel()
 		return nil, err
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		defer resp.Body.Close()
+		streamCancel()
 		errBody, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("provider %s returned %s: %s", p.name, resp.Status, string(errBody))
 	}
 
+	// lastActivity holds the unix-nano timestamp of the most recent byte
+	// read from the response body. Zero means "no chunk yet" — the watchdog
+	// treats that as still in prompt-processing and skips the staleness
+	// check until the first chunk arrives.
+	var lastActivity atomic.Int64
+	var idleFired atomic.Bool
+
+	var reader io.Reader = resp.Body
+	if idle > 0 {
+		reader = &activityReader{r: reader, onRead: func() {
+			lastActivity.Store(time.Now().UnixNano())
+		}}
+	}
+
+	if logPath := strings.TrimSpace(os.Getenv("FORGE_SSE_LOG")); logPath != "" {
+		if f, ferr := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); ferr == nil {
+			fmt.Fprintf(f, "\n=== %s | %s | model=%s ===\n", time.Now().Format(time.RFC3339Nano), p.name, req.Model)
+			reader = io.TeeReader(reader, f)
+			// Note: f leaks until process exit; matches the prior behavior
+			// where the log file was deferred-closed inside the goroutine.
+			// Move the close into the SSE goroutine below.
+			go func() {
+				<-streamCtx.Done()
+				_ = f.Close()
+			}()
+		}
+	}
+
+	rawEvents := make(chan ChatEvent, 16)
 	events := make(chan ChatEvent, 16)
+
+	// Watchdog: arms once lastActivity becomes non-zero. Tick interval is
+	// idle/4 so we detect within ~25% of the configured window without
+	// spinning. Capped at 1s minimum to avoid burning CPU on tiny idles.
+	if idle > 0 {
+		go func() {
+			tick := max(idle/4, time.Second)
+			ticker := time.NewTicker(tick)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-streamCtx.Done():
+					return
+				case now := <-ticker.C:
+					last := lastActivity.Load()
+					if last == 0 {
+						continue
+					}
+					if now.Sub(time.Unix(0, last)) > idle {
+						idleFired.Store(true)
+						streamCancel()
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	go func() {
+		defer close(rawEvents)
+		defer resp.Body.Close()
+		p.readSSE(reader, rawEvents)
+	}()
+
 	go func() {
 		defer close(events)
-		defer resp.Body.Close()
-		var reader io.Reader = resp.Body
-		if logPath := strings.TrimSpace(os.Getenv("FORGE_SSE_LOG")); logPath != "" {
-			if f, ferr := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); ferr == nil {
-				defer f.Close()
-				fmt.Fprintf(f, "\n=== %s | %s | model=%s ===\n", time.Now().Format(time.RFC3339Nano), p.name, req.Model)
-				reader = io.TeeReader(resp.Body, f)
+		defer streamCancel()
+		for evt := range rawEvents {
+			if evt.Type == "error" && idleFired.Load() {
+				evt.Error = ErrIdleTimeout
 			}
+			events <- evt
 		}
-		p.readSSE(reader, events)
 	}()
+
 	return events, nil
+}
+
+// activityReader notifies onRead whenever the underlying reader returns data,
+// letting the idle watchdog track per-chunk freshness without touching the
+// SSE parser.
+type activityReader struct {
+	r      io.Reader
+	onRead func()
+}
+
+func (a *activityReader) Read(p []byte) (int, error) {
+	n, err := a.r.Read(p)
+	if n > 0 && a.onRead != nil {
+		a.onRead()
+	}
+	return n, err
 }
 
 func (p *OpenAICompatible) readSSE(body io.Reader, events chan<- ChatEvent) {

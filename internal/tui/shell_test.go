@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"forge/internal/agent"
 	"forge/internal/config"
 	"forge/internal/globalconfig"
 
@@ -228,6 +229,34 @@ func TestShellEnterInWorkspaceInputForwardsToWorkspace(t *testing.T) {
 	}
 }
 
+func TestShellWorkspaceAskUserModalKeepsFocusOffBaseInput(t *testing.T) {
+	cwd := t.TempDir()
+	m := newShellModel(ShellOptions{
+		InitialHubDir:    cwd,
+		InitialWorkspace: &WorkspaceSession{Options: Options{CWD: cwd}},
+		StateStore:       &memoryHubStateStore{},
+	})
+	t.Cleanup(func() {
+		_ = (&m).Close()
+	})
+	m.activePane = paneInput
+	m.workspace.activeForm = formAskUser
+	m.workspace.askUserForm = newAskUserForm(&agent.AskUserRequest{
+		Question: "Choose one",
+		Options:  []string{"A", "B", "C"},
+	}, m.workspace.theme, 96, 24)
+	m.workspace.input.Focus()
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	next := updated.(shellModel)
+	if next.workspace.askUserForm.cursor != 1 {
+		t.Fatalf("cursor = %d, want 1", next.workspace.askUserForm.cursor)
+	}
+	if next.workspace.input.Focused() {
+		t.Fatal("expected workspace base input blurred while ask_user modal is active")
+	}
+}
+
 func TestShellEnterInHubSidebarActivatesMainPane(t *testing.T) {
 	m := newShellModel(ShellOptions{
 		InitialHubDir: t.TempDir(),
@@ -293,8 +322,43 @@ func TestShellEnterInHubSidebarOpensChat(t *testing.T) {
 	if next.hubChat.options.CWD == cwd {
 		t.Fatalf("hub chat should not reuse explorer cwd %q", cwd)
 	}
+	if got := next.hubChat.agentRuntime.Mode; got != "chat" {
+		t.Fatalf("hub chat mode = %q, want chat", got)
+	}
 	if cmd == nil {
 		t.Fatal("expected resize/init command for hub chat")
+	}
+}
+
+func TestShellHubAskUserModalKeepsFocusOffBaseInput(t *testing.T) {
+	t.Setenv("FORGE_GLOBAL_HOME", t.TempDir())
+	m := newShellModel(ShellOptions{
+		InitialHubDir: t.TempDir(),
+		StateStore:    &memoryHubStateStore{},
+	})
+	t.Cleanup(func() {
+		_ = (&m).Close()
+	})
+	if cmd := m.ensureHubChatSession(); cmd == nil {
+		t.Fatal("expected hub chat session command")
+	}
+	m.mode = modeHub
+	m.activeView = viewChat
+	m.activePane = paneInput
+	m.hubChat.activeForm = formAskUser
+	m.hubChat.askUserForm = newAskUserForm(&agent.AskUserRequest{
+		Question: "Choose one",
+		Options:  []string{"A", "B", "C"},
+	}, m.hubChat.theme, 96, 24)
+	m.hubChat.input.Focus()
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	next := updated.(shellModel)
+	if next.hubChat.askUserForm.cursor != 1 {
+		t.Fatalf("cursor = %d, want 1", next.hubChat.askUserForm.cursor)
+	}
+	if next.hubChat.input.Focused() {
+		t.Fatal("expected hub base input blurred while ask_user modal is active")
 	}
 }
 

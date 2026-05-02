@@ -98,6 +98,21 @@ func managedWorkspaceSettings() []managedSetting {
 		{path: "context.yarn.compact_transcript_chars", value: func(cfg Config) any { return cfg.Context.Yarn.CompactTranscriptChars }},
 		{path: "context.yarn.render_mode", value: func(cfg Config) any { return cfg.Context.Yarn.RenderMode }},
 		{path: "context.yarn.render_head_lines", value: func(cfg Config) any { return cfg.Context.Yarn.RenderHeadLines }},
+		{path: "approval_profile", value: func(cfg Config) any { return cfg.ApprovalProfile }},
+		{path: "runtime.request_timeout_seconds", value: func(cfg Config) any { return cfg.Runtime.RequestTimeoutSeconds }},
+		{path: "runtime.request_idle_timeout_seconds", value: func(cfg Config) any { return cfg.Runtime.RequestIdleTimeoutSeconds }},
+		{path: "runtime.subagent_timeout_seconds", value: func(cfg Config) any { return cfg.Runtime.SubagentTimeoutSeconds }},
+		{path: "runtime.task_timeout_seconds", value: func(cfg Config) any { return cfg.Runtime.TaskTimeoutSeconds }},
+		{path: "runtime.max_steps", value: func(cfg Config) any { return cfg.Runtime.MaxSteps }},
+		{path: "runtime.max_steps_build", value: func(cfg Config) any { return cfg.Runtime.MaxStepsBuild }},
+		{path: "runtime.max_no_progress_steps", value: func(cfg Config) any { return cfg.Runtime.MaxNoProgressSteps }},
+		{path: "runtime.max_empty_responses", value: func(cfg Config) any { return cfg.Runtime.MaxEmptyResponses }},
+		{path: "runtime.max_same_tool_failures", value: func(cfg Config) any { return cfg.Runtime.MaxSameToolFailures }},
+		{path: "runtime.max_consecutive_read_only", value: func(cfg Config) any { return cfg.Runtime.MaxConsecutiveReadOnly }},
+		{path: "runtime.max_planner_summary_steps", value: func(cfg Config) any { return cfg.Runtime.MaxPlannerSummarySteps }},
+		{path: "runtime.max_builder_read_loops", value: func(cfg Config) any { return cfg.Runtime.MaxBuilderReadLoops }},
+		{path: "runtime.retry_on_provider_timeout", value: func(cfg Config) any { return cfg.Runtime.RetryOnProviderTimeout }},
+		{path: "runtime.inline_builder", value: func(cfg Config) any { return cfg.Runtime.InlineBuilder }},
 	}
 
 	for _, role := range []string{"chat", "explorer", "planner", "editor", "reviewer", "summarizer"} {

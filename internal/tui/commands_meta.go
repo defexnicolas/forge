@@ -14,7 +14,7 @@ var tuiCommands = []commandDescriptor{
 	{Name: "/model", Usage: "/model [list|set|reload]", Description: "manage models"},
 	{Name: "/model-multi", Usage: "/model-multi [off]", Description: "assign models per agent role", Subcommands: []string{"off"}},
 	{Name: "/provider", Usage: "/provider", Description: "configure provider URL, key, model"},
-	{Name: "/mode", Usage: "/mode [name]", Description: "switch mode (plan/build/explore)"},
+	{Name: "/mode", Usage: "/mode [name]", Description: "switch mode (chat/plan/build/explore)"},
 	{Name: "/agents", Usage: "/agents", Description: "list subagents"},
 	{Name: "/agent", Usage: "/agent <name> <task>", Description: "run a subagent task"},
 	{Name: "/plan", Usage: "/plan [panel|full|todos|new]", Description: "manage plan document and checklist panel", Subcommands: []string{"panel", "full", "todos", "new", "refine"}},
@@ -52,6 +52,7 @@ var tuiCommands = []commandDescriptor{
 	{Name: "/analyze", Usage: "/analyze [refresh|show]", Description: "scan and cache project snapshot", Subcommands: []string{"refresh", "show"}},
 	{Name: "/btw", Usage: "/btw <question>", Description: "side LLM call using shared context (parallel)"},
 	{Name: "/remote-control", Usage: "/remote-control [start|stop|status] [port]", Description: "serve session over LAN for web/device access", Subcommands: []string{"start", "stop", "status"}},
+	{Name: "/code", Usage: "/code", Description: "open the workspace in VS Code"},
 	{Name: "/quit", Usage: "/quit", Description: "exit forge and save history"},
 }
 

@@ -132,6 +132,51 @@ func TestTogglePinPinsExplorerDirectorySelection(t *testing.T) {
 	}
 }
 
+// TestNewShellModelPreservesLoadedHubState is a regression for the bug where
+// newShellModel built shellModel without copying the loaded hubState into the
+// struct, so the very first loadExplorerDir() call wrote a zero-value
+// HubState back to disk and silently wiped Pinned + Recent across restarts.
+func TestNewShellModelPreservesLoadedHubState(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "hub.json")
+	pre := HubState{
+		LastHubDir:       "/some/where",
+		RecentWorkspaces: []RecentWorkspace{{Path: "/projects/snake"}},
+		Pinned:           []string{"/projects/snake"},
+		MigrationDone:    true,
+	}
+	store := NewFileHubStateStore(path)
+	if err := store.Save(pre); err != nil {
+		t.Fatalf("seed Save: %v", err)
+	}
+
+	m := newShellModel(ShellOptions{
+		StateStore:    store,
+		InitialHubDir: dir, // avoid loadExplorerDir touching anything outside tempdir
+	})
+
+	if !m.hubState.IsPinned("/projects/snake") {
+		t.Errorf("loaded Pinned lost on construction: %v", m.hubState.Pinned)
+	}
+	if len(m.hubState.RecentWorkspaces) != 1 {
+		t.Errorf("loaded RecentWorkspaces lost: %v", m.hubState.RecentWorkspaces)
+	}
+	if !m.hubState.MigrationDone {
+		t.Error("loaded MigrationDone flipped back to false on construction")
+	}
+
+	// The on-disk file must still contain the pin after construction —
+	// loadExplorerDir runs inside newShellModel and saves; if the loaded
+	// state was not propagated, that save would clobber Pinned.
+	got, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !got.IsPinned("/projects/snake") {
+		t.Errorf("Pinned wiped from disk during construction: %v", got.Pinned)
+	}
+}
+
 func TestHubStateSaveLoadRoundtrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "hub.json")

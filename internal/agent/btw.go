@@ -64,7 +64,7 @@ func (r *Runtime) runBtw(ctx context.Context, question string, events chan<- Eve
 		},
 	}
 
-	stream, err := provider.Stream(ctx, req)
+	stream, err := r.streamProvider(ctx, provider, req)
 	if err != nil {
 		resp, chatErr := provider.Chat(ctx, req)
 		if chatErr != nil {

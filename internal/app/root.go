@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"forge/internal/config"
+	"forge/internal/globalconfig"
 	"forge/internal/llm"
 	"forge/internal/session"
 	"forge/internal/tui"
@@ -22,6 +23,13 @@ func NewRootCommand() *cobra.Command {
 		Use:   "forge",
 		Short: "Terminal workbench for coding agents",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// One-shot migration of the user-level forge home from the
+			// legacy ~/.codex/forge/ layout to ~/.forge/. Idempotent and
+			// silent on a fresh install. Run before anything else so the
+			// first global.toml / hub_state.json read sees the new path.
+			if err := globalconfig.Migrate(); err != nil {
+				fmt.Fprintf(os.Stderr, "forge home migration warning: %v\n", err)
+			}
 			launchDir, err := os.Getwd()
 			if err != nil {
 				return err

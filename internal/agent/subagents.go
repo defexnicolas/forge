@@ -210,9 +210,11 @@ func (r *Runtime) RunSubagent(ctx context.Context, request SubagentRequest) (too
 	consecutiveReadLoops := 0
 	for step := 0; step < stepLimit; step++ {
 		stepsUsed := step + 1
-		// Mirror the planner-loop compaction (runtime.go:1068) so prefill stays
-		// bounded as the Builder accumulates read_file results across steps.
-		compactOldToolResults(messages, 3)
+		// Mirror the planner-loop compaction so prefill stays bounded as
+		// the Builder accumulates read_file results across steps. Keep
+		// only 2 verbatim — the builder turn is by definition build-mode
+		// work where prefill on long sequences hurts the most.
+		compactOldToolResults(messages, 2)
 		reqCtx, reqCancel := withOptionalTimeout(subCtx, r.requestTimeout())
 		accumulated, toolCalls, err := r.streamSubagentResponse(reqCtx, provider, llm.ChatRequest{
 			Model:    model,
@@ -386,7 +388,7 @@ func (r *Runtime) RunSubagent(ctx context.Context, request SubagentRequest) (too
 }
 
 func (r *Runtime) streamSubagentResponse(ctx context.Context, provider llm.Provider, req llm.ChatRequest) (string, []llm.ToolCall, error) {
-	stream, err := provider.Stream(ctx, req)
+	stream, err := r.streamProvider(ctx, provider, req)
 	if err != nil {
 		if !errors.Is(err, llm.ErrNotSupported) {
 			return "", nil, err
@@ -597,6 +599,16 @@ func (r *Runtime) executeSubagentTool(ctx context.Context, worker Subagent, call
 	if !contains(worker.AllowedTools, canonicalName) {
 		return "Tool result for " + canonicalName + ": denied by subagent policy", nil
 	}
+	// Subagents share the parent's per-turn read cache. Without this, four
+	// parallel builders each re-read the same files from disk and re-prefill
+	// the bytes into their separate message histories — multiplying token
+	// usage by N for no useful work. Cache hits are also exempt from the
+	// builder's read-loop guard since the read did no real work.
+	if canonicalName == "read_file" {
+		if cached, _, hit := r.lookupReadCache(call.Input); hit && cached != nil {
+			return "Tool result for read_file:\n" + summarizeResult(*cached), nil
+		}
+	}
 	if canonicalName == "run_command" {
 		var req struct {
 			Command string `json:"command"`
@@ -608,7 +620,7 @@ func (r *Runtime) executeSubagentTool(ctx context.Context, worker Subagent, call
 		if decision == permissions.Deny {
 			return "Tool result for run_command: " + reason, nil
 		}
-		if decision == permissions.Ask {
+		if decision == permissions.Ask && !r.autoApproveMode() {
 			events := r.currentEvents()
 			if events == nil {
 				return "Tool result for run_command: no event channel available for approval", nil
@@ -659,7 +671,13 @@ func (r *Runtime) executeSubagentTool(ctx context.Context, worker Subagent, call
 	if err != nil {
 		return "", err
 	}
-	return "Tool result for " + canonicalName + ":\n" + summarizeResult(result), nil
+	observation := "Tool result for " + canonicalName + ":\n" + summarizeResult(result)
+	// Populate the shared read cache so a sibling subagent (or the parent
+	// later in the turn) gets a hit instead of re-reading from disk.
+	if canonicalName == "read_file" && len(result.Content) > 0 {
+		r.storeReadCache(call.Input, &result, observation)
+	}
+	return observation, nil
 }
 
 // currentEvents returns the events channel of the in-flight turn, or nil when

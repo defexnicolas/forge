@@ -77,6 +77,28 @@ func (r *Runtime) requestTimeout() time.Duration {
 	return time.Duration(secs) * time.Second
 }
 
+func (r *Runtime) requestIdleTimeout() time.Duration {
+	secs := r.Config.Runtime.RequestIdleTimeoutSeconds
+	if secs <= 0 {
+		return 0
+	}
+	return time.Duration(secs) * time.Second
+}
+
+// streamProvider invokes provider.Stream, opting into the idle-timeout
+// watchdog when the provider implements StreamWithIdle. Centralising this
+// keeps the type assertion off every LLM call site.
+func (r *Runtime) streamProvider(ctx context.Context, provider llm.Provider, req llm.ChatRequest) (<-chan llm.ChatEvent, error) {
+	if idle := r.requestIdleTimeout(); idle > 0 {
+		if p, ok := provider.(interface {
+			StreamWithIdle(context.Context, llm.ChatRequest, time.Duration) (<-chan llm.ChatEvent, error)
+		}); ok {
+			return p.StreamWithIdle(ctx, req, idle)
+		}
+	}
+	return provider.Stream(ctx, req)
+}
+
 func (r *Runtime) subagentTimeout() time.Duration {
 	secs := r.Config.Runtime.SubagentTimeoutSeconds
 	if secs <= 0 {
@@ -130,13 +152,27 @@ func (r *Runtime) maxPlannerSummarySteps() int {
 
 func (r *Runtime) maxBuilderReadLoops() int {
 	if v := r.Config.Runtime.MaxBuilderReadLoops; v > 0 {
+		// Floor at 8 — anything lower fires before the agent finishes
+		// reading the relevant files for even a small task.
+		if v < 8 {
+			return 8
+		}
 		return v
 	}
-	return 4
+	return 12
 }
 
 func (r *Runtime) retryOnProviderTimeout() bool {
 	return r.Config.Runtime.RetryOnProviderTimeout
+}
+
+// autoApproveMode reports whether the configured approval_profile bypasses
+// the interactive prompt for file mutations and run_command. "auto" and
+// "yolo" both opt in. Anything else (including the default "normal" and
+// the safe "safe" profiles) keeps the prompt-on-each-mutation behaviour.
+func (r *Runtime) autoApproveMode() bool {
+	p := strings.ToLower(strings.TrimSpace(r.Config.ApprovalProfile))
+	return p == "auto" || p == "yolo"
 }
 
 func withOptionalTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,6 +29,14 @@ type fakeProvider struct {
 	loads       []string
 	loadConfigs []llm.LoadConfig
 	calls       int
+}
+
+type fakeHistorySource struct {
+	text string
+}
+
+func (f fakeHistorySource) ContextText(limit int) string {
+	return f.text
 }
 
 func (f *fakeProvider) Name() string { return "fake" }
@@ -206,6 +215,26 @@ func (p *scriptedTimeoutProvider) LoadModel(ctx context.Context, id string, cfg 
 	return nil
 }
 
+func TestNewRuntimeAdoptsConfigMaxSteps(t *testing.T) {
+	cwd := t.TempDir()
+	cfg := config.Defaults()
+	cfg.Runtime.MaxSteps = 17
+	r := newTestRuntime(t, cwd, cfg, tools.NewRegistry(), llm.NewRegistry())
+	if r.MaxSteps != 17 {
+		t.Errorf("MaxSteps = %d, want 17 (from cfg.Runtime.MaxSteps)", r.MaxSteps)
+	}
+}
+
+func TestNewRuntimeFallsBackTo40WhenConfigZero(t *testing.T) {
+	cwd := t.TempDir()
+	cfg := config.Defaults()
+	cfg.Runtime.MaxSteps = 0
+	r := newTestRuntime(t, cwd, cfg, tools.NewRegistry(), llm.NewRegistry())
+	if r.MaxSteps != 40 {
+		t.Errorf("MaxSteps = %d, want 40 (built-in fallback)", r.MaxSteps)
+	}
+}
+
 func TestRuntimeReadsFileThenAnswers(t *testing.T) {
 	cwd := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(cwd, "docs"), 0o755); err != nil {
@@ -305,6 +334,75 @@ func TestPlanModeAutoSwitchesToBuildOnExecuteIntent(t *testing.T) {
 	if runtime.Mode != "build" {
 		t.Fatalf("expected mode to be build after auto-switch, got %s", runtime.Mode)
 	}
+	prompt := provider.requests[0].Messages[1].Content
+	if !strings.Contains(prompt, "Use the digest below first; call plan_get only if that digest is insufficient.") {
+		t.Fatalf("expected build prompt to prefer plan digest before plan_get, got:\n%s", prompt)
+	}
+}
+
+func TestBuildPromptOmitsSessionTimeline(t *testing.T) {
+	cwd := t.TempDir()
+	cfg := config.Defaults()
+	cfg.Providers.Default.Name = "fake"
+	registry := tools.NewRegistry()
+	tools.RegisterBuiltins(registry)
+	provider := &fakeProvider{responses: []string{"done"}}
+	providers := llm.NewRegistry()
+	providers.Register(provider)
+
+	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+	runtime.Builder.History = fakeHistorySource{text: "Session summary:\nfirst request\n\nRecent timeline:\nfirst answer"}
+	if _, err := runtime.Plans.Save(plans.Document{Summary: "approved plan"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Tasks.ReplacePlan([]string{"Apply the patch"}); err != nil {
+		t.Fatal(err)
+	}
+
+	for range runtime.Run(context.Background(), "execute the plan") {
+	}
+	prompt := provider.requests[0].Messages[1].Content
+	if strings.Contains(prompt, "Session summary:") || strings.Contains(prompt, "Recent timeline:") {
+		t.Fatalf("build prompt should omit session timeline, got:\n%s", prompt)
+	}
+}
+
+func TestBuildModeRepromptsProseOnlyWhileTasksRemain(t *testing.T) {
+	cwd := t.TempDir()
+	cfg := config.Defaults()
+	cfg.Providers.Default.Name = "fake"
+	registry := tools.NewRegistry()
+	tools.RegisterBuiltins(registry)
+	provider := &fakeProvider{responses: []string{
+		"What's already in place:\n- state exists\n\nWhat's missing:\n- wire handlers",
+		`<tool_call>{"name":"task_update","input":{"id":"plan-1","status":"completed","notes":"wired handlers"}}</tool_call>`,
+	}}
+	providers := llm.NewRegistry()
+	providers.Register(provider)
+
+	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+	if _, err := runtime.Tasks.ReplacePlan([]string{"Wire handlers"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.SetMode("build"); err != nil {
+		t.Fatal(err)
+	}
+	var sawCompletion bool
+	for event := range runtime.Run(context.Background(), "execute the plan") {
+		if event.Type == EventAssistantText && strings.Contains(event.Text, "All checklist tasks complete.") {
+			sawCompletion = true
+		}
+	}
+	if len(provider.requests) < 2 {
+		t.Fatalf("expected build mode to reprompt after prose-only response, got %d request(s)", len(provider.requests))
+	}
+	lastUser := provider.requests[1].Messages[len(provider.requests[1].Messages)-1].Content
+	if !strings.Contains(lastUser, "You are in BUILD mode and checklist tasks still remain") {
+		t.Fatalf("expected build reprompt asking for tool call, got:\n%s", lastUser)
+	}
+	if !sawCompletion {
+		t.Fatal("expected build turn to complete after reprompted tool call")
+	}
 }
 
 func TestPlanPromptIncludesExistingPlanForRefinement(t *testing.T) {
@@ -360,6 +458,36 @@ func TestPlanPromptExecutionIntentWithoutTasksStaysInPlan(t *testing.T) {
 	}
 	if runtime.Mode != "plan" {
 		t.Fatalf("expected to stay in plan mode without active tasks, got %s", runtime.Mode)
+	}
+}
+
+func TestPlanRefinementPromptDoesNotAutoSwitchToBuild(t *testing.T) {
+	cwd := t.TempDir()
+	cfg := config.Defaults()
+	cfg.Providers.Default.Name = "fake"
+	registry := tools.NewRegistry()
+	tools.RegisterBuiltins(registry)
+	provider := &fakeProvider{responses: []string{"done"}}
+	providers := llm.NewRegistry()
+	providers.Register(provider)
+
+	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+	if _, err := runtime.Plans.Save(plans.Document{Summary: "approved 2p plan"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Tasks.ReplacePlan([]string{"Implement 2p mode"}); err != nil {
+		t.Fatal(err)
+	}
+
+	line := "PLAN REFINEMENT REQUEST: continue with your plan to implement 2p in snake.\n\nRefine the existing plan and checklist for the user's latest request."
+	for range runtime.Run(context.Background(), line) {
+	}
+	if runtime.Mode != "plan" {
+		t.Fatalf("expected refinement prompt to stay in plan mode, got %s", runtime.Mode)
+	}
+	prompt := provider.requests[0].Messages[1].Content
+	if !strings.Contains(prompt, "Default to refining the existing plan and checklist") {
+		t.Fatalf("expected plan refinement guidance, got:\n%s", prompt)
 	}
 }
 
@@ -1210,6 +1338,99 @@ func TestRuntimeNativeToolCallReadsFile(t *testing.T) {
 	}
 	if !sawFinalText {
 		t.Fatal("expected final text answer via native tool calling")
+	}
+}
+
+func TestBuildModeNativeReadOnlyLoopStopsEarly(t *testing.T) {
+	cwd := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cwd, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "docs", "README.md"), []byte("Hello Forge"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Defaults()
+	cfg.Providers.Default.Name = "fake"
+	cfg.Providers.OpenAICompatible.SupportsTools = true
+	cfg.Runtime.MaxBuilderReadLoops = 8
+	registry := tools.NewRegistry()
+	tools.RegisterBuiltins(registry)
+	providers := llm.NewRegistry()
+	providers.Register(&fakeNativeProvider{steps: []nativeStep{
+		{toolCalls: []llm.ToolCall{{ID: "call_1", Type: "function", Function: llm.FunctionCall{Name: "read_file", Arguments: `{"path":"docs/README.md"}`}}}},
+		{toolCalls: []llm.ToolCall{{ID: "call_2", Type: "function", Function: llm.FunctionCall{Name: "read_file", Arguments: `{"path":"docs/README.md"}`}}}},
+		{toolCalls: []llm.ToolCall{{ID: "call_3", Type: "function", Function: llm.FunctionCall{Name: "read_file", Arguments: `{"path":"docs/README.md"}`}}}},
+		{toolCalls: []llm.ToolCall{{ID: "call_4", Type: "function", Function: llm.FunctionCall{Name: "read_file", Arguments: `{"path":"docs/README.md"}`}}}},
+		{toolCalls: []llm.ToolCall{{ID: "call_5", Type: "function", Function: llm.FunctionCall{Name: "read_file", Arguments: `{"path":"docs/README.md"}`}}}},
+	}})
+
+	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+	if err := runtime.SetMode("build"); err != nil {
+		t.Fatal(err)
+	}
+	var sawErr error
+	for event := range runtime.Run(context.Background(), "finish the task") {
+		if event.Type == EventError {
+			sawErr = event.Error
+		}
+	}
+	if sawErr == nil {
+		t.Fatal("expected build read-only loop error")
+	}
+	if !strings.Contains(sawErr.Error(), "repeated read_file on docs/README.md") {
+		t.Fatalf("unexpected error: %v", sawErr)
+	}
+}
+
+func TestBuildModeAllowsSixDistinctReadOnlyCalls(t *testing.T) {
+	cwd := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cwd, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 6; i++ {
+		name := filepath.Join(cwd, "docs", fmt.Sprintf("file%d.txt", i))
+		if err := os.WriteFile(name, []byte(fmt.Sprintf("content %d", i)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cfg := config.Defaults()
+	cfg.Providers.Default.Name = "fake"
+	cfg.Providers.OpenAICompatible.SupportsTools = true
+	cfg.Runtime.MaxBuilderReadLoops = 8
+	registry := tools.NewRegistry()
+	tools.RegisterBuiltins(registry)
+	providers := llm.NewRegistry()
+	providers.Register(&fakeNativeProvider{steps: []nativeStep{
+		{toolCalls: []llm.ToolCall{{ID: "call_1", Type: "function", Function: llm.FunctionCall{Name: "read_file", Arguments: `{"path":"docs/file1.txt"}`}}}},
+		{toolCalls: []llm.ToolCall{{ID: "call_2", Type: "function", Function: llm.FunctionCall{Name: "read_file", Arguments: `{"path":"docs/file2.txt"}`}}}},
+		{toolCalls: []llm.ToolCall{{ID: "call_3", Type: "function", Function: llm.FunctionCall{Name: "read_file", Arguments: `{"path":"docs/file3.txt"}`}}}},
+		{toolCalls: []llm.ToolCall{{ID: "call_4", Type: "function", Function: llm.FunctionCall{Name: "read_file", Arguments: `{"path":"docs/file4.txt"}`}}}},
+		{toolCalls: []llm.ToolCall{{ID: "call_5", Type: "function", Function: llm.FunctionCall{Name: "read_file", Arguments: `{"path":"docs/file5.txt"}`}}}},
+		{toolCalls: []llm.ToolCall{{ID: "call_6", Type: "function", Function: llm.FunctionCall{Name: "read_file", Arguments: `{"path":"docs/file6.txt"}`}}}},
+		{content: "Ready to edit."},
+	}})
+
+	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
+	if err := runtime.SetMode("build"); err != nil {
+		t.Fatal(err)
+	}
+	var sawErr error
+	var sawFinalText bool
+	for event := range runtime.Run(context.Background(), "finish the task") {
+		if event.Type == EventError {
+			sawErr = event.Error
+		}
+		if (event.Type == EventAssistantText || event.Type == EventAssistantDelta) && strings.Contains(event.Text, "Ready to edit.") {
+			sawFinalText = true
+		}
+	}
+	if sawErr != nil {
+		t.Fatalf("did not expect build read-only guard for distinct files: %v", sawErr)
+	}
+	if !sawFinalText {
+		t.Fatal("expected build turn to continue after six distinct reads")
 	}
 }
 

@@ -88,3 +88,18 @@ func TestReplacePlanRejectsAccidentalEmptyOverwrite(t *testing.T) {
 		t.Fatalf("expected existing task preserved, got %#v", list)
 	}
 }
+
+func TestUpdateByTitleFallback(t *testing.T) {
+	store := New(t.TempDir())
+	t.Cleanup(func() { store.Close() })
+	if _, err := store.ReplacePlan([]string{"Wire handlers", "Add CSS task"}); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := store.Update("", "Wire handlers", "in_progress", "refined")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.ID != "plan-1" || updated.Status != "in_progress" || updated.Notes != "refined" {
+		t.Fatalf("unexpected updated task %#v", updated)
+	}
+}

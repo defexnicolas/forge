@@ -266,6 +266,13 @@ func (m *model) appendAgentEvent(event agent.Event) {
 		if tps > 0 {
 			suffix += fmt.Sprintf(" | %.1f tk/s", tps)
 		}
+		// Step efficiency: surface total steps + mutating / read-only split.
+		if steps := m.agentRuntime.LastTurnStepsUsed; steps > 0 {
+			suffix += fmt.Sprintf(" | %d steps (mut %d / ro %d)", steps, m.agentRuntime.LastTurnMutatingSteps, m.agentRuntime.LastTurnReadOnlySteps)
+			if hits := m.agentRuntime.LastTurnCacheHits; hits > 0 {
+				suffix += fmt.Sprintf(" | cache %d", hits)
+			}
+		}
 		m.history = append(m.history, "")
 		m.history = append(m.history, "    "+t.IndicatorDone.Render("* ")+t.DoneStyle.Render("turn complete")+t.Muted.Render(suffix))
 		m.history = append(m.history, t.SeparatorLine(m.width-4))
@@ -276,10 +283,8 @@ func (m *model) appendAgentEvent(event agent.Event) {
 			m.confirmExplorerPlan = newConfirmForm("Pass explorer findings to Plan mode?", m.theme)
 			m.history = append(m.history, t.Muted.Render("Explorer finished. Confirm to send these findings to Plan mode."))
 		} else if m.shouldOfferPlanExecution() {
-			m.pendingExecuteLine = "Execute the approved plan."
-			m.activeForm = formConfirmExecute
-			m.confirmExecute = newConfirmFormWithDefault("Execute this approved plan now?", m.theme, false)
-			m.history = append(m.history, t.Muted.Render("Plan finished. Press Y to execute it now, or Enter/Esc to leave it pending."))
+			m.pendingExecuteLine = ""
+			m.history = append(m.history, t.Muted.Render("Plan finished. Type an explicit execute request when you want to switch to Build mode."))
 		}
 		m.forceScrollBottom = true
 	}

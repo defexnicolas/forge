@@ -619,6 +619,14 @@ func TestRuntimeTaskTools(t *testing.T) {
 	if !strings.Contains(result.Content[0].Text, "completed") {
 		t.Fatalf("expected completed task, got %#v", result)
 	}
+	update, _ = json.Marshal(map[string]string{"title": "ship sprint", "status": "in_progress"})
+	result, err = runtime.runTaskTool("task_update", update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result.Content[0].Text, "in_progress") {
+		t.Fatalf("expected title-based task update, got %#v", result)
+	}
 }
 
 func TestRuntimePlanTools(t *testing.T) {

@@ -247,6 +247,43 @@ func TestPlanModeFollowupRefinesExistingPlanWithoutResetPrompt(t *testing.T) {
 	}
 }
 
+func TestCompletedBuildFollowupAutoSwitchesBackToPlanRefinement(t *testing.T) {
+	provider := &tuiFakeProvider{responses: []string{"Refined the finished work."}}
+	m := newExplorerHandoffTestModel(t, provider)
+	if err := m.agentRuntime.SetMode("build"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.agentRuntime.Plans.Save(plans.Document{Summary: "existing plan"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.agentRuntime.Tasks.ReplacePlan([]string{"Implement the fix"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.agentRuntime.Tasks.Update("plan-1", "", "completed", "done"); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := m.handleLine("agrega un par de modificaciones")
+	if !m.agentRunning {
+		t.Fatal("follow-up after completed build should start a planner turn immediately")
+	}
+	if m.agentRuntime.Mode != "plan" {
+		t.Fatalf("mode = %q, want plan", m.agentRuntime.Mode)
+	}
+	finalModel := drainAgentEvents(t, m, cmd)
+
+	if len(provider.requests) == 0 {
+		t.Fatal("expected provider request")
+	}
+	userPrompt := provider.requests[0].Messages[1].Content
+	if !strings.Contains(userPrompt, "PLAN REFINEMENT REQUEST: agrega un par de modificaciones") {
+		t.Fatalf("expected refinement prompt after completed build, got:\n%s", userPrompt)
+	}
+	if finalModel.agentRuntime.Mode != "plan" {
+		t.Fatalf("final mode = %q, want plan", finalModel.agentRuntime.Mode)
+	}
+}
+
 func TestPlanModeExplicitResetStillPromptsForConfirmation(t *testing.T) {
 	provider := &tuiFakeProvider{responses: []string{"unused"}}
 	m := newExplorerHandoffTestModel(t, provider)

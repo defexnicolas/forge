@@ -865,6 +865,15 @@ func (m *model) handleLine(line string) tea.Cmd {
 		m.history = append(m.history, t.Warning.Render("  Agent is still running."))
 		return nil
 	}
+	if m.agentRuntime != nil && m.agentRuntime.Mode == "build" && m.completedChecklistFollowupShouldRefine(line) {
+		_ = m.agentRuntime.SetMode("plan")
+		m.showPlan = true
+		m.recalcLayout()
+		m.history = append(m.history, t.Muted.Render("Build completed; switching back to Plan mode to refine the finished work."))
+		m.agentEvents = m.agentRuntime.Run(context.Background(), planRefinementPrompt(line))
+		m.agentRunning = true
+		return waitForAgentEvent(m.agentEvents)
+	}
 	// If in plan mode with tasks and the user wants to execute, route the
 	// message straight through — the planner will now dispatch each task to
 	// the builder subagent via execute_task, so no mode switch is needed.
@@ -1111,6 +1120,8 @@ func (m *model) handleCommand(line string) string {
 		return m.handleBtwCommand(strings.Join(fields[1:], " "))
 	case "/remote-control", "/remote":
 		return m.handleRemoteCommand(fields)
+	case "/code":
+		return m.openInVSCode()
 	default:
 		return "Unknown command. Try /help."
 	}
@@ -1156,7 +1167,7 @@ func (m *model) cycleMode() {
 		if name == current {
 			next := modes[(i+1)%len(modes)]
 			_ = m.agentRuntime.SetMode(next)
-			if next == "explore" && m.showPlan {
+			if next != "plan" && next != "build" && m.showPlan {
 				m.showPlan = false
 				m.recalcLayout()
 			}
@@ -1345,6 +1356,50 @@ func looksLikePlanReset(line string) bool {
 		}
 	}
 	return false
+}
+
+func looksLikeBuildFollowupRefinement(line string) bool {
+	lower := strings.TrimSpace(strings.ToLower(line))
+	if lower == "" {
+		return false
+	}
+	for _, kw := range []string{
+		"change", "modify", "update", "adjust", "tweak", "revise", "refine",
+		"add", "remove", "fix", "improve", "follow-up",
+		"cambia", "modifica", "actualiza", "ajusta", "retoca", "revisa",
+		"agrega", "añade", "anade", "quita", "corrige", "mejora", "modificaciones",
+	} {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *model) completedChecklistFollowupShouldRefine(line string) bool {
+	if m == nil || m.agentRuntime == nil || m.agentRuntime.Mode != "build" {
+		return false
+	}
+	if !looksLikeBuildFollowupRefinement(line) {
+		return false
+	}
+	if m.agentRuntime.Tasks == nil {
+		return false
+	}
+	list, err := m.agentRuntime.Tasks.List()
+	if err != nil || len(list) == 0 {
+		return false
+	}
+	hasCompleted := false
+	for _, task := range list {
+		switch task.Status {
+		case "pending", "in_progress":
+			return false
+		case "completed", "done":
+			hasCompleted = true
+		}
+	}
+	return hasCompleted
 }
 
 // recalcLayout recalculates viewport and input widths based on current state.

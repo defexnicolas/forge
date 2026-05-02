@@ -10,7 +10,7 @@ import (
 )
 
 func TestAllModesExist(t *testing.T) {
-	for _, name := range []string{"plan", "build", "explore"} {
+	for _, name := range []string{"chat", "plan", "build", "explore"} {
 		mode, ok := GetMode(name)
 		if !ok {
 			t.Fatalf("mode %s should exist", name)
@@ -29,13 +29,29 @@ func TestAllModesExist(t *testing.T) {
 
 func TestModeNames(t *testing.T) {
 	names := ModeNames()
-	if len(names) != 3 {
-		t.Fatalf("expected 3 modes (plan + build + explore), got %d: %v", len(names), names)
+	if len(names) != 4 {
+		t.Fatalf("expected 4 modes (chat + plan + build + explore), got %d: %v", len(names), names)
 	}
-	expected := []string{"build", "explore", "plan"}
+	expected := []string{"build", "chat", "explore", "plan"}
 	for i, name := range expected {
 		if names[i] != name {
 			t.Fatalf("expected mode %d to be %s, got %s (full: %v)", i, name, names[i], names)
+		}
+	}
+}
+
+func TestChatModeAllowsOnlyReadConversationTools(t *testing.T) {
+	mode, _ := GetMode("chat")
+	for _, tool := range []string{"edit_file", "write_file", "apply_patch", "run_command", "todo_write", "plan_write", "plan_get"} {
+		decision, _ := mode.Policy.Decision(tool)
+		if decision != ToolDeny {
+			t.Fatalf("chat mode should deny %s, got %s", tool, decision)
+		}
+	}
+	for _, tool := range []string{"read_file", "list_files", "search_text", "git_status", "ask_user"} {
+		decision, _ := mode.Policy.Decision(tool)
+		if decision != ToolAllow {
+			t.Fatalf("chat mode should allow %s, got %s", tool, decision)
 		}
 	}
 }
@@ -106,6 +122,12 @@ func TestSetModeValid(t *testing.T) {
 	if runtime.Mode != "explore" {
 		t.Fatalf("expected explore, got %s", runtime.Mode)
 	}
+	if err := runtime.SetMode("chat"); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.Mode != "chat" {
+		t.Fatalf("expected chat, got %s", runtime.Mode)
+	}
 	if err := runtime.SetMode("build"); err != nil {
 		t.Fatal(err)
 	}
@@ -144,8 +166,14 @@ func TestSystemPromptIncludesBuildModeInstructions(t *testing.T) {
 		if !strings.Contains(sp, "task_update") {
 			t.Fatalf("native=%v: build-mode prompt should mention task_update", native)
 		}
+		if !strings.Contains(sp, "Only call plan_get or task_list if that digest is insufficient") {
+			t.Fatalf("native=%v: build-mode prompt should prefer in-prompt digest before plan_get/task_list:\n%s", native, sp)
+		}
 		if !strings.Contains(sp, "Do NOT call execute_task") {
 			t.Fatalf("native=%v: build-mode prompt should forbid execute_task", native)
+		}
+		if !strings.Contains(sp, "Do NOT narrate your understanding") {
+			t.Fatalf("native=%v: build-mode prompt should forbid prose summaries while tasks remain", native)
 		}
 	}
 }
@@ -168,5 +196,15 @@ func TestSystemPromptKeepsExamplesInPlanMode(t *testing.T) {
 	}
 	if !strings.Contains(sp, "Use todo_write only when starting from scratch") {
 		t.Fatal("plan-mode prompt should keep the todo_write usage note")
+	}
+}
+
+func TestSystemPromptIncludesChatModeInstructions(t *testing.T) {
+	sp := systemPrompt(false, "chat", NewChatPolicy())
+	if !strings.Contains(sp, "You are in chat mode") {
+		t.Fatalf("chat-mode prompt missing chat instructions:\n%s", sp)
+	}
+	if strings.Contains(sp, `"name":"plan_write"`) {
+		t.Fatalf("chat-mode prompt should not advertise planning tools:\n%s", sp)
 	}
 }

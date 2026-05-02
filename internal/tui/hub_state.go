@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
+
+	"forge/internal/globalconfig"
 )
 
 type RecentWorkspace struct {
@@ -73,12 +75,11 @@ type fileHubStateStore struct {
 
 func NewFileHubStateStore(path string) HubStateStore {
 	if path == "" {
-		home, err := os.UserHomeDir()
-		if err == nil {
-			path = filepath.Join(home, ".codex", "memories", "forge_hub_state.json")
-		} else {
-			path = filepath.Join(".", ".forge_hub_state.json")
-		}
+		// Lives alongside global.toml under the forge home dir
+		// (~/.forge/hub_state.json by default). globalconfig.Migrate()
+		// copies the legacy ~/.codex/memories/forge_hub_state.json on
+		// first launch so existing pinned/recent state survives.
+		path = filepath.Join(globalconfig.HomeDir(), "hub_state.json")
 	}
 	return fileHubStateStore{path: path}
 }
