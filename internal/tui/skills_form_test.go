@@ -181,7 +181,18 @@ func TestSkillsFormInstallsSkillsSHEntryViaCLI(t *testing.T) {
 		theme:      DefaultTheme(),
 	}
 
-	form, _ = form.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	// Install is now async: Enter returns a tea.Cmd that runs the install
+	// in a goroutine. We must execute it and feed the resulting message
+	// back through Update() to land in the post-install state.
+	var cmd tea.Cmd
+	form, cmd = form.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatalf("expected install cmd from Enter, got nil")
+	}
+	if form.installing != "repo-skill" {
+		t.Fatalf("expected installing flag set to repo-skill, got %q", form.installing)
+	}
+	form, _ = form.Update(cmd())
 	if form.errMsg != "" {
 		t.Fatalf("unexpected install error: %s", form.errMsg)
 	}

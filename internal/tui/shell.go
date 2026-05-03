@@ -731,10 +731,11 @@ func (m *shellModel) handleEnter() (tea.Model, tea.Cmd) {
 			return *m, m.resizeWorkspace()
 		case viewSettings:
 			items := m.hubSettingsItems()
+			var cmd tea.Cmd
 			if m.hubSettingsIndex >= 0 && m.hubSettingsIndex < len(items) {
-				items[m.hubSettingsIndex].Open(m)
+				cmd = items[m.hubSettingsIndex].Open(m)
 			}
-			return *m, nil
+			return *m, cmd
 		case viewChat:
 			if m.hubChat == nil {
 				m.activePane = paneInput
@@ -1734,7 +1735,7 @@ type hubSettingsItem struct {
 	Label string
 	Hint  string
 	Scope hubScope
-	Open  func(*shellModel)
+	Open  func(*shellModel) tea.Cmd
 }
 
 func (m *shellModel) hubSettingsItems() []hubSettingsItem {
@@ -1745,46 +1746,49 @@ func (m *shellModel) hubSettingsItems() []hubSettingsItem {
 			Label: "Theme (global)",
 			Hint:  "persist UI theme as default for every workspace",
 			Scope: scopeHub,
-			Open: func(m *shellModel) {
+			Open: func(m *shellModel) tea.Cmd {
 				m.themeForm = newThemeForm(m.theme)
 				m.activeHubForm = hubFormTheme
+				return nil
 			},
 		},
 		{
 			Label: "Skills (skills.sh)",
 			Hint:  "browse skills.sh; install into ~/.forge/skills",
 			Scope: scopeHub,
-			Open: func(m *shellModel) {
-				m.openHubSkillsBrowser()
+			Open: func(m *shellModel) tea.Cmd {
+				return m.openHubSkillsBrowser()
 			},
 		},
 		{
 			Label: "Web Search",
 			Hint:  "backend + API key (duckduckgo / ollama)",
 			Scope: scopeHub,
-			Open: func(m *shellModel) {
+			Open: func(m *shellModel) tea.Cmd {
 				if cfg, ok := m.loadHubSettingsConfig(); ok {
 					m.webSearchForm = newWebSearchForm(cfg, m.theme)
 					m.activeHubForm = hubFormWebSearch
 				}
+				return nil
 			},
 		},
 		{
 			Label: "Output Style",
 			Hint:  "pick a plugin output-style to inject into the system prompt",
 			Scope: scopeHub,
-			Open: func(m *shellModel) {
+			Open: func(m *shellModel) tea.Cmd {
 				if cfg, ok := m.loadHubSettingsConfig(); ok {
 					m.outputStyleForm = newOutputStyleForm(cfg, m.discoverOutputStyles(), m.theme)
 					m.activeHubForm = hubFormOutputStyle
 				}
+				return nil
 			},
 		},
 		{
 			Label: "Plugins",
 			Hint:  "enable / disable discovered Claude-style plugins",
 			Scope: scopeHub,
-			Open: func(m *shellModel) {
+			Open: func(m *shellModel) tea.Cmd {
 				cwd := ""
 				if m.workspace != nil {
 					cwd = m.workspace.options.CWD
@@ -1792,10 +1796,11 @@ func (m *shellModel) hubSettingsItems() []hubSettingsItem {
 				form, err := newPluginsForm(cwd, m.theme)
 				if err != nil {
 					m.statusMessage = "Plugins discovery failed: " + err.Error()
-					return
+					return nil
 				}
 				m.pluginsForm = form
 				m.activeHubForm = hubFormPlugins
+				return nil
 			},
 		},
 
@@ -1805,52 +1810,57 @@ func (m *shellModel) hubSettingsItems() []hubSettingsItem {
 			Label: "Provider",
 			Hint:  "base URL, key, chat model",
 			Scope: scopeHub,
-			Open: func(m *shellModel) {
+			Open: func(m *shellModel) tea.Cmd {
 				if cfg, ok := m.loadHubSettingsConfig(); ok {
 					m.providerForm = newProviderForm("", cfg, m.theme)
 					m.activeHubForm = hubFormProvider
 				}
+				return nil
 			},
 		},
 		{
 			Label: "Model",
 			Hint:  "pick active chat model and context",
 			Scope: scopeHub,
-			Open: func(m *shellModel) {
+			Open: func(m *shellModel) tea.Cmd {
 				if cfg, ok := m.loadHubSettingsConfig(); ok {
 					m.modelForm = newModelForm("", cfg, hubSettingsProviders(cfg), m.theme)
 					m.activeHubForm = hubFormModel
 				}
+				return nil
 			},
 		},
 		{
 			Label: "Model Multi",
 			Hint:  "role models and loading strategy",
 			Scope: scopeHub,
-			Open: func(m *shellModel) {
+			Open: func(m *shellModel) tea.Cmd {
 				if cfg, ok := m.loadHubSettingsConfig(); ok {
 					m.modelMultiForm = newModelMultiFormWithPersist("", cfg, hubSettingsProviders(cfg), m.theme, false)
 					m.activeHubForm = hubFormModelMulti
 				}
+				return nil
 			},
 		},
 		{
 			Label: "YARN / Context",
 			Hint:  "context, budget, pins, compacting",
 			Scope: scopeHub,
-			Open: func(m *shellModel) {
+			Open: func(m *shellModel) tea.Cmd {
 				if cfg, ok := m.loadHubSettingsConfig(); ok {
 					m.yarnSettingsForm = newYarnSettingsForm("", cfg, m.theme)
 					m.activeHubForm = hubFormYarn
 				}
+				return nil
 			},
 		},
 		{
 			Label: "Open Workspace",
 			Hint:  "enter chat with this target",
 			Scope: scopeWorkspace,
-			Open: func(m *shellModel) {
+			Open: func(m *shellModel) tea.Cmd {
 				m.openSelectedWorkspace()
+				return nil
 			},
 		},
 	}

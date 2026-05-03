@@ -25,6 +25,7 @@ type skillsForm struct {
 	done             bool
 	canceled         bool
 	loading          bool
+	installing       string
 	installed        string
 	removed          string
 	errMsg           string
@@ -48,6 +49,15 @@ type skillsLoadedMsg struct {
 	found []skills.Skill
 	err   error
 	repos []string
+}
+
+// skillInstalledMsg is dispatched by installSkillCmd when a background
+// install finishes. The Update handler reads err to decide whether to
+// surface success or failure, then refreshes installed state.
+type skillInstalledMsg struct {
+	name      string
+	installed skills.Skill
+	err       error
 }
 
 func newSkillsForm(cwd string, mgr *skills.Manager, theme Theme, repos []string, force bool) (skillsForm, tea.Cmd) {
@@ -104,6 +114,31 @@ func loadSkillsCmd(mgr *skills.Manager, repos []string, directory bool) tea.Cmd 
 	}
 }
 
+// installSkillCmd runs the install in a background goroutine and reports
+// back as a skillInstalledMsg. Built-in skills bypass the CLI; everything
+// else goes through the configured installer (typically `npx skills`),
+// which can stall on network or interactive prompts — running it
+// synchronously inside Update would freeze the entire TUI for the duration
+// of the timeout.
+func installSkillCmd(mgr *skills.Manager, cwd string, skill skills.Skill) tea.Cmd {
+	return func() tea.Msg {
+		if usesBuiltinSkillInstaller(skill) {
+			if err := skills.InstallBuiltin(cwd, skill.Name); err != nil {
+				return skillInstalledMsg{name: skill.Name, err: fmt.Errorf("built-in skill install failed: %w", err)}
+			}
+			installed, _ := mgr.FindInstalled(skill.Name)
+			return skillInstalledMsg{name: skill.Name, installed: installed}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		installed, err := mgr.InstallAndVerify(ctx, skill)
+		if err != nil {
+			return skillInstalledMsg{name: skill.Name, err: fmt.Errorf("skills CLI install failed: %w", err)}
+		}
+		return skillInstalledMsg{name: skill.Name, installed: installed}
+	}
+}
+
 func (f skillsForm) Update(msg tea.Msg) (skillsForm, tea.Cmd) {
 	switch msg := msg.(type) {
 	case skillsLoadedMsg:
@@ -121,6 +156,26 @@ func (f skillsForm) Update(msg tea.Msg) (skillsForm, tea.Cmd) {
 		}
 		f.applyFilter()
 		f.selectName(selected)
+		return f, nil
+	case skillInstalledMsg:
+		// Stale message guard: if the user already canceled/closed the form
+		// or kicked off a different install, drop this one quietly.
+		if f.installing == "" || f.installing != msg.name {
+			return f, nil
+		}
+		f.installing = ""
+		if msg.err != nil {
+			f.errMsg = msg.err.Error()
+			f.notice = "install failed: " + msg.name
+			return f, nil
+		}
+		f.installed = msg.name
+		f.errMsg = ""
+		f.notice = "installed: " + msg.name + installPathLabel(msg.installed.InstallPath)
+		f.refreshInstalled()
+		f.markInstalled(msg.name, msg.installed)
+		f.applyFilter()
+		f.selectName(msg.name)
 		return f, nil
 	case tea.KeyMsg:
 		if f.confirmRemove != "" {
@@ -188,6 +243,10 @@ func (f skillsForm) Update(msg tea.Msg) (skillsForm, tea.Cmd) {
 			f.ensureSelectedVisible()
 			return f, nil
 		case tea.KeyCtrlR:
+			if f.installing != "" {
+				f.notice = "installing " + f.installing + "; refresh blocked until it finishes"
+				return f, nil
+			}
 			f.loading = true
 			f.errMsg = ""
 			f.notice = "refreshing Skills CLI cache"
@@ -222,40 +281,20 @@ func (f skillsForm) Update(msg tea.Msg) (skillsForm, tea.Cmd) {
 				f.notice = "skills are still loading; wait or press Esc to close"
 				return f, nil
 			}
+			if f.installing != "" {
+				f.notice = "already installing " + f.installing + "; wait for it to finish"
+				return f, nil
+			}
 			if len(f.filtered) > 0 && f.selected < len(f.filtered) {
 				skill := f.filtered[f.selected]
 				if skill.Installed {
 					f.notice = skill.Name + " is already installed at " + skill.InstallPath
 					return f, nil
 				}
-				var err error
-				var installed skills.Skill
-				if usesBuiltinSkillInstaller(skill) {
-					err = skills.InstallBuiltin(f.cwd, skill.Name)
-					if err != nil {
-						err = fmt.Errorf("built-in skill install failed: %w", err)
-					} else {
-						installed, _ = f.manager.FindInstalled(skill.Name)
-					}
-				} else {
-					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-					installed, err = f.manager.InstallAndVerify(ctx, skill)
-					cancel()
-					if err != nil {
-						err = fmt.Errorf("skills CLI install failed: %w", err)
-					}
-				}
-				if err != nil {
-					f.errMsg = err.Error()
-				} else {
-					f.installed = skill.Name
-					f.errMsg = ""
-					f.notice = "installed: " + skill.Name + installPathLabel(installed.InstallPath)
-					f.refreshInstalled()
-					f.markInstalled(skill.Name, installed)
-					f.applyFilter()
-					f.selectName(skill.Name)
-				}
+				f.installing = skill.Name
+				f.errMsg = ""
+				f.notice = "installing " + skill.Name + " in background; Esc closes the browser, install keeps running"
+				return f, installSkillCmd(f.manager, f.cwd, skill)
 			}
 			return f, nil
 		}
@@ -344,6 +383,9 @@ func (f skillsForm) View() string {
 	}
 	if f.loading {
 		content += "\n" + t.Muted.Render("  Fetching in background. Cached results will be reused next time.")
+	}
+	if f.installing != "" {
+		content += "\n" + t.Muted.Render("  Installing "+f.installing+" in background. Esc closes the browser; install keeps running.")
 	}
 	content += "\n" + t.Muted.Render("  Left/Right tabs  Up/Down navigate  PgUp/PgDown scroll  Delete remove  Enter install  Ctrl+R refresh  Esc close")
 	return box.Render(content)

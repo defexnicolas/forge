@@ -2,6 +2,8 @@ package tui
 
 import (
 	"forge/internal/skills"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 // openHubSkillsBrowser opens the skills browser in Hub mode (no workspace
@@ -11,17 +13,23 @@ import (
 // outside any workspace. Skills already installed under the legacy
 // ~/.codex/skills/ path stay readable — manager's searchDirs scans both.
 //
+// Returns the form's initial tea.Cmd (the async cache load) so the caller
+// can hand it to Bubble Tea. Dropping that cmd was the bug behind "remote
+// skills don't load in the Hub view": loading=true would never resolve
+// because the load goroutine never started.
+//
 // On any error (manager construction, etc.) the entry just sets a status
-// message; the user can still browse Recent / Pinned without disruption.
-func (m *shellModel) openHubSkillsBrowser() {
+// message and returns nil; the user can still browse Recent / Pinned
+// without disruption.
+func (m *shellModel) openHubSkillsBrowser() tea.Cmd {
 	if err := skills.EnsureGlobalDirs(); err != nil {
 		m.statusMessage = "Hub skills: " + err.Error()
-		return
+		return nil
 	}
 	mgr := skills.NewGlobalManager(skills.Options{})
 	form, cmd := newSkillsForm(mgr.Cwd(), mgr, m.theme, nil, false)
 	m.skillsForm = form
 	m.activeHubForm = hubFormSkills
 	m.statusMessage = "Browsing global skills (~/.forge/skills)"
-	_ = cmd // The form's first cmd typically loads cache async; safe to drop here -- the next Update tick re-issues if needed.
+	return cmd
 }
