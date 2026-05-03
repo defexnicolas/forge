@@ -54,6 +54,18 @@ type WhatsAppOptions struct {
 	// CLI users can render it to a terminal QR.
 	QRCallback func(qrData string)
 
+	// PhoneNumber, when non-empty, switches first-time pairing from QR
+	// to whatsmeow's PairPhone flow. The user types the returned code
+	// into WhatsApp → Linked devices → "Link with phone number instead"
+	// — no image rendering needed (the SSH-friendly path). Format:
+	// international, digits only, no leading '0' (e.g. "5215551234567").
+	PhoneNumber string
+
+	// PairCodeCallback fires once with the 8-character pairing code
+	// (already formatted "XXXX-XXXX") when PhoneNumber pairing is in
+	// use. Ignored when QR pairing is selected.
+	PairCodeCallback func(code string)
+
 	// MaxMessagesPerMinute caps outbound throughput across all
 	// recipients. 10/minute is well below Meta's "unusual" threshold.
 	MaxMessagesPerMinute int
@@ -125,6 +137,10 @@ func NewWhatsApp(opts WhatsAppOptions) *WhatsApp {
 	}
 	if opts.QRCallback != nil {
 		merged.QRCallback = opts.QRCallback
+	}
+	merged.PhoneNumber = opts.PhoneNumber
+	if opts.PairCodeCallback != nil {
+		merged.PairCodeCallback = opts.PairCodeCallback
 	}
 	if opts.MaxMessagesPerMinute > 0 {
 		merged.MaxMessagesPerMinute = opts.MaxMessagesPerMinute
@@ -227,16 +243,31 @@ func (w *WhatsApp) Connect(ctx context.Context) error {
 	hasDevice := client.Store.ID != nil
 	fmt.Fprintf(os.Stderr, "[whatsapp] Connect: dbPath=%s hasDevice=%v jid=%v\n",
 		w.opts.DBPath, hasDevice, client.Store.ID)
-	// New session → drive the QR pairing dance.
+	// New session → drive the pairing dance. Two flavours:
+	//   - QR (default): the goroutine fans `code` events to QRCallback.
+	//   - Phone code (PhoneNumber set): we wait for the first `code`
+	//     event so whatsmeow has finished its handshake, then call
+	//     PairPhone and surface the 8-char code via PairCodeCallback.
+	//     The QR `code` events are ignored in this mode.
 	if !hasDevice {
 		qrChan, _ := client.GetQRChannel(ctx)
 		if err := client.Connect(); err != nil {
 			return fmt.Errorf("whatsapp: connect (qr-phase): %w", err)
 		}
+		usePhone := w.opts.PhoneNumber != ""
+		qrReady := make(chan struct{})
 		go func() {
+			var notified bool
 			for evt := range qrChan {
 				switch evt.Event {
 				case "code":
+					if !notified {
+						notified = true
+						close(qrReady)
+					}
+					if usePhone {
+						continue
+					}
 					w.mu.Lock()
 					w.notes = "scan QR with WhatsApp → Linked devices"
 					w.mu.Unlock()
@@ -251,12 +282,40 @@ func (w *WhatsApp) Connect(ctx context.Context) error {
 					w.mu.Unlock()
 				case "timeout", "err-client-outdated":
 					w.mu.Lock()
-					w.lastError = "QR pairing failed: " + evt.Event
+					w.lastError = "pairing failed: " + evt.Event
 					w.notes = w.lastError
 					w.mu.Unlock()
 				}
 			}
 		}()
+		if usePhone {
+			select {
+			case <-qrReady:
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(20 * time.Second):
+				return errors.New("whatsapp: timed out waiting for handshake before pair-phone")
+			}
+			code, err := client.PairPhone(ctx, w.opts.PhoneNumber, true,
+				whatsmeow.PairClientChrome, "Forge")
+			if err != nil {
+				w.mu.Lock()
+				w.lastError = "pair phone: " + err.Error()
+				w.notes = w.lastError
+				w.mu.Unlock()
+				return fmt.Errorf("whatsapp: pair phone: %w", err)
+			}
+			formatted := code
+			if len(code) == 8 {
+				formatted = code[:4] + "-" + code[4:]
+			}
+			w.mu.Lock()
+			w.notes = "enter pair code in WhatsApp → Linked devices"
+			w.mu.Unlock()
+			if w.opts.PairCodeCallback != nil {
+				w.opts.PairCodeCallback(formatted)
+			}
+		}
 		return nil
 	}
 	if err := client.Connect(); err != nil {

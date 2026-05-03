@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"forge/internal/claw/channels"
 	"forge/internal/globalconfig"
@@ -45,27 +46,41 @@ type whatsAppFormState struct {
 	errMsg        string
 	channel       *channels.WhatsApp
 	cancel        context.CancelFunc
+
+	// Pairing-mode picker + phone-code state
+	mode       waPairMode
+	modeCursor int    // 0 = QR, 1 = Phone code
+	phoneInput string // digits only, no leading '+'; max 15 (E.164)
+	pairCode   string // formatted "XXXX-XXXX" once whatsmeow returns it
 }
 
 type waSnapshot struct {
-	phase     waFormPhase
-	qrText    string
-	pngPath   string
-	pngErr    string
-	statusMsg string
-	errMsg    string
+	phase      waFormPhase
+	qrText     string
+	pngPath    string
+	pngErr     string
+	statusMsg  string
+	errMsg     string
+	mode       waPairMode
+	modeCursor int
+	phoneInput string
+	pairCode   string
 }
 
 func (s *whatsAppFormState) snapshot() waSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return waSnapshot{
-		phase:     s.phase,
-		qrText:    s.qrText,
-		pngPath:   s.qrPNGPath,
-		pngErr:    s.qrPNGErr,
-		statusMsg: s.statusMsg,
-		errMsg:    s.errMsg,
+		phase:      s.phase,
+		qrText:     s.qrText,
+		pngPath:    s.qrPNGPath,
+		pngErr:     s.qrPNGErr,
+		statusMsg:  s.statusMsg,
+		errMsg:     s.errMsg,
+		mode:       s.mode,
+		modeCursor: s.modeCursor,
+		phoneInput: s.phoneInput,
+		pairCode:   s.pairCode,
 	}
 }
 
@@ -73,10 +88,20 @@ type waFormPhase int
 
 const (
 	waPhaseIdle waFormPhase = iota
+	waPhaseModeSelect
+	waPhasePhoneInput
 	waPhaseConnecting
 	waPhaseQR
+	waPhasePairCode
 	waPhaseConnected
 	waPhaseError
+)
+
+type waPairMode int
+
+const (
+	waModeQR waPairMode = iota
+	waModePhone
 )
 
 // waPairedMsg fires once the device is paired (whatsmeow's "success"
@@ -151,11 +176,23 @@ func (f whatsAppForm) Update(msg tea.Msg) (whatsAppForm, tea.Cmd) {
 	case waRefreshMsg:
 		f.pulse++
 		snap := f.state.snapshot()
-		if snap.phase == waPhaseConnecting || snap.phase == waPhaseQR {
+		if snap.phase == waPhaseConnecting || snap.phase == waPhaseQR || snap.phase == waPhasePairCode {
 			return f, tickWhatsAppForm()
 		}
 		return f, nil
 	case tea.KeyMsg:
+		snap := f.state.snapshot()
+
+		// Phone-input phase wants per-rune handling and inline validation.
+		if snap.phase == waPhasePhoneInput {
+			return f.updatePhoneInput(m)
+		}
+
+		// Mode-select consumes 1/2 and arrows before generic Enter/Esc.
+		if snap.phase == waPhaseModeSelect {
+			return f.updateModeSelect(m)
+		}
+
 		switch m.Type {
 		case tea.KeyEsc:
 			f.state.mu.Lock()
@@ -168,16 +205,14 @@ func (f whatsAppForm) Update(msg tea.Msg) (whatsAppForm, tea.Cmd) {
 			f.done = true
 			return f, nil
 		case tea.KeyEnter:
-			snap := f.state.snapshot()
 			if snap.phase == waPhaseIdle || snap.phase == waPhaseError {
 				f.state.mu.Lock()
-				f.state.phase = waPhaseConnecting
-				f.state.statusMsg = "Connecting to WhatsApp servers..."
+				f.state.phase = waPhaseModeSelect
 				f.state.errMsg = ""
 				f.state.pngOpenedOnce = false
 				f.state.qrPNGErr = ""
 				f.state.mu.Unlock()
-				return f, tea.Batch(f.startPairing(), tickWhatsAppForm())
+				return f, nil
 			}
 			if snap.phase == waPhaseQR && snap.pngPath != "" {
 				// Re-open the PNG. Best-effort: surface the error in
@@ -198,6 +233,122 @@ func (f whatsAppForm) Update(msg tea.Msg) (whatsAppForm, tea.Cmd) {
 	return f, nil
 }
 
+// updateModeSelect handles key input when the user is choosing between
+// QR pairing and phone-code pairing. Digit shortcuts (1/2) jump directly
+// to the option; Tab/Up/Down toggle; Enter confirms; Esc closes the form.
+func (f whatsAppForm) updateModeSelect(m tea.KeyMsg) (whatsAppForm, tea.Cmd) {
+	switch m.Type {
+	case tea.KeyEsc:
+		f.canceled = true
+		f.done = true
+		return f, nil
+	case tea.KeyUp, tea.KeyDown, tea.KeyTab:
+		f.state.mu.Lock()
+		if f.state.modeCursor == 0 {
+			f.state.modeCursor = 1
+		} else {
+			f.state.modeCursor = 0
+		}
+		f.state.mu.Unlock()
+		return f, nil
+	case tea.KeyRunes:
+		for _, r := range m.Runes {
+			switch r {
+			case '1':
+				f.state.mu.Lock()
+				f.state.modeCursor = 0
+				f.state.mu.Unlock()
+			case '2':
+				f.state.mu.Lock()
+				f.state.modeCursor = 1
+				f.state.mu.Unlock()
+			}
+		}
+		return f, nil
+	case tea.KeyEnter:
+		f.state.mu.Lock()
+		if f.state.modeCursor == 0 {
+			f.state.mode = waModeQR
+			f.state.phase = waPhaseConnecting
+			f.state.statusMsg = "Connecting to WhatsApp servers..."
+			f.state.errMsg = ""
+			f.state.pngOpenedOnce = false
+			f.state.qrPNGErr = ""
+			f.state.mu.Unlock()
+			return f, tea.Batch(f.startPairing(), tickWhatsAppForm())
+		}
+		f.state.mode = waModePhone
+		f.state.phase = waPhasePhoneInput
+		f.state.errMsg = ""
+		f.state.mu.Unlock()
+		return f, nil
+	}
+	return f, nil
+}
+
+// updatePhoneInput handles digit-by-digit entry of the international
+// phone number. Only digits are accepted; Backspace trims; Enter
+// validates (>=7 digits, not starting with '0') and kicks off pairing;
+// Esc clears the buffer and goes back to mode-select.
+func (f whatsAppForm) updatePhoneInput(m tea.KeyMsg) (whatsAppForm, tea.Cmd) {
+	switch m.Type {
+	case tea.KeyEsc:
+		f.state.mu.Lock()
+		f.state.phase = waPhaseModeSelect
+		f.state.phoneInput = ""
+		f.state.errMsg = ""
+		f.state.mu.Unlock()
+		return f, nil
+	case tea.KeyBackspace, tea.KeyDelete:
+		f.state.mu.Lock()
+		if n := len(f.state.phoneInput); n > 0 {
+			f.state.phoneInput = f.state.phoneInput[:n-1]
+		}
+		f.state.errMsg = ""
+		f.state.mu.Unlock()
+		return f, nil
+	case tea.KeySpace:
+		return f, nil
+	case tea.KeyEnter:
+		f.state.mu.Lock()
+		phone := f.state.phoneInput
+		f.state.mu.Unlock()
+		if len(phone) < 7 {
+			f.state.mu.Lock()
+			f.state.errMsg = "Number too short — use international format, digits only."
+			f.state.mu.Unlock()
+			return f, nil
+		}
+		if phone[0] == '0' {
+			f.state.mu.Lock()
+			f.state.errMsg = "Drop the leading 0 — start with the country code (e.g. 52 for Mexico)."
+			f.state.mu.Unlock()
+			return f, nil
+		}
+		f.state.mu.Lock()
+		f.state.phase = waPhaseConnecting
+		f.state.statusMsg = "Asking WhatsApp for a pairing code..."
+		f.state.errMsg = ""
+		f.state.mu.Unlock()
+		return f, tea.Batch(f.startPairing(), tickWhatsAppForm())
+	case tea.KeyRunes:
+		f.state.mu.Lock()
+		added := false
+		for _, r := range m.Runes {
+			if unicode.IsDigit(r) && len(f.state.phoneInput) < 15 {
+				f.state.phoneInput += string(r)
+				added = true
+			}
+		}
+		if added {
+			f.state.errMsg = ""
+		}
+		f.state.mu.Unlock()
+		return f, nil
+	}
+	return f, nil
+}
+
 // startPairing kicks off the WhatsApp channel boot in a goroutine and
 // streams the QR / paired / error transitions back into the form's
 // shared state via the mutex. The form's renderer reads the latest
@@ -212,13 +363,29 @@ func (f whatsAppForm) startPairing() tea.Cmd {
 		state.cancel = cancel
 		state.mu.Unlock()
 
+		state.mu.Lock()
+		mode := state.mode
+		phone := state.phoneInput
+		state.mu.Unlock()
+		var phoneOpt string
+		if mode == waModePhone {
+			phoneOpt = phone
+		}
 		ch := channels.NewWhatsApp(channels.WhatsAppOptions{
-			DBPath: dbPath,
+			DBPath:      dbPath,
+			PhoneNumber: phoneOpt,
 			QRCallback: func(qr string) {
+				// In phone-code mode the channel layer also drops these,
+				// but a TUI-side guard avoids any flicker if a stale
+				// event leaks through.
+				state.mu.Lock()
+				if state.mode == waModePhone {
+					state.mu.Unlock()
+					return
+				}
 				// First-pass state update with the raw token so the
 				// form can show *something* immediately even if PNG
 				// generation hiccups.
-				state.mu.Lock()
 				state.qrText = qr
 				state.phase = waPhaseQR
 				openOnce := !state.pngOpenedOnce
@@ -238,6 +405,14 @@ func (f whatsAppForm) startPairing() tea.Cmd {
 						state.pngOpenedOnce = true
 					}
 				}
+				state.mu.Unlock()
+			},
+			PairCodeCallback: func(code string) {
+				state.mu.Lock()
+				state.pairCode = code
+				state.phase = waPhasePairCode
+				state.statusMsg = "Enter this code in WhatsApp → Linked devices."
+				state.errMsg = ""
 				state.mu.Unlock()
 			},
 		})
@@ -346,6 +521,30 @@ func (f whatsAppForm) ViewSized(maxWidth, maxHeight int) string {
 		b.WriteString("This will open a WhatsApp Web session bound to forge.\n")
 		b.WriteString("Guardrails: typing delay, random send delay, rate limit, first-contact link block.\n")
 		b.WriteString("\n" + t.Muted.Render("Enter: start pairing  Esc: cancel"))
+	case waPhaseModeSelect:
+		b.WriteString("Choose how to pair this device:\n\n")
+		opt0 := "  [1] QR scan (best with desktop / image viewer)"
+		opt1 := "  [2] Phone code (recommended over SSH)"
+		if snap.modeCursor == 0 {
+			opt0 = "> " + t.StatusValue.Render("[1] QR scan (best with desktop / image viewer)")
+		} else {
+			opt1 = "> " + t.StatusValue.Render("[2] Phone code (recommended over SSH)")
+		}
+		b.WriteString(opt0 + "\n")
+		b.WriteString(opt1 + "\n")
+		b.WriteString("\n" + t.Muted.Render("1/2 or ↑/↓ to choose · Enter: confirm · Esc: cancel"))
+	case waPhasePhoneInput:
+		b.WriteString("Phone number (international format, digits only, no leading 0):\n\n")
+		display := "+" + snap.phoneInput
+		if snap.phoneInput == "" {
+			display = "+_________________"
+		}
+		b.WriteString("  " + t.StatusValue.Render(display) + "\n\n")
+		b.WriteString(t.Muted.Render("e.g. +5215551234567 (52 = country code, then the rest)") + "\n")
+		if snap.errMsg != "" {
+			b.WriteString("\n" + t.ErrorStyle.Render(snap.errMsg) + "\n")
+		}
+		b.WriteString("\n" + t.Muted.Render("Enter: request pair code · Backspace: edit · Esc: back"))
 	case waPhaseConnecting:
 		spinner := []string{"-", "\\", "|", "/"}[f.pulse%4]
 		b.WriteString("\n" + t.StatusValue.Render(spinner+" "+snap.statusMsg) + "\n\n")
@@ -373,6 +572,14 @@ func (f whatsAppForm) ViewSized(maxWidth, maxHeight int) string {
 			b.WriteString(snap.qrText + "\n")
 		}
 		b.WriteString("\n" + t.Muted.Render("Enter: reopen viewer   Esc: cancel"))
+	case waPhasePairCode:
+		spinner := []string{"-", "\\", "|", "/"}[f.pulse%4]
+		b.WriteString("\n" + t.StatusValue.Render(spinner+" Pair code: "+snap.pairCode) + "\n\n")
+		b.WriteString("On your phone:\n")
+		b.WriteString("  WhatsApp → Settings → Linked devices →\n")
+		b.WriteString("  \"Link with phone number instead\" → enter this code\n\n")
+		b.WriteString(t.Muted.Render("Code expires in ~160s; this screen advances automatically once linked.") + "\n")
+		b.WriteString("\n" + t.Muted.Render("Esc: cancel"))
 	case waPhaseConnected:
 		b.WriteString("\n" + t.Success.Render(snap.statusMsg) + "\n\n")
 		b.WriteString(t.Muted.Render("Enter: close"))
