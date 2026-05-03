@@ -44,6 +44,16 @@ var allowedClawToolNames = []string{
 	"claw_schedule_reminder",
 	"claw_list_reminders",
 	"claw_cancel_reminder",
+	// Recurring crons: heartbeat-driven prompts that re-fire on a
+	// schedule. Each firing runs as its own Claw chat with tools, so
+	// "every morning send Sebastián a check-in" really sends.
+	"claw_add_cron",
+	"claw_list_crons",
+	"claw_remove_cron",
+	// Self-introspection: lets Claw read its own recent memory/facts
+	// before answering, and trigger a dream pass on demand.
+	"claw_recent_memory",
+	"claw_dream_now",
 	// Workspace note: lets Claw append prose to its own markdown
 	// personality files (MEMORY/SOUL/USER/TOOLS/IDENTITY) mid-
 	// conversation. AGENTS.md and HEARTBEAT.md are operator-edited.

@@ -388,11 +388,99 @@ func (s *Service) loop(interval time.Duration) {
 	for {
 		select {
 		case <-ticker.C:
-			_ = s.Tick(time.Now().UTC())
+			now := time.Now().UTC()
+			fired, _ := s.tickAndCollect(now)
+			for _, job := range fired {
+				go s.runCronJob(job)
+			}
 		case <-s.stopCh:
 			return
 		}
 	}
+}
+
+// runCronJob dispatches one fired cron's prompt as a Claw chat call so it
+// can use tools (search, send messages, remember facts, etc). Output is
+// stored on the job's LastResult and as an "agent" MemoryEvent — it does
+// NOT pollute state.Chat.Transcript (that's for human-driven turns).
+//
+// The function is fire-and-forget: errors are recorded on the job, never
+// propagated. Each cron gets its own context with a generous timeout so a
+// stuck call can't tie up the heartbeat goroutine forever.
+func (s *Service) runCronJob(job CronJob) {
+	if s == nil {
+		return
+	}
+	prompt := strings.TrimSpace(job.Prompt)
+	if prompt == "" {
+		return
+	}
+	timeout := interviewTimeout(s.config)
+	if timeout <= 0 {
+		timeout = 90 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	_, builder, err := s.ensureChatRuntime()
+	if err != nil {
+		s.recordCronOutcome(job.ID, "", err.Error())
+		return
+	}
+	state := s.store.Snapshot()
+	header := "[scheduled cron '" + job.Name + "'] "
+	reply, err := s.generateChatReplyContextExt(ctx, state, header+prompt, builder, "You are running as a scheduled cron job, not a live chat. Take any user-facing action the prompt requests (e.g. send a WhatsApp ping, look something up online, append a note) and return a one-line confirmation summarising what you did.", true)
+	if err != nil {
+		s.recordCronOutcome(job.ID, "", err.Error())
+		return
+	}
+	s.recordCronOutcome(job.ID, strings.TrimSpace(reply), "")
+}
+
+// recordCronOutcome stamps a cron's LastResult / LastError + appends a
+// completion MemoryEvent so the dream consolidator and the user-facing
+// status panel can see what happened.
+func (s *Service) recordCronOutcome(id, result, errMsg string) {
+	if s == nil || strings.TrimSpace(id) == "" {
+		return
+	}
+	_ = s.store.Update(func(state *State) error {
+		now := time.Now().UTC()
+		for i := range state.Crons {
+			if state.Crons[i].ID != id {
+				continue
+			}
+			job := &state.Crons[i]
+			if errMsg != "" {
+				job.LastError = errMsg
+				job.LastResult = "error"
+			} else {
+				job.LastError = ""
+				if result != "" {
+					job.LastResult = trimText(result, 240)
+				} else {
+					job.LastResult = "ok"
+				}
+			}
+			body := job.Name
+			if errMsg != "" {
+				body += ": error: " + errMsg
+			} else if result != "" {
+				body += ": " + trimText(result, 200)
+			}
+			state.Memory.Events = append(state.Memory.Events, MemoryEvent{
+				ID:        newID(),
+				Kind:      "cron_result",
+				Channel:   "system",
+				Author:    "claw",
+				Text:      body,
+				CreatedAt: now,
+			})
+			break
+		}
+		compactState(state)
+		return nil
+	})
 }
 
 func (s *Service) Stop() error {
@@ -2124,12 +2212,120 @@ func (s *Service) RunDream(ctx context.Context, reason string) (DreamResult, err
 		return DreamResult{}, ctx.Err()
 	default:
 	}
+	reason = strings.TrimSpace(reason)
+	// Phase 1: rule-based consolidation. Cheap, always succeeds, gives
+	// the LastDreamAt advance + structured suggestions. The rule pass
+	// trims to the last 6 events and stamps a summary regardless of
+	// whether the LLM is reachable, so dreams keep working offline.
 	var result DreamResult
 	err := s.store.Update(func(state *State) error {
-		result = runDream(state, strings.TrimSpace(reason))
+		result = runDream(state, reason)
 		return nil
 	})
-	return result, err
+	if err != nil {
+		return result, err
+	}
+	// Phase 2 (opt-in): if the LLM is reachable and there's enough fresh
+	// material, ask the model for a richer prose summary and append it
+	// alongside the rule-based one. Failure is silent — the rule pass
+	// already produced a usable result. Keeps the heartbeat resilient
+	// while still upgrading user-facing dreams when the model is up.
+	state := s.store.Snapshot()
+	if shouldRunLLMDream(state) {
+		if llmSummary, ok := s.tryLLMDream(ctx, state, reason); ok && strings.TrimSpace(llmSummary) != "" {
+			_ = s.store.Update(func(state *State) error {
+				now := time.Now().UTC()
+				state.Memory.Summaries = append(state.Memory.Summaries, MemorySummary{
+					ID:        newID(),
+					Source:    reason + ":llm",
+					Summary:   trimText(llmSummary, 600),
+					CreatedAt: now,
+				})
+				state.Memory.LastDreamAt = now
+				compactState(state)
+				return nil
+			})
+			result.Summary = llmSummary
+			result.Summaries++
+		}
+	}
+	return result, nil
+}
+
+// shouldRunLLMDream gates the model-driven consolidation. We only call
+// out when there's enough new material to justify the spend: at least 4
+// events have happened since the last dream, OR no LLM dream has ever
+// run (so the user gets a nice first one). The rule-based pass always
+// runs first, so this is purely an enhancement step.
+func shouldRunLLMDream(state State) bool {
+	if len(state.Memory.Events) >= 4 {
+		return true
+	}
+	for _, sum := range state.Memory.Summaries {
+		if strings.HasSuffix(sum.Source, ":llm") {
+			return false
+		}
+	}
+	return len(state.Memory.Events) > 0
+}
+
+// tryLLMDream asks the configured chat model for a paragraph that
+// consolidates Claw's recent events into a memorable summary. Returns
+// (summary, true) on success; (_, false) for any failure (no provider,
+// timeout, empty response). Never panics, never propagates errors —
+// dreaming is always best-effort.
+func (s *Service) tryLLMDream(parent context.Context, state State, reason string) (string, bool) {
+	provider, modelID, err := s.interviewProvider()
+	if err != nil || provider == nil {
+		return "", false
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	timeout := interviewTimeout(s.config)
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+
+	events := state.Memory.Events
+	if len(events) > 12 {
+		events = events[len(events)-12:]
+	}
+	var lines []string
+	for _, e := range events {
+		text := strings.TrimSpace(e.Text)
+		if text == "" {
+			continue
+		}
+		lines = append(lines, "- ["+e.Kind+"] "+e.Author+": "+trimText(text, 180))
+	}
+	if len(lines) == 0 {
+		return "", false
+	}
+	persona := strings.TrimSpace(state.Identity.Name)
+	if persona == "" {
+		persona = "Claw"
+	}
+	system := "You are " + persona + "'s dream consolidator. Read the recent events and produce ONE compact paragraph (3-5 sentences) capturing the through-line: what the user has been doing, what they care about right now, and any open thread you should follow up on. No bullet lists, no markdown headers, no JSON. Reply in the user's preferred language if known (state.user.preferences)."
+	user := "Reason for this dream: " + reason + "\n\nRecent events:\n" + strings.Join(lines, "\n") + "\n\nReturn only the consolidated paragraph."
+
+	resp, err := provider.Chat(ctx, llm.ChatRequest{
+		Model: modelID,
+		Messages: []llm.Message{
+			{Role: "system", Content: system},
+			{Role: "user", Content: user},
+		},
+	})
+	if err != nil || resp == nil {
+		return "", false
+	}
+	out := strings.TrimSpace(resp.Content)
+	if out == "" {
+		return "", false
+	}
+	return out, true
 }
 
 func (s *Service) AddCron(name, schedule, prompt string) (CronJob, error) {
@@ -2143,7 +2339,8 @@ func (s *Service) AddCron(name, schedule, prompt string) (CronJob, error) {
 	if job.Name == "" || job.Schedule == "" {
 		return CronJob{}, fmt.Errorf("name and schedule are required")
 	}
-	next, err := nextCronTime(job.Schedule, time.Now().UTC())
+	loc := userLocation(s.store.Snapshot())
+	next, err := nextCronTime(job.Schedule, time.Now().UTC(), loc)
 	if err != nil {
 		return CronJob{}, err
 	}
@@ -2157,12 +2354,59 @@ func (s *Service) AddCron(name, schedule, prompt string) (CronJob, error) {
 	return job, nil
 }
 
-func (s *Service) Tick(now time.Time) error {
+// ListCrons returns a copy of every cron registered with Claw, in
+// definition order.
+func (s *Service) ListCrons() []CronJob {
+	state := s.store.Snapshot()
+	out := make([]CronJob, len(state.Crons))
+	copy(out, state.Crons)
+	return out
+}
+
+// RemoveCron deletes a cron by ID. Returns nil if the ID was not found —
+// idempotent so the LLM can call it without checking first.
+func (s *Service) RemoveCron(id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return fmt.Errorf("id is required")
+	}
 	return s.store.Update(func(state *State) error {
+		filtered := state.Crons[:0]
+		for _, job := range state.Crons {
+			if job.ID != id {
+				filtered = append(filtered, job)
+			}
+		}
+		state.Crons = filtered
+		return nil
+	})
+}
+
+// Tick advances the heartbeat one beat. Side effects:
+//   - LastBeatAt updated
+//   - any cron whose NextRunAt <= now is marked LastRunAt and rescheduled
+//   - a system MemoryEvent is appended for each fired cron
+//   - if the dream interval has elapsed, the rule-based dream consolidator
+//     runs in-place
+//   - state is compacted
+//
+// Returns the list of crons that fired this tick (deep copies — safe to
+// dispatch on goroutines without racing the store). Errors from rescheduling
+// a malformed cron are stored on the job's LastError and surfaced via
+// Heartbeat.Status="degraded" but do NOT propagate as the function's error.
+func (s *Service) Tick(now time.Time) error {
+	_, err := s.tickAndCollect(now)
+	return err
+}
+
+func (s *Service) tickAndCollect(now time.Time) ([]CronJob, error) {
+	var fired []CronJob
+	err := s.store.Update(func(state *State) error {
 		state.Heartbeat.LastBeatAt = now.UTC()
 		if state.Heartbeat.Running {
 			state.Heartbeat.Status = "running"
 		}
+		loc := userLocation(*state)
 		for i := range state.Crons {
 			job := &state.Crons[i]
 			if !job.Enabled || job.NextRunAt.IsZero() || job.NextRunAt.After(now) {
@@ -2179,7 +2423,7 @@ func (s *Service) Tick(now time.Time) error {
 				Text:      job.Name + ": " + job.Prompt,
 				CreatedAt: now.UTC(),
 			})
-			next, err := nextCronTime(job.Schedule, now)
+			next, err := nextCronTime(job.Schedule, now, loc)
 			if err != nil {
 				job.LastError = err.Error()
 				state.Heartbeat.Status = "degraded"
@@ -2187,6 +2431,7 @@ func (s *Service) Tick(now time.Time) error {
 				continue
 			}
 			job.NextRunAt = next
+			fired = append(fired, *job)
 		}
 		if shouldDream(state, s.cfg, now) {
 			runDream(state, "heartbeat")
@@ -2194,6 +2439,7 @@ func (s *Service) Tick(now time.Time) error {
 		compactState(state)
 		return nil
 	})
+	return fired, err
 }
 
 func (s *Service) activeModel() ActiveModel {
@@ -2330,21 +2576,6 @@ func shouldDream(state *State, cfg config.ClawConfig, now time.Time) bool {
 		return true
 	}
 	return now.Sub(state.Memory.LastDreamAt) >= time.Duration(cfg.DreamIntervalMinutes)*time.Minute
-}
-
-func nextCronTime(spec string, from time.Time) (time.Time, error) {
-	spec = strings.TrimSpace(spec)
-	if !strings.HasPrefix(spec, "@every ") {
-		return time.Time{}, fmt.Errorf("unsupported schedule %q; use @every <duration>", spec)
-	}
-	dur, err := time.ParseDuration(strings.TrimSpace(strings.TrimPrefix(spec, "@every ")))
-	if err != nil {
-		return time.Time{}, err
-	}
-	if dur <= 0 {
-		return time.Time{}, fmt.Errorf("duration must be positive")
-	}
-	return from.UTC().Add(dur), nil
 }
 
 func applyConfigDefaults(state *State, cfg config.ClawConfig) {
@@ -2923,7 +3154,12 @@ func (s *Service) generateChatReplyContextExt(ctx context.Context, state State, 
 	// correct answer instead of a hallucinated guess. The format
 	// includes the timezone offset for unambiguous reading.
 	clockLine := "Current local time: " + time.Now().Local().Format("2006-01-02 15:04:05 MST")
-	systemPrompt := clockLine + "\n\n" + clawChatSystemPromptForState(state, includeMemory)
+	awarenessLine := buildAwarenessLine(state)
+	header := clockLine
+	if awarenessLine != "" {
+		header += "\n" + awarenessLine
+	}
+	systemPrompt := header + "\n\n" + clawChatSystemPromptForState(state, includeMemory)
 	if extra := strings.TrimSpace(systemExtra); extra != "" {
 		systemPrompt = systemPrompt + "\n\n" + extra
 	}
@@ -3206,6 +3442,46 @@ func trimmedChatTranscript(turns []InterviewTurn, maxTurns int) []InterviewTurn 
 		return turns
 	}
 	return turns[len(turns)-maxTurns:]
+}
+
+// buildAwarenessLine produces a one-line "you have X reminders, Y crones,
+// Z facts in memory" hint the LLM sees at the top of every chat turn. The
+// goal is self-awareness: without this, Claw routinely answers "no tengo
+// nada agendado contigo" when state.Reminders is full because it never
+// looked. Empty when nothing's actually scheduled, so we don't waste
+// prompt tokens on zeroes.
+func buildAwarenessLine(state State) string {
+	pendingReminders := 0
+	for _, r := range state.Reminders {
+		if strings.EqualFold(strings.TrimSpace(r.Status), "pending") {
+			pendingReminders++
+		}
+	}
+	enabledCrons := 0
+	for _, c := range state.Crons {
+		if c.Enabled {
+			enabledCrons++
+		}
+	}
+	contacts := len(state.Contacts)
+	facts := len(state.Memory.Facts)
+	if pendingReminders == 0 && enabledCrons == 0 && contacts == 0 && facts == 0 {
+		return ""
+	}
+	parts := make([]string, 0, 4)
+	if pendingReminders > 0 {
+		parts = append(parts, fmt.Sprintf("%d pending reminder(s)", pendingReminders))
+	}
+	if enabledCrons > 0 {
+		parts = append(parts, fmt.Sprintf("%d active cron(s)", enabledCrons))
+	}
+	if contacts > 0 {
+		parts = append(parts, fmt.Sprintf("%d known contact(s)", contacts))
+	}
+	if facts > 0 {
+		parts = append(parts, fmt.Sprintf("%d remembered fact(s)", facts))
+	}
+	return "Memory state: " + strings.Join(parts, ", ") + " (use claw_recent_memory, claw_list_reminders, claw_list_crons, claw_recall to read them before saying you don't know)."
 }
 
 func tailMemorySummaries(in []MemorySummary, n int) []string {

@@ -31,6 +31,55 @@ func pluginCommandSuggestions(cwd string) []string {
 	return out
 }
 
+// skillCommandSuggestions enumerates /<skill-name> entries by scanning
+// the same dirs runSkillTool.searchDirs uses (workspace + home), so the
+// autocomplete set matches what dispatchSkillCommand can actually
+// resolve. Skills hidden by a built-in (e.g. /review) are filtered by
+// the caller in Suggest, not here.
+func skillCommandSuggestions(cwd string) []string {
+	var dirs []string
+	if strings.TrimSpace(cwd) != "" {
+		dirs = append(dirs,
+			filepath.Join(cwd, ".agents", "skills"),
+			filepath.Join(cwd, ".forge", "skills"),
+		)
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		dirs = append(dirs,
+			filepath.Join(home, ".codex", "skills"),
+			filepath.Join(home, ".forge", "skills"),
+			// Claude Code-style location — scanned last so a same-named
+			// forge/codex skill wins. Mirrors the order in
+			// internal/tools/skill.go and internal/skills/manager.go.
+			filepath.Join(home, ".claude", "skills"),
+		)
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, d := range dirs {
+		entries, err := os.ReadDir(d)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			if seen[name] {
+				continue
+			}
+			if _, err := os.Stat(filepath.Join(d, name, "SKILL.md")); err != nil {
+				continue
+			}
+			seen[name] = true
+			out = append(out, "/"+name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // Suggest returns autocomplete suggestions for the current input.
 func Suggest(input, cwd string) []string {
 	if strings.TrimSpace(input) == "" {
@@ -67,6 +116,22 @@ func Suggest(input, cwd string) []string {
 		// from the workspace + global plugin dirs. Treat them as additive
 		// suggestions so the static autocomplete tests keep passing.
 		for _, cmd := range pluginCommandSuggestions(cwd) {
+			if strings.HasPrefix(cmd, input) && cmd != input {
+				matches = append(matches, cmd)
+			}
+		}
+		// Skill commands (/<skill-name>) — additive same as plugins.
+		// Built-in names always shadow a same-named skill in the
+		// dispatcher, so filter them out of completions to avoid the
+		// user thinking the skill is reachable.
+		builtins := map[string]bool{}
+		for _, c := range slashCommandNames() {
+			builtins[c] = true
+		}
+		for _, cmd := range skillCommandSuggestions(cwd) {
+			if builtins[cmd] {
+				continue
+			}
 			if strings.HasPrefix(cmd, input) && cmd != input {
 				matches = append(matches, cmd)
 			}

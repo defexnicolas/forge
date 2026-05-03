@@ -755,6 +755,12 @@ func skillSearchDirs(cwd string) []string {
 		dirs = append(dirs,
 			filepath.Join(home, ".codex", "skills"),
 			filepath.Join(home, ".forge", "skills"),
+			// Claude Code-style location, scanned last so forge/codex
+			// skills always win a name collision against an
+			// equivalently-named one shipped under ~/.claude. Lets users
+			// install Claude Code skill packs (gstack, etc.) without
+			// any post-clone fix-up.
+			filepath.Join(home, ".claude", "skills"),
 		)
 	}
 	return dirs

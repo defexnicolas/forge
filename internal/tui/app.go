@@ -1182,6 +1182,12 @@ func (m *model) handleCommand(line string) string {
 		if msg, ok := m.dispatchPluginCommand(fields[0], fields[1:]); ok {
 			return msg
 		}
+		// Skill commands: /<skill-name> resolves against installed skills
+		// (same dirs run_skill scans). Built-ins above always win on a
+		// name collision, so this only fires for unmatched names.
+		if msg, ok := m.dispatchSkillCommand(fields[0], fields[1:]); ok {
+			return msg
+		}
 		return "Unknown command. Try /help."
 	}
 }
@@ -1232,6 +1238,67 @@ func (m *model) dispatchPluginCommand(head string, rest []string) (string, bool)
 		}
 	}
 	return m.theme.Warning.Render(head + ": plugin or command not found"), true
+}
+
+// dispatchSkillCommand matches /<skill-name> against installed skills
+// (workspace + home dirs the run_skill tool scans). On a hit, the
+// SKILL.md body (frontmatter stripped) is sent to the runtime as a user
+// message — same path as dispatchPluginCommand. Extra args are appended
+// as "User context: ...".
+//
+// Frontmatter directives (tools/script/models) are NOT honored on this
+// dispatch path; they only apply when the LLM invokes run_skill
+// explicitly. The skill body can instruct the model to call run_skill
+// itself if it needs the script output.
+//
+// Returns ("", false) when the name is not an installed skill so the
+// caller can fall through to "Unknown command".
+func (m *model) dispatchSkillCommand(head string, rest []string) (string, bool) {
+	if !strings.HasPrefix(head, "/") || strings.Contains(head, ":") {
+		return "", false
+	}
+	if m.options.Skills == nil {
+		return "", false
+	}
+	name := strings.TrimPrefix(head, "/")
+	if name == "" {
+		return "", false
+	}
+	detail, err := m.options.Skills.LoadSkill(name)
+	if err != nil {
+		return "", false
+	}
+	data, err := os.ReadFile(detail.Path)
+	if err != nil {
+		return m.theme.ErrorStyle.Render("read skill " + name + ": " + err.Error()), true
+	}
+	body := strings.TrimSpace(stripSkillFrontmatter(string(data)))
+	if extra := strings.TrimSpace(strings.Join(rest, " ")); extra != "" {
+		body += "\n\nUser context: " + extra
+	}
+	m.agentEvents = m.agentRuntime.Run(context.Background(), body)
+	m.agentRunning = true
+	m.pendingCommand = waitForAgentEvent(m.agentEvents)
+	return "Running " + head + " from skills", true
+}
+
+// stripSkillFrontmatter removes a leading YAML frontmatter block
+// (delimited by `---` lines) so the body sent to the runtime doesn't
+// carry the metadata header. If no frontmatter is present, the input is
+// returned unchanged.
+func stripSkillFrontmatter(content string) string {
+	if !strings.HasPrefix(content, "---\n") && !strings.HasPrefix(content, "---\r\n") {
+		return content
+	}
+	rest := strings.TrimPrefix(strings.TrimPrefix(content, "---\r\n"), "---\n")
+	idx := strings.Index(rest, "\n---")
+	if idx < 0 {
+		return content
+	}
+	after := rest[idx+len("\n---"):]
+	after = strings.TrimPrefix(after, "\r")
+	after = strings.TrimPrefix(after, "\n")
+	return after
 }
 
 func (m model) helpText() string {

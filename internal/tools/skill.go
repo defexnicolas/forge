@@ -143,6 +143,11 @@ func (t runSkillTool) searchDirs(cwd, name string) []string {
 		dirs = append(dirs,
 			filepath.Join(home, ".codex", "skills", name),
 			filepath.Join(home, ".forge", "skills", name),
+			// Claude Code-style location — scanned last so forge/codex
+			// skills shadow any same-named one under ~/.claude. Keeps
+			// `git clone … ~/.claude/skills/<pack>` workflows usable
+			// without renaming.
+			filepath.Join(home, ".claude", "skills", name),
 		)
 	}
 	for _, extra := range t.extraSearchDirs {
