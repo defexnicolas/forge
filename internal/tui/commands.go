@@ -700,13 +700,13 @@ func (m model) describePermissions() string {
 	return t.FormatTable([]string{" ", "Profile", "Description"}, rows) +
 		"\n\n" + m.agentRuntime.Commands.Describe() +
 		"\n\n" + t.Muted.Render("These profiles affect run_command only. Commands stay inside the workspace by default and can optionally reuse the managed .forge/venv.") +
-		"\n" + t.Muted.Render("Use /permissions set <profile> to change.")
+		"\n" + t.Muted.Render("Use /profile <name> or /permissions set <name> to change.")
 }
 
 func (m *model) setPermissionProfile(name string) string {
 	profile, ok := permissions.GetProfile(name)
 	if !ok {
-		return m.theme.ErrorStyle.Render("Unknown profile: " + name + ". Available: safe, normal, fast, yolo")
+		return m.theme.ErrorStyle.Render("Unknown profile: " + name + ". Available: " + strings.Join(permissions.ProfileNames(), ", "))
 	}
 	m.agentRuntime.Commands = profile.Policy
 	return m.theme.Success.Render("Permission profile set to: " + name + " - " + profile.Description)

@@ -29,6 +29,29 @@ func TestHelpAndAutocompleteUseCommandDescriptors(t *testing.T) {
 	}
 }
 
+func TestProfileSubcommandAutocomplete(t *testing.T) {
+	all := Suggest("/profile ", t.TempDir())
+	for _, want := range []string{"/profile safe", "/profile normal", "/profile fast", "/profile trusted", "/profile yolo"} {
+		if !containsSuggestion(all, want) {
+			t.Fatalf("autocomplete missing %q in %v", want, all)
+		}
+	}
+
+	filtered := Suggest("/profile tr", t.TempDir())
+	if len(filtered) != 1 || filtered[0] != "/profile trusted" {
+		t.Fatalf("filtered /profile autocomplete = %v, want [/profile trusted]", filtered)
+	}
+}
+
+func TestPermissionsSubcommandAutocomplete(t *testing.T) {
+	all := Suggest("/permissions ", t.TempDir())
+	for _, want := range []string{"/permissions set", "/permissions trusted", "/permissions yolo"} {
+		if !containsSuggestion(all, want) {
+			t.Fatalf("autocomplete missing %q in %v", want, all)
+		}
+	}
+}
+
 func TestPlanSubcommandAutocomplete(t *testing.T) {
 	all := Suggest("/plan ", t.TempDir())
 	for _, want := range []string{"/plan panel", "/plan full", "/plan todos", "/plan new", "/plan refine"} {

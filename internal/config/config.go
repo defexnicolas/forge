@@ -9,13 +9,15 @@ import (
 
 	"forge/internal/gitops"
 	"forge/internal/globalconfig"
+	"forge/internal/permissions"
 
 	"github.com/pelletier/go-toml/v2"
 )
 
 type Config struct {
-	DefaultAgent    string `toml:"default_agent"`
-	ApprovalProfile string `toml:"approval_profile"`
+	DefaultAgent       string `toml:"default_agent"`
+	ApprovalProfile    string `toml:"approval_profile"`
+	PermissionsProfile string `toml:"permissions_profile"`
 	// OutputStyle is the path to a plugin-shipped output-style markdown
 	// file whose body is appended to the agent's system prompt. Set via
 	// HUB > Settings > Output Style after the user picks one of the styles
@@ -35,6 +37,20 @@ type Config struct {
 	Explore      ExploreConfig      `toml:"explore"`
 	Plan         PlanConfig         `toml:"plan"`
 	TUI          TUIConfig          `toml:"tui"`
+	Update       UpdateConfig       `toml:"update"`
+}
+
+// UpdateConfig governs the in-app update checker. The check only runs when
+// the binary was built with -ldflags injecting a SourceRepo path; otherwise
+// the updater is silently disabled regardless of these flags.
+type UpdateConfig struct {
+	// CheckOnStartup runs `git fetch` once shortly after the TUI starts.
+	// Default true. Set to false on slow networks or to keep the Hub
+	// banner from appearing.
+	CheckOnStartup bool `toml:"check_on_startup"`
+	// CheckIntervalMinutes re-runs the check periodically while forge is
+	// running. 0 disables periodic checks (only the startup one runs).
+	CheckIntervalMinutes int `toml:"check_interval_minutes"`
 }
 
 // WebSearchConfig governs the web_search tool's backend selection. Provider
@@ -420,6 +436,9 @@ func applyGlobalDefaults(cfg *Config, g globalconfig.GlobalConfig, keys map[stri
 	if g.ApprovalProfile != nil && (!keys["approval_profile"] || cfg.ApprovalProfile == Defaults().ApprovalProfile) {
 		cfg.ApprovalProfile = *g.ApprovalProfile
 	}
+	if g.PermissionsProfile != nil && (!keys["permissions_profile"] || cfg.PermissionsProfile == Defaults().PermissionsProfile) {
+		cfg.PermissionsProfile = *g.PermissionsProfile
+	}
 	if g.OutputStyle != nil && (!keys["output_style"] || cfg.OutputStyle == "") {
 		cfg.OutputStyle = *g.OutputStyle
 	}
@@ -643,8 +662,9 @@ func applyProviderEntry(p *ProviderConfig, g globalconfig.ProviderEntry, keys ma
 
 func Defaults() Config {
 	return Config{
-		DefaultAgent:    "build",
-		ApprovalProfile: "normal",
+		DefaultAgent:       "build",
+		ApprovalProfile:    "normal",
+		PermissionsProfile: "normal",
 		Providers: Providers{
 			Default: ProviderRef{Name: "lmstudio"},
 			OpenAICompatible: ProviderConfig{
@@ -799,11 +819,33 @@ func Defaults() Config {
 			"reviewer":   "local-model",
 			"summarizer": "local-model",
 		},
+		Update: UpdateConfig{
+			CheckOnStartup:       true,
+			CheckIntervalMinutes: 60,
+		},
 	}
+}
+
+// normalizePermissionsProfile coerces empty / unknown profile names back to
+// the default. A typo in `permissions_profile` should not lock the user out
+// of run_command — it falls back to "normal" silently and the surrounding
+// runtime code logs the chosen policy.
+func normalizePermissionsProfile(name, fallback string) string {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return fallback
+	}
+	for _, valid := range permissions.ProfileNames() {
+		if strings.EqualFold(trimmed, valid) {
+			return valid
+		}
+	}
+	return fallback
 }
 
 func Normalize(cfg *Config) {
 	defaults := Defaults()
+	cfg.PermissionsProfile = normalizePermissionsProfile(cfg.PermissionsProfile, defaults.PermissionsProfile)
 	if cfg.Models == nil {
 		cfg.Models = map[string]string{}
 	}

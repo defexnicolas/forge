@@ -9,6 +9,34 @@ import (
 	"forge/internal/globalconfig"
 )
 
+func TestDefaultsPermissionsProfileIsNormal(t *testing.T) {
+	if got := Defaults().PermissionsProfile; got != "normal" {
+		t.Fatalf("Defaults().PermissionsProfile = %q, want %q", got, "normal")
+	}
+}
+
+func TestNormalizePermissionsProfileFallback(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"", "normal"},
+		{"trusted", "trusted"},
+		{"YOLO", "yolo"},
+		{"  fast  ", "fast"},
+		{"fooz", "normal"},
+		{"safe", "safe"},
+	}
+	for _, tc := range cases {
+		cfg := Defaults()
+		cfg.PermissionsProfile = tc.in
+		Normalize(&cfg)
+		if cfg.PermissionsProfile != tc.want {
+			t.Errorf("Normalize(%q) = %q, want %q", tc.in, cfg.PermissionsProfile, tc.want)
+		}
+	}
+}
+
 func TestDefaultsUseRecommendedYarnProfile(t *testing.T) {
 	cfg := Defaults()
 	if !cfg.Providers.LMStudio.SupportsTools {

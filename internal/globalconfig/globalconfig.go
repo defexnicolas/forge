@@ -34,20 +34,21 @@ import (
 
 // GlobalConfig is the on-disk shape of ~/.forge/global.toml.
 type GlobalConfig struct {
-	Theme           *string                  `toml:"theme,omitempty"`
-	ApprovalProfile *string                  `toml:"approval_profile,omitempty"`
-	OutputStyle     *string                  `toml:"output_style,omitempty"`
-	DefaultProvider *string                  `toml:"default_provider,omitempty"`
-	Providers       map[string]ProviderEntry `toml:"providers,omitempty"`
-	Models          map[string]string        `toml:"models,omitempty"`
-	DetectedByRole  map[string]DetectedModel `toml:"detected_by_role,omitempty"`
-	ModelLoading    *ModelLoadingDefaults    `toml:"model_loading,omitempty"`
-	Yarn            *YarnDefaults            `toml:"yarn,omitempty"`
-	Skills          *SkillsDefaults          `toml:"skills,omitempty"`
-	Plugins         *PluginsDefaults         `toml:"plugins,omitempty"`
-	Runtime         *RuntimeDefaults         `toml:"runtime,omitempty"`
-	WebSearch       *WebSearchDefaults       `toml:"web_search,omitempty"`
-	Claw            *ClawDefaults            `toml:"claw,omitempty"`
+	Theme              *string                  `toml:"theme,omitempty"`
+	ApprovalProfile    *string                  `toml:"approval_profile,omitempty"`
+	PermissionsProfile *string                  `toml:"permissions_profile,omitempty"`
+	OutputStyle        *string                  `toml:"output_style,omitempty"`
+	DefaultProvider    *string                  `toml:"default_provider,omitempty"`
+	Providers          map[string]ProviderEntry `toml:"providers,omitempty"`
+	Models             map[string]string        `toml:"models,omitempty"`
+	DetectedByRole     map[string]DetectedModel `toml:"detected_by_role,omitempty"`
+	ModelLoading       *ModelLoadingDefaults    `toml:"model_loading,omitempty"`
+	Yarn               *YarnDefaults            `toml:"yarn,omitempty"`
+	Skills             *SkillsDefaults          `toml:"skills,omitempty"`
+	Plugins            *PluginsDefaults         `toml:"plugins,omitempty"`
+	Runtime            *RuntimeDefaults         `toml:"runtime,omitempty"`
+	WebSearch          *WebSearchDefaults       `toml:"web_search,omitempty"`
+	Claw               *ClawDefaults            `toml:"claw,omitempty"`
 }
 
 // ProviderEntry mirrors config.ProviderConfig but every field is a pointer

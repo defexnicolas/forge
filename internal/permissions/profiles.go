@@ -33,6 +33,15 @@ func DefaultProfiles() map[string]Profile {
 				Deny:  defaultDenyPatterns(),
 			},
 		},
+		"trusted": {
+			Name:        "trusted",
+			Description: "Installers, downloads, and Docker allowed. Strictly destructive ops still denied.",
+			Policy: CommandPolicy{
+				Allow: append(defaultAllowPatterns(), trustedAllowPatterns()...),
+				Ask:   []string{"*"},
+				Deny:  trustedDenyPatterns(),
+			},
+		},
 		"yolo": {
 			Name:        "yolo",
 			Description: "Commands allowed except denylist. File edits and patches still follow agent policy.",
@@ -53,7 +62,7 @@ func GetProfile(name string) (Profile, bool) {
 
 // ProfileNames returns the available profile names in order.
 func ProfileNames() []string {
-	return []string{"safe", "normal", "fast", "yolo"}
+	return []string{"safe", "normal", "fast", "trusted", "yolo"}
 }
 
 func defaultDenyPatterns() []string {
@@ -71,5 +80,51 @@ func defaultAllowPatterns() []string {
 		"npm test", "pnpm test", "yarn test",
 		"git status", "git status *",
 		"git diff", "git diff *", "git log *",
+	}
+}
+
+// trustedAllowPatterns extends the default allowlist with installers,
+// network downloads, and container tooling. Used by the "trusted" profile
+// only — `safe`, `normal`, and `fast` keep curl/wget on the denylist.
+func trustedAllowPatterns() []string {
+	return []string{
+		"npm install *", "npm i *",
+		"pnpm install *", "pnpm i *", "pnpm add *", "pnpm dlx *",
+		"yarn install *", "yarn add *",
+		"npx *",
+		"pip install *", "pip3 install *",
+		"cargo install *",
+		"go install *", "go get *",
+		"apt-get install *", "apt install *",
+		"brew install *",
+		"choco install *",
+		"winget install *",
+		"docker *", "docker-compose *",
+		"curl *", "wget *",
+		"Invoke-WebRequest *", "iwr *",
+	}
+}
+
+// trustedDenyPatterns is the strict-destructive denylist for the "trusted"
+// profile. It deliberately omits curl/wget so the profile's downloads work
+// (Deny wins over Allow in CommandPolicy.Decide). It also omits plain `rm *`
+// so workspace cleanup is allowed; only filesystem-root or home-dir wipes
+// and irreversible repo operations are blocked.
+func trustedDenyPatterns() []string {
+	return []string{
+		"rm -rf /*", "rm -rf /",
+		"rm -rf ~*", "rm -rf ~/*",
+		"rm -rf $HOME*", "rm -rf $HOME/*",
+		"del /f /s /q *",
+		"Remove-Item -Recurse -Force /*",
+		"git reset --hard *",
+		"git push --force *", "git push -f *",
+		"mkfs *", "mkfs.* *",
+		"diskpart *",
+		"format *",
+		"dd if=* of=/dev/*",
+		"chmod -R 777 /",
+		"shutdown *",
+		"reboot *",
 	}
 }

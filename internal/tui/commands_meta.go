@@ -1,5 +1,7 @@
 package tui
 
+import "forge/internal/permissions"
+
 type commandDescriptor struct {
 	Name        string
 	Usage       string
@@ -20,6 +22,7 @@ var tuiCommands = []commandDescriptor{
 	{Name: "/plan", Usage: "/plan [panel|full|todos|new]", Description: "manage plan document and checklist panel", Subcommands: []string{"panel", "full", "todos", "new", "refine"}},
 	{Name: "/plan-new", Usage: "/plan-new <goal>", Description: "clear current plan and start a new planning interview"},
 	{Name: "/permissions", Usage: "/permissions [set <profile>]", Description: "show/set command permission profile"},
+	{Name: "/profile", Usage: "/profile [<profile>]", Description: "show/set command permission profile (alias of /permissions)"},
 	{Name: "/context", Usage: "/context [pin|drop|yarn|compact]", Description: "show or manage context"},
 	{Name: "/pin", Usage: "/pin @path", Description: "pin a context file"},
 	{Name: "/drop", Usage: "/drop @path", Description: "drop a pinned context file"},
@@ -54,7 +57,25 @@ var tuiCommands = []commandDescriptor{
 	{Name: "/claw", Usage: "/claw [status|start|stop|dream|interview|memory|soul|inbox|cron]", Description: "manage the resident Claw service", Subcommands: []string{"status", "start", "stop", "dream", "interview", "memory", "soul", "inbox", "cron"}},
 	{Name: "/remote-control", Usage: "/remote-control [start|stop|status] [port]", Description: "serve session over LAN for web/device access", Subcommands: []string{"start", "stop", "status"}},
 	{Name: "/code", Usage: "/code", Description: "open the workspace in VS Code"},
+	{Name: "/update", Usage: "/update", Description: "git pull + rebuild the running forge binary"},
 	{Name: "/quit", Usage: "/quit", Description: "exit forge and save history"},
+}
+
+// init wires the dynamic profile subcommands into /permissions and /profile
+// so autocomplete suggests the actual profile names from permissions.ProfileNames()
+// without duplicating the list. Adding a new profile in internal/permissions
+// automatically surfaces it in the TUI suggestions and the status table.
+func init() {
+	profileSubs := append([]string(nil), permissions.ProfileNames()...)
+	permissionsSubs := append([]string{"set"}, permissions.ProfileNames()...)
+	for i := range tuiCommands {
+		switch tuiCommands[i].Name {
+		case "/profile":
+			tuiCommands[i].Subcommands = profileSubs
+		case "/permissions":
+			tuiCommands[i].Subcommands = permissionsSubs
+		}
+	}
 }
 
 func slashCommandNames() []string {

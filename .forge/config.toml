@@ -5,6 +5,19 @@ default_agent = 'build'
 # prompt.
 approval_profile = 'auto'
 
+# permissions_profile controls which run_command invocations are allowed
+# without prompting. Defaults to 'normal'. Available profiles:
+#   safe    — every command requires approval (only the destructive denylist runs straight to Deny).
+#   normal  — go test / git status / git diff allowed; npm/pnpm/yarn test ask; curl/wget/rm denied.
+#   fast    — adds npm run / pnpm run / make / cargo test / pytest to allow; same denylist as normal.
+#   trusted — installers (npm/pnpm/pip/cargo/apt/brew/winget), Docker, curl/wget allowed without prompt.
+#             Strictly destructive ops (rm -rf /, mkfs, force-push, format, shutdown) still denied.
+#             Use this when you want the agent to install dependencies, pull docker images, and
+#             configure containerized runtimes (e.g. running Node 20 via `docker run` when the host
+#             only has Node 18) without manual approval at every step.
+#   yolo    — everything allowed except the destructive denylist.
+# permissions_profile = 'normal'
+
 [model_loading]
 # All slots LM Studio supports. Subagent fan-out (build / explore) follows
 # this value when their concurrency isn't explicitly set lower.

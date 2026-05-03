@@ -7,6 +7,7 @@ import (
 	"os"
 	"time"
 
+	"forge/internal/buildinfo"
 	"forge/internal/config"
 	"forge/internal/globalconfig"
 	"forge/internal/llm"
@@ -140,7 +141,20 @@ func newVersionCommand() *cobra.Command {
 		Use:   "version",
 		Short: "Print version",
 		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Fprintln(cmd.OutOrStdout(), "forge dev")
+			info := buildinfo.Get()
+			out := cmd.OutOrStdout()
+			fmt.Fprintf(out, "forge %s\n", info.Version)
+			if info.BuildSHA != "" {
+				fmt.Fprintf(out, "  commit:     %s\n", info.BuildSHA)
+			}
+			if info.BuildTime != "" {
+				fmt.Fprintf(out, "  built:      %s\n", info.BuildTime)
+			}
+			if info.SourceRepo != "" {
+				fmt.Fprintf(out, "  source:     %s\n", info.SourceRepo)
+			} else {
+				fmt.Fprintln(out, "  source:     (not embedded — update checks disabled)")
+			}
 		},
 	}
 }

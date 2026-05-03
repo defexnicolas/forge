@@ -15,8 +15,11 @@ import (
 	"forge/internal/globalconfig"
 	"forge/internal/llm"
 	"forge/internal/plugins"
+	"forge/internal/buildinfo"
 	"forge/internal/session"
 	"forge/internal/tools"
+	"forge/internal/tui/pet"
+	"forge/internal/updater"
 
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
@@ -166,6 +169,17 @@ type shellModel struct {
 	// is still running while the user is in Hub. Empty = none.
 	// Re-opening this exact path reattaches instead of spawning fresh.
 	backgroundWorkspacePath string
+	// updateStatus is the latest result from updater.Check. It populates
+	// the Hub banner. Updated by an async tea.Cmd at startup and on a
+	// periodic tick. Zero value (StateUnknown) means the check hasn't
+	// completed yet — the banner stays hidden.
+	updateStatus updater.Status
+	// updateRunning prevents overlapping /update invocations.
+	updateRunning bool
+	// pet drives the animated braille robot rendered at the bottom of
+	// the Hub panel. Zero value renders the static base sprite; calling
+	// pet.Tick on each petTickMsg advances eyes/mouth/sparkles.
+	pet pet.State
 }
 
 type clawInterviewAnsweredMsg struct {
@@ -326,10 +340,44 @@ func newShellModel(options ShellOptions) shellModel {
 }
 
 func (m shellModel) Init() tea.Cmd {
+	cmds := []tea.Cmd{petTickCmd()}
 	if m.workspace != nil {
-		return m.runWorkspaceInit()
+		cmds = append(cmds, m.runWorkspaceInit())
 	}
-	return nil
+	// Update check fires only when the binary embeds a source repo path
+	// (scripts/build.{ps1,sh}). Without it, the updater is disabled and
+	// scheduling the check would just produce StateDisabled noise.
+	if buildinfo.HasSourceRepo() {
+		cfg, ok := m.updateCheckConfig()
+		if ok && cfg.CheckOnStartup {
+			cmds = append(cmds, updateCheckCmd())
+			if tick := scheduleUpdateTick(cfg.CheckIntervalMinutes); tick != nil {
+				cmds = append(cmds, tick)
+			}
+		}
+	}
+	switch len(cmds) {
+	case 0:
+		return nil
+	case 1:
+		return cmds[0]
+	default:
+		return tea.Batch(cmds...)
+	}
+}
+
+// updateCheckConfig returns the effective UpdateConfig for the running
+// shell. It prefers an attached workspace's config (if a workspace is
+// open), falling back to the global config, and finally to defaults so a
+// fresh install with no global file still gets the auto-check.
+func (m shellModel) updateCheckConfig() (config.UpdateConfig, bool) {
+	if m.workspace != nil {
+		return m.workspace.options.Config.Update, true
+	}
+	if cfg, err := loadHubGlobalConfig(); err == nil {
+		return cfg.Update, true
+	}
+	return config.Defaults().Update, true
 }
 
 func (m shellModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -354,6 +402,34 @@ func (m shellModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return result, cmd
 	}
 	switch msg := msg.(type) {
+	case petTickMsg:
+		m.pet = pet.Tick(m.pet)
+		return m, petTickCmd()
+	case updateCheckResultMsg:
+		m.updateStatus = msg.status
+		return m, nil
+	case updateTickMsg:
+		// Periodic re-check. Re-arm the tick chain so it keeps firing
+		// even if no update arrived this cycle.
+		cfg, _ := m.updateCheckConfig()
+		var cmds []tea.Cmd
+		if buildinfo.HasSourceRepo() {
+			cmds = append(cmds, updateCheckCmd())
+		}
+		if next := scheduleUpdateTick(cfg.CheckIntervalMinutes); next != nil {
+			cmds = append(cmds, next)
+		}
+		if len(cmds) == 0 {
+			return m, nil
+		}
+		return m, tea.Batch(cmds...)
+	case updateRunResultMsg:
+		m.updateRunning = false
+		m.statusMessage = m.describeUpdateRun(msg)
+		if msg.statusAfter.State != updater.StateUnknown {
+			m.updateStatus = msg.statusAfter
+		}
+		return m, nil
 	case clawInterviewAnsweredMsg:
 		m.clawAwaitingReply = false
 		m.clawPendingAnswer = ""
@@ -489,6 +565,14 @@ func (m *shellModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			case "o":
 				m.openSelectedWorkspace()
 				return *m, m.resizeWorkspace()
+			case "u":
+				// Hub-only shortcut: trigger /update. The banner advertises
+				// this. Workspace input intercepts 'u' before this point so
+				// users typing in chat still see literal 'u'.
+				if cmd := m.triggerUpdate(); cmd != nil {
+					return *m, cmd
+				}
+				return *m, nil
 			case "p":
 				m.togglePinForActiveSelection()
 				return *m, nil
@@ -1160,6 +1244,25 @@ func (m shellModel) sidebarView() string {
 	} else {
 		lines = append(lines, "", m.theme.Muted.Render("  Tab sidebar/main"), m.theme.Muted.Render("  Enter activate"), m.theme.Muted.Render("  O open workspace"))
 	}
+	// Pet anchored to the bottom of the sidebar frame. Only render it
+	// when the content actually fits — otherwise we'd push the bordered
+	// box past the terminal height (lipgloss Height pads short content
+	// but does not clip overflow). The inner content area is the outer
+	// Height value minus the 2 lines of vertical padding from
+	// Padding(1,1); the border lives outside Height. Subtracting one
+	// more line keeps a small breathing gap between the last hint line
+	// and the pet's first row.
+	if petLines := m.sidebarPetLines(); len(petLines) > 0 {
+		innerContent := max(1, m.height-4) - 2
+		needed := len(lines) + 1 + len(petLines) // 1 = breathing gap
+		if needed <= innerContent {
+			filler := innerContent - len(lines) - len(petLines)
+			for i := 0; i < filler; i++ {
+				lines = append(lines, "")
+			}
+			lines = append(lines, petLines...)
+		}
+	}
 	style := lipgloss.NewStyle().
 		Width(shellSidebarWidth).
 		Height(max(1, m.height-4)).
@@ -1481,6 +1584,12 @@ func (m shellModel) hubView() string {
 	lines := []string{title, subtitle, ""}
 	lines = append(lines, bodyLines...)
 	footer := []string{m.renderHubHelp(), m.renderHubStatus()}
+	if banner := m.updateBannerLine(); banner != "" {
+		// Banner sits at the very bottom of the panel so users see
+		// "update: N commits behind" as the last visual cue. Pressing
+		// `u` while in Hub triggers the same flow as /update.
+		footer = append(footer, banner)
+	}
 	filler := innerHeight - len(lines) - len(footer)
 	for i := 0; i < filler; i++ {
 		lines = append(lines, "")

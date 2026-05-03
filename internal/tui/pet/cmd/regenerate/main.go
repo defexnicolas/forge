@@ -1,0 +1,206 @@
+// Regenerate emits a new robot_data.go at smaller native dimensions
+// without needing the original robot.png or Pillow. It reads the
+// existing 70x22 RobotChars/RobotColors data, downsamples the sprite
+// at the SUBDOT level (140x88 input dots → TARGET_COLS*2 x TARGET_ROWS*4
+// output dots), and writes the result to the path passed via -out.
+//
+// Usage from the repo root:
+//
+//	go run ./internal/tui/pet/cmd/regenerate -cols 18 -rows 6 -out robot_data_small.go
+//	go run ./internal/tui/pet/cmd/regenerate -cols 16 -rows 5 -out internal/tui/pet/robot_data.go --debug
+//
+// When --debug is set, the program also prints the new positions of the
+// eye / mouth / sparkle regions so the constants in pet.go can be
+// updated to match the regenerated sprite. Translation is just rule of
+// three: new = old * TARGET / 70 (cols) or * TARGET / 22 (rows).
+package main
+
+import (
+	"flag"
+	"fmt"
+	"os"
+	"strings"
+
+	"forge/internal/tui/pet"
+)
+
+func main() {
+	cols := flag.Int("cols", 18, "target columns (sprite cells)")
+	rows := flag.Int("rows", 6, "target rows (sprite cells)")
+	out := flag.String("out", "robot_data_small.go", "output Go file path")
+	pkg := flag.String("package", "pet", "package name for the generated file")
+	debug := flag.Bool("debug", false, "print suggested region constants")
+	flag.Parse()
+
+	if *cols <= 0 || *rows <= 0 {
+		fmt.Fprintln(os.Stderr, "cols and rows must be positive")
+		os.Exit(1)
+	}
+
+	chars, colors := downsample(*cols, *rows)
+
+	if err := writeGo(*out, *pkg, *cols, *rows, chars, colors); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	fmt.Printf("wrote %s — %dx%d cells\n", *out, *cols, *rows)
+
+	if *debug {
+		fmt.Println("\nSuggested region constants for the new sprite:")
+		fmt.Printf("  leftEye   = region{%d, %d, %d, %d}\n", scaleR(8, *rows), scaleR(10, *rows), scaleC(24, *cols), scaleC(29, *cols))
+		fmt.Printf("  rightEye  = region{%d, %d, %d, %d}\n", scaleR(8, *rows), scaleR(10, *rows), scaleC(36, *cols), scaleC(41, *cols))
+		fmt.Printf("  mouth     = region{%d, %d, %d, %d}\n", scaleR(15, *rows), scaleR(16, *rows), scaleC(26, *cols), scaleC(39, *cols))
+		fmt.Printf("  sparkZone = region{%d, %d, %d, %d}\n", scaleR(0, *rows), scaleR(3, *rows), scaleC(18, *cols), scaleC(50, *cols))
+	}
+}
+
+func scaleR(r, target int) int { return r * target / pet.Rows }
+func scaleC(c, target int) int { return c * target / pet.Cols }
+
+// downsample mirrors RenderSmall's subdot logic but produces raw
+// chars/colors arrays instead of an ANSI-rendered string. We need the
+// raw data for the .go output; styles are applied at runtime.
+func downsample(targetCols, targetRows int) ([][]string, [][][3]uint8) {
+	in := buildSubdotGrid()
+
+	const inW = pet.Cols * 2 // 140
+	const inH = pet.Rows * 4 // 88
+	outW := targetCols * 2
+	outH := targetRows * 4
+
+	chars := make([][]string, targetRows)
+	colors := make([][][3]uint8, targetRows)
+	for r := 0; r < targetRows; r++ {
+		chars[r] = make([]string, targetCols)
+		colors[r] = make([][3]uint8, targetCols)
+		for c := 0; c < targetCols; c++ {
+			var bits uint8
+			var rSum, gSum, bSum, n int
+			for bit := 0; bit < 8; bit++ {
+				dRow, dCol := dotPosition(bit)
+				outR := r*4 + dRow
+				outC := c*2 + dCol
+				inR := outR * inH / outH
+				inC := outC * inW / outW
+				if inR < inH && inC < inW && in[inR][inC] {
+					bits |= 1 << bit
+					col := pet.RobotColors[inR/4][inC/2]
+					rSum += int(col[0])
+					gSum += int(col[1])
+					bSum += int(col[2])
+					n++
+				}
+			}
+			if bits == 0 {
+				chars[r][c] = " "
+				colors[r][c] = [3]uint8{}
+				continue
+			}
+			chars[r][c] = string(rune(0x2800 + int(bits)))
+			if n > 0 {
+				colors[r][c] = [3]uint8{
+					uint8(rSum / n),
+					uint8(gSum / n),
+					uint8(bSum / n),
+				}
+			} else {
+				colors[r][c] = [3]uint8{0xCC, 0xCC, 0xCC}
+			}
+		}
+	}
+	return chars, colors
+}
+
+func buildSubdotGrid() [][]bool {
+	const inW = pet.Cols * 2
+	const inH = pet.Rows * 4
+	in := make([][]bool, inH)
+	for i := range in {
+		in[i] = make([]bool, inW)
+	}
+	for r := 0; r < pet.Rows; r++ {
+		for c := 0; c < pet.Cols; c++ {
+			ch := pet.RobotChars[r][c]
+			if ch == " " || ch == "" {
+				continue
+			}
+			runes := []rune(ch)
+			if len(runes) == 0 {
+				continue
+			}
+			pt := runes[0]
+			if pt < 0x2800 || pt > 0x28FF {
+				continue
+			}
+			bits := uint8(pt - 0x2800)
+			for bit := 0; bit < 8; bit++ {
+				if bits&(1<<bit) == 0 {
+					continue
+				}
+				dRow, dCol := dotPosition(bit)
+				in[r*4+dRow][c*2+dCol] = true
+			}
+		}
+	}
+	return in
+}
+
+func dotPosition(bit int) (row, col int) {
+	switch bit {
+	case 0:
+		return 0, 0
+	case 1:
+		return 1, 0
+	case 2:
+		return 2, 0
+	case 3:
+		return 0, 1
+	case 4:
+		return 1, 1
+	case 5:
+		return 2, 1
+	case 6:
+		return 3, 0
+	case 7:
+		return 3, 1
+	}
+	return 0, 0
+}
+
+func writeGo(path, pkg string, cols, rows int, chars [][]string, colors [][][3]uint8) error {
+	var b strings.Builder
+	b.WriteString("package " + pkg + "\n\n")
+	b.WriteString("// Auto-generated by internal/tui/pet/cmd/regenerate.\n")
+	b.WriteString("// To regenerate at a different size:\n")
+	b.WriteString("//   go run ./internal/tui/pet/cmd/regenerate -cols N -rows M -out PATH\n\n")
+	fmt.Fprintf(&b, "const RobotCols = %d\n", cols)
+	fmt.Fprintf(&b, "const RobotRows = %d\n\n", rows)
+
+	b.WriteString("var RobotChars = [][]string{\n")
+	for _, row := range chars {
+		b.WriteString("\t{")
+		for i, ch := range row {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			fmt.Fprintf(&b, "%q", ch)
+		}
+		b.WriteString("},\n")
+	}
+	b.WriteString("}\n\n")
+
+	b.WriteString("var RobotColors = [][][3]uint8{\n")
+	for _, row := range colors {
+		b.WriteString("\t{")
+		for i, col := range row {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			fmt.Fprintf(&b, "{%d,%d,%d}", col[0], col[1], col[2])
+		}
+		b.WriteString("},\n")
+	}
+	b.WriteString("}\n")
+
+	return os.WriteFile(path, []byte(b.String()), 0o644)
+}

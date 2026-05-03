@@ -262,7 +262,15 @@ func TestRunSubagentUsesStreamWhenAvailable(t *testing.T) {
 	}
 }
 
-func TestExecuteTaskPassesOnlyTaskAsContext(t *testing.T) {
+// TestExecuteTaskPassesPlanDigestToBuilder verifies that the builder
+// subagent receives the compactPlanDigest of the approved plan as part of
+// its context. This is intentional: when one task hits a blocker that an
+// adjacent task in the same plan would solve (e.g. "Task 2 sets up Docker"
+// while Task 1 is choking on a host runtime version), the builder needs to
+// see the surrounding plan to pull the adjacent step forward instead of
+// returning task_too_large. The digest is truncated by compactPlanDigest
+// (~600 chars total) so it stays cheap.
+func TestExecuteTaskPassesPlanDigestToBuilder(t *testing.T) {
 	cwd := t.TempDir()
 	cfg := config.Defaults()
 	cfg.Providers.Default.Name = "fake"
@@ -278,11 +286,9 @@ func TestExecuteTaskPassesOnlyTaskAsContext(t *testing.T) {
 		BaselinePresent: true,
 	})
 
-	// Save a plan document with details that MUST NOT leak to the builder,
-	// and a task whose title is what SHOULD appear in the builder prompt.
 	if _, err := runtime.Plans.Save(plans.Document{
-		Summary:  "DO_NOT_LEAK_THIS_PLAN_SUMMARY",
-		Approach: "DO_NOT_LEAK_THIS_APPROACH",
+		Summary:  "PLAN_SUMMARY_VISIBLE_TO_BUILDER",
+		Approach: "PLAN_APPROACH_VISIBLE_TO_BUILDER",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -308,9 +314,14 @@ func TestExecuteTaskPassesOnlyTaskAsContext(t *testing.T) {
 	if !strings.Contains(userMsg, "BUILDER_TASK_TITLE") {
 		t.Fatalf("expected task title in builder prompt, got:\n%s", userMsg)
 	}
-	if strings.Contains(userMsg, "DO_NOT_LEAK_THIS_PLAN_SUMMARY") ||
-		strings.Contains(userMsg, "DO_NOT_LEAK_THIS_APPROACH") {
-		t.Fatalf("plan document leaked into builder prompt:\n%s", userMsg)
+	if !strings.Contains(userMsg, "Approved plan:") {
+		t.Fatalf("expected 'Approved plan:' digest line in builder prompt, got:\n%s", userMsg)
+	}
+	if !strings.Contains(userMsg, "PLAN_SUMMARY_VISIBLE_TO_BUILDER") {
+		t.Fatalf("expected plan summary in builder digest, got:\n%s", userMsg)
+	}
+	if !strings.Contains(userMsg, "PLAN_APPROACH_VISIBLE_TO_BUILDER") {
+		t.Fatalf("expected plan approach in builder digest, got:\n%s", userMsg)
 	}
 	if !strings.Contains(userMsg, "a.go") || !strings.Contains(userMsg, "b.go") {
 		t.Fatalf("expected relevant_files in builder context, got:\n%s", userMsg)

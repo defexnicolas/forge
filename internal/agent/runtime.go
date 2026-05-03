@@ -228,6 +228,12 @@ func NewRuntime(cwd string, cfg config.Config, registry *tools.Registry, provide
 	if maxSteps <= 0 {
 		maxSteps = 40
 	}
+	commands := permissions.DefaultCommandPolicy()
+	if name := strings.TrimSpace(cfg.PermissionsProfile); name != "" {
+		if profile, ok := permissions.GetProfile(name); ok {
+			commands = profile.Policy
+		}
+	}
 	runtime := &Runtime{
 		CWD:       cwd,
 		Config:    cfg,
@@ -237,7 +243,7 @@ func NewRuntime(cwd string, cfg config.Config, registry *tools.Registry, provide
 		MaxSteps:  maxSteps,
 		Mode:      "plan",
 		Policy:    NewPlanPolicy(),
-		Commands:  permissions.DefaultCommandPolicy(),
+		Commands:  commands,
 		Plans:     plans.New(cwd),
 		Tasks:     tasks.New(cwd),
 		Subagents: DefaultSubagents(),

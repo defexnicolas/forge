@@ -756,10 +756,11 @@ func subagentSystemPrompt(worker Subagent, snapshot contextbuilder.Snapshot) str
 		rules.WriteString("You MAY read files, edit files, apply patches, run allowed verification commands, and update task state.\n")
 		rules.WriteString("Do not re-plan, do not rewrite the checklist, and do not call execute_task or spawn_subagent.\n")
 		rules.WriteString("Prefer this workflow: inspect task context -> read/search the minimal files -> apply the smallest viable edit -> verify if useful -> update the task if you changed its state -> return the final result.\n")
-		rules.WriteString("This task is one section of a larger plan. Aim to finish in <=3 tool calls.\n")
-		rules.WriteString("If the assigned section cannot be completed in <=3 tool calls, return findings='task_too_large' with a proposed sub-split and let the planner re-chunk. Do NOT try to deliver the whole feature in one task.\n")
+		rules.WriteString("This task is one section of a larger plan. Aim to finish in <=8 tool calls.\n")
+		rules.WriteString("If the assigned section cannot be completed in <=8 tool calls, return findings='task_too_large' with a proposed sub-split and let the planner re-chunk. Do NOT try to deliver the whole feature in one task.\n")
 		rules.WriteString("For large new files under scaffold_then_patch, create only a minimal scaffold first. Then fill the file section-by-section with edit_file or apply_patch. Do not write the full file in one shot.\n")
 		rules.WriteString("File size limit: keep every produced file at or below ~600 lines. If the assigned task implies a single file >600 lines, stop, return findings='split_required' with a proposed multi-file split, and let the planner re-plan instead of writing one giant file. Exception: generated data, fixtures, or dense JSON/CSV may exceed the limit when the file's nature requires it — call that out in the result.\n")
+		rules.WriteString("If your assigned task hits an environment or runtime blocker that an ADJACENT task in the approved plan would solve (e.g. another task installs Docker, sets up Node, configures a runtime), pull that step forward and complete it inline rather than abandoning with task_too_large. Use the 'Approved plan' digest in your context to spot these adjacencies.\n")
 		rules.WriteString("Stop once the single task is completed or clearly blocked.\n")
 	} else if hasMutatingTools(worker.AllowedTools) {
 		rules.WriteString("You may edit files only when the assigned task requires it.\n")
@@ -792,11 +793,14 @@ Main context engine: ` + snapshot.ContextEngine)
 
 func subagentStepLimit(worker Subagent) int {
 	if worker.Name == "builder" {
-		// Tight budget on purpose: the planner is expected to chunk large
-		// work via normalizeChecklistItems, so each Builder run is one small
-		// section. If 6 steps are not enough, the right answer is to replan
-		// (return findings='task_too_large') rather than burn context here.
-		return 6
+		// 12 steps gives the builder room for 2-3 reads, a multi-step edit
+		// sequence, a verification command, task_update, and one fallback
+		// retry. Tighter budgets (the prior 6) made multi-stack tasks
+		// (e.g. scaffold + Dockerfile + compose) hit task_too_large just
+		// from prep work even when each individual step was small. If 12
+		// still isn't enough, returning findings='task_too_large' is the
+		// right call so the planner re-chunks.
+		return 12
 	}
 	if hasMutatingTools(worker.AllowedTools) {
 		return 8
@@ -878,6 +882,11 @@ func formatStructuredSubagentContext(payload map[string]any) string {
 			if text := strings.TrimSpace(fmt.Sprintf("%v", value)); text != "" {
 				lines = append(lines, strings.ReplaceAll(key, "_", " ")+": "+text)
 			}
+		}
+	}
+	if v, ok := payload["approved_plan_digest"].(string); ok {
+		if digest := strings.TrimSpace(v); digest != "" {
+			lines = append(lines, "Approved plan: "+digest)
 		}
 	}
 	if len(lines) > 0 {

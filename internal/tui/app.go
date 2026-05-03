@@ -149,6 +149,9 @@ type model struct {
 	fullRenderCache       string
 	fullRenderFingerprint uint64
 	pendingCommand        tea.Cmd
+	// updateRunning prevents overlapping /update invocations in the
+	// workspace transcript. Cleared when an updateRunResultMsg arrives.
+	updateRunning bool
 	btwEvents             <-chan agent.Event
 	btwStreaming          bool
 	remoteServer          *remoteControlHandle
@@ -333,6 +336,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			break
 		}
 		cmds = append(cmds, waitForAgentEvent(msg.events))
+	case updateRunResultMsg:
+		m.updateRunning = false
+		// Reuse the same describer as the Hub flow so the user sees
+		// identical wording regardless of where they triggered /update.
+		text := (shellModel{theme: m.theme}).describeUpdateRun(msg)
+		styled := m.theme.Muted.Render(text)
+		if msg.pullErr != nil || msg.buildErr != nil || (!msg.pull.Pulled && msg.pull.DirtyMsg != "") {
+			styled = m.theme.ErrorStyle.Render(text)
+		} else if msg.pull.Pulled {
+			styled = m.theme.Success.Render(text)
+		}
+		m.history = append(m.history, styled)
+		m.refresh()
 	case streamFlushMsg:
 		m.streamFlushPending = false
 		if m.streaming {
@@ -760,12 +776,23 @@ func (m model) statusLineView() string {
 		modelMultiLabel = t.StatusActive.Render("Multi:" + strategy)
 	}
 
+	profileName := commandProfileName(m.agentRuntime.Commands)
+	profileStyle := t.Muted
+	switch profileName {
+	case "trusted":
+		profileStyle = t.StatusActive
+	case "yolo":
+		profileStyle = t.Warning
+	}
+	profileLabel := profileStyle.Render("prof:" + profileName)
+
 	sep := t.Muted.Render(" | ")
 	bar := " " + mode + sep +
 		t.StatusValue.Render(modelName) + sep +
 		thinkLabel + sep +
 		modelMultiLabel + sep +
 		t.Accent.Render(provider) + sep +
+		profileLabel + sep +
 		gitInfo + sep +
 		status + sep +
 		contextInfo + sep +
@@ -956,6 +983,8 @@ func (m *model) handleCommand(line string) string {
 	case "/quit", "/exit":
 		m.quitting = true
 		return m.theme.Muted.Render("Goodbye.")
+	case "/update":
+		return m.handleUpdateCommand()
 	case "/dir":
 		return m.theme.Accent.Render("  CWD: ") + m.options.CWD
 	case "/theme":
@@ -1007,9 +1036,17 @@ func (m *model) handleCommand(line string) string {
 		return m.describeConfig()
 	case "/review":
 		return m.enterReviewMode()
-	case "/permissions":
+	case "/permissions", "/profile":
+		// Both shapes accepted:
+		//   /permissions set <name>   /profile set <name>
+		//   /permissions <name>       /profile <name>
+		// The bare `/profile <name>` form skips the "set" verb because the
+		// /profile alias is meant to be the fast path.
 		if len(fields) >= 3 && fields[1] == "set" {
 			return m.setPermissionProfile(fields[2])
+		}
+		if len(fields) >= 2 && fields[1] != "set" {
+			return m.setPermissionProfile(fields[1])
 		}
 		return m.describePermissions()
 	case "/session":

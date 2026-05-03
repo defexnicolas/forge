@@ -217,6 +217,14 @@ func (r *Runtime) executeExecuteTask(ctx context.Context, input json.RawMessage)
 	if guard.SectionGoal != "" {
 		contextPayload["section_goal"] = guard.SectionGoal
 	}
+	if r.Plans != nil && r.Tasks != nil {
+		if planDoc, ok, err := r.Plans.Current(); err == nil && ok {
+			taskList, _ := r.Tasks.List()
+			if digest := compactPlanDigest(planDoc, taskList); digest != "" {
+				contextPayload["approved_plan_digest"] = digest
+			}
+		}
+	}
 	contextJSON, _ := json.Marshal(contextPayload)
 	subReq := SubagentRequest{
 		Agent:   "builder",
