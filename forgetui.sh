@@ -389,6 +389,12 @@ install_forge_binary() {
 }
 
 build_forge() {
+  if [ ! -d "$REPO_DIR/cmd/forge" ]; then
+    die "no encontre $REPO_DIR/cmd/forge; el repo clonado parece incompleto o desactualizado. Hacé 'git pull' (o re-clonar) para traer el directorio cmd/forge antes de re-correr este script"
+  fi
+
+  cd "$REPO_DIR"
+
   log "descargando modulos de Go"
   "$GO_BIN" mod download
 
