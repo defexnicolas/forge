@@ -1,17 +1,18 @@
 <p align="center">
-  <img src="docs/imgs/forge.png" alt="Forge" width="420" />
+  <img src="docs/imgs/forge-banner.png" alt="Forge — Build. Ship. Repeat." width="100%" />
 </p>
 
-<h1 align="center">Forge</h1>
-
 <p align="center">
-  <strong>Local-first terminal coding agent.</strong><br/>
   Fast Go TUI · Global Hub · Persistent Claw companion.
 </p>
 
 ---
 
 Forge runs against LM Studio, OpenAI-compatible APIs, and the OpenAI API. It supports Claude-style plugins, [skills.sh](https://skills.sh), MCP, LAN remote control, pluggable web search, and a resident companion that can pair with WhatsApp.
+
+<p align="center">
+  <img src="docs/imgs/tagline-banner.png" alt="Local-First terminal coding agent" width="100%" />
+</p>
 
 ## Install
 
@@ -80,6 +81,9 @@ supports_tools = true
 
 Then `export OPENAI_API_KEY=sk-...` and `forge --cwd /your/project`.
 
+> **Dev recommendation — always use `/model-multi`.**
+> Even when you want a single model for every mode, configure it through `/model-multi` instead of `/model`. Forge handles parallelism better when models are declared per-mode, and the same UI lets you assign different models to `chat`, `explore`, `plan`, and `build` whenever you need to.
+
 ## Concepts
 
 **Hub.** Global control plane: workspace explorer, recent/pinned, global chat, skills browser, plugin/MCP inspection, Claw management. Writes shared defaults to `~/.forge/global.toml`.
@@ -134,7 +138,7 @@ provider = "duckduckgo"   # default, no key
 |---|---|
 | `/mode [name]` | switch between `chat`, `explore`, `plan`, `build` |
 | `/plan [panel\|full\|todos\|new\|refine]` | inspect or refresh the plan/checklist |
-| `/model`, `/provider` | manage models and provider config |
+| `/model`, `/model-multi`, `/provider` | manage models (single or per-mode) and provider config |
 | `/skills`, `/plugins`, `/mcp` | browse skills, plugins, MCP |
 | `/claw ...` | manage the resident Claw service |
 | `/review` | switch to review/diff workflow |
