@@ -1,99 +1,72 @@
-# Forge
+<p align="center">
+  <img src="docs/imgs/forge.png" alt="Forge" width="180" />
+</p>
 
-**A terminal coding agent built for local models.** Lean context, live parallel subagents, native plugin/skill/MCP ecosystem compatibility, and a TUI that streams at 30fps without dropping frames on Ollama's 150+ tk/s bursts.
+<h1 align="center">Forge</h1>
 
-Written in Go. Runs against LM Studio, Ollama (via any OpenAI-compatible endpoint), and the OpenAI API. Plugs into the Claude Code plugin format, consumes skills from [skills.sh](https://skills.sh), and speaks MCP.
-
----
-
-## Why Forge
-
-| | **Forge** | OpenCode | Aider |
-|---|---|---|---|
-| **Per-turn context injection** | ~1k (YARN-scored) | ~10–16k (tool-descriptions + skills XML bloat) | 4–8k (repomap) |
-| **Core language / binary** | Go, single 34MB `.exe` | TypeScript, Node runtime | Python, pip install |
-| **TUI** | Bubble Tea, 30fps flush, inline diff, Glamour markdown | OpenTUI, 60fps, syntax highlighting broken ([#12301](https://github.com/sst/opencode/issues/12301)) | Rich terminal, REPL-style |
-| **Parallel subagents** | Live multi-lane with `EventSubagentProgress` | Sequential despite appearing parallel ([#14195](https://github.com/sst/opencode/issues/14195)) | None |
-| **Plan/Build modes** | Plan writes the plan + checklist (no edits); Build walks the checklist with editor tools — separate prompts and policies | Tool-restricted agent swap | None (commit-loop style) |
-| **Claude Code plugins** | Discovers `.claude/plugins` + `.claude-plugin/plugin.json`, loads commands/agents/hooks/MCP | Partial | No |
-| **MCP servers** | Full stdio + SSE transport from `.mcp.json` | Full | Partial |
-| **Skills ecosystem** | `skills.sh` directory via `/skills` browser, install-scoped to project | No | No |
-| **Local-first** | Designed against LM Studio; YARN profiles sized for 2B/4B/9B/14B/26B | Cloud-first, local possible | Cloud-first |
-| **Approval UX** | Inline colored diff preview + keyboard confirm | Full-screen diff dialog | Per-edit y/n |
-| **Remote viewer** | `/remote-control` serves a live SSE feed over LAN | No | No |
-
-**The short version:** Forge injects an order of magnitude less context than OpenCode per turn because it uses YARN scoring + tool-result compaction instead of dumping the whole skills catalog + every tool's multi-paragraph description into every request. Your local model runs faster and answers sharper.
+<p align="center">
+  <strong>Local-first terminal coding agent.</strong><br/>
+  Fast Go TUI · Global Hub · Persistent Claw companion.
+</p>
 
 ---
+
+Forge runs against LM Studio, OpenAI-compatible APIs, and the OpenAI API. It supports Claude-style plugins, [skills.sh](https://skills.sh), MCP, LAN remote control, pluggable web search, and a resident companion that can pair with WhatsApp.
 
 ## Install
 
-### Prerequisites
-
-- **Go 1.25+** (`go version`)
-- **LM Studio** (recommended) or any OpenAI-compatible endpoint
-- Windows, macOS, or Linux
-
-### Build from source
+One command, any platform:
 
 ```bash
-git clone <this-repo> forge
+git clone https://github.com/defexnicolas/forge.git
 cd forge
-go build -o forge.exe ./cmd/forge     # Windows
-go build -o forge    ./cmd/forge       # macOS / Linux
+bash forgetui.sh
 ```
 
-Binary is ~34 MB, fully static, no runtime deps.
+`forgetui.sh` provisions a private Go toolchain under `~/.forgetui/`, best-effort installs Python and Node.js, builds Forge, copies the binary to `~/bin` (Windows) or `~/.local/bin` (macOS/Linux), and prints the exact PATH command for your shell.
 
-### Add to PATH
+Useful env vars: `INSTALL_OPTIONAL_RUNTIMES=0` to skip Python/Node, `INSTALL_TO_USER_BIN=0` to skip global install, `INSTALL_BIN_DIR=...` to override the target.
 
-**Windows (PowerShell, current user):**
-```powershell
-$forgeDir = "C:\path\to\forge"
-[Environment]::SetEnvironmentVariable("PATH", "$env:PATH;$forgeDir", "User")
-# Restart terminal for the change to take effect.
-```
+<details>
+<summary>Manual build</summary>
 
-**Windows (permanent, all users, admin PowerShell):**
-```powershell
-[Environment]::SetEnvironmentVariable("PATH", "$env:PATH;C:\path\to\forge", "Machine")
-```
+Requires Go 1.25+.
 
-**macOS / Linux (zsh or bash):**
 ```bash
-echo 'export PATH="$HOME/forge:$PATH"' >> ~/.zshrc   # or ~/.bashrc
-source ~/.zshrc
-# Or: sudo cp forge /usr/local/bin/
+go build -o forge.exe ./cmd/forge   # Windows
+go build -o forge     ./cmd/forge   # macOS / Linux
 ```
+</details>
 
 Verify:
+
 ```bash
 forge --help
 ```
 
-### First run
+## First Run
 
 ```bash
-cd /your/project
-forge
+forge                          # opens the Hub
+forge --cwd /path/to/project   # jumps straight to a workspace
 ```
 
-On first launch Forge creates `.forge/` in your project with default config, session log, and SQLite state. Nothing is written outside the project directory unless you explicitly pin a global skill or plugin.
+State layout:
 
----
+- `~/.forge/global.toml` — Hub-level defaults shared across workspaces
+- `~/.forge/hub_state.json` — recent/pinned workspaces, migration flags
+- `~/.forge/claw/` — Claw memory, channels, sessions
+- `~/.forge/cache/` — skills, QR assets, shared caches
+- `<repo>/.forge/config.toml` — workspace overrides
+
+Legacy state under `~/.codex` is migrated automatically on startup.
 
 ## Quick Start
 
-### With LM Studio (default, recommended for local)
+**LM Studio.** Load a model, start the server on `http://localhost:1234/v1`, run `forge`.
 
-1. Load a model in LM Studio with GEN slots ≥ 2.
-2. Start the LM Studio server on `http://localhost:1234/v1`.
-3. Run `forge` in your project root.
-4. Forge auto-detects the loaded model via the `/v1/models` endpoint.
+**OpenAI-compatible.** In `<repo>/.forge/config.toml`:
 
-### With OpenAI API
-
-Edit `.forge/config.toml`:
 ```toml
 [providers.default]
 name = "openai_compatible"
@@ -105,457 +78,116 @@ default_model = "gpt-5.4-mini"
 supports_tools = true
 ```
 
-Export the key and run:
-```bash
-export OPENAI_API_KEY=sk-...
-forge
+Then `export OPENAI_API_KEY=sk-...` and `forge --cwd /your/project`.
+
+## Concepts
+
+**Hub.** Global control plane: workspace explorer, recent/pinned, global chat, skills browser, plugin/MCP inspection, Claw management. Writes shared defaults to `~/.forge/global.toml`.
+
+**Modes.** Workspaces switch between four modes via `/mode`:
+
+| Mode | Purpose |
+|---|---|
+| `chat` | Conversation with read-only tools when useful. |
+| `explore` | Read-only codebase understanding. |
+| `plan` | Writes the plan and checklist. Does not edit files. |
+| `build` | Executes the checklist with editor tools under approval. Default mode. |
+
+**Claw.** Persistent companion under `~/.forge/claw/`: onboarding interview, memory summaries, heartbeat/dream loops, contacts, facts, reminders, workspace notes, and tool-aware chat. Commands: `/claw status | interview | start | stop | dream | memory | soul | reset | cron add <name> <duration> <prompt>`.
+
+**WhatsApp.** Pair from Hub → Claw → Channels (QR flow). Outbound via `whatsapp_send`; inbound DMs can be auto-replied. Guardrails always on: typing simulation, rate limiting, first-contact link guard, allowlists, explicit approval unless an auto-approval profile is selected.
+
+**Web search.** Pluggable backend, same config for main agent and Claw:
+
+```toml
+[web_search]
+provider = "duckduckgo"   # default, no key
+# provider = "ollama"
+# api_key_env = "OLLAMA_API_KEY"
+# base_url = "https://ollama.com"
 ```
 
-Any OpenAI-compatible endpoint works: vLLM, llama.cpp's server, Groq, Together, Fireworks. Just point `base_url` at it.
+**Plugins.** Discovered from `.forge/plugins/` and `.claude/plugins/`. Supports `commands/`, `agents/`, `hooks/`, `.mcp.json`, `skills/`, `.lsp.json`, `settings.json` (safe subset), and `output-styles/`. `bin/` is recognized but never auto-executed.
 
----
+**Skills.** Native [skills.sh](https://skills.sh) and plugin-shipped support: `/skills`, `/skills refresh`, `/skills <repo>`, `/skills cache`. Workspace installs go to `.forge/skills/`; global to `~/.forge/skills/`.
 
-## Core Concepts
+**MCP.** Drop `.mcp.json` in the project or ship from a plugin. Inspect with `/mcp`, `/mcp resources`, `/mcp prompts`.
 
-### Modes
-
-Three modes cycle with **Shift+Tab** (`build` → `explore` → `plan` → `build` …). Switch directly with `/mode <name>`.
-
-| Mode | Role | Tools allowed |
-|---|---|---|
-| **EXPLORE** | Read-only investigation. The model reads, searches, and reports — no edits possible. | `read_file`, `list_files`, `search_text`, `search_files`, `git_status`, `git_diff`, `web_fetch` |
-| **PLAN** | Designer. Asks 3–6 clarifying questions (`ask_user`), writes the plan document (`plan_write`), and produces the executable checklist (`todo_write`/`task_*`). Does **not** edit files and does **not** dispatch subagents — its turn ends after the checklist is written. | `ask_user`, `plan_write`, `todo_write`, `task_*`, plus read-only tools |
-| **BUILD** | Executor. Reads the approved plan + checklist and walks tasks directly with editor tools, one task at a time (each mutation prompts for approval). Does **not** dispatch subagents and does **not** rewrite the plan. | `plan_get`, `task_list`, `task_update`, `read_file`, `edit_file`, `write_file`, `apply_patch`, `run_command`, plus read-only tools |
-
-**The plan/build split is deliberate.** PLAN keeps a stable, long-lived context across the whole workstream while it designs and decomposes the work. BUILD then gets a tight, executor-only prompt and a build-specific policy (`NewBuildPolicy()` in `internal/agent/policy.go`) so the model can't drift back into re-planning while it should be shipping. Subagents (like `builder`, `tester`, `reviewer`) are a separate dispatch mechanism available from the planner via `execute_task` / `spawn_subagents` — they are not modes.
-
-### The recommended workflow
-
-```
-  EXPLORE         PLAN                    BUILD
-  ─────────       ──────────────────      ──────────────────────
-  1. ask          3. Shift+Tab → PLAN     6. Shift+Tab → BUILD
-  2. read files   4. answer interview     7. work the checklist
-                  5. approve plan            one task at a time
-                                             (each edit asks for
-                                             approval)
-```
-
-**Always start in EXPLORE.** The first few minutes of any non-trivial task should be the model reading your code — *not* writing any. In EXPLORE mode there are no approval modals, no undo stack to worry about, and the model's output is pure signal about what it understands.
-
-Once you're confident the model has the right mental model of your code, switch to PLAN with `Shift+Tab`. The planner will ask 3–6 clarifying questions, write a plan document (`plan_write`), and produce a checklist (`todo_write`). You can review the checklist in the right-hand panel (which shows `EXPLORE → DESIGN → REVIEW → EXECUTE` as the active phase) before approving. When the checklist is approved, switch to BUILD (`/mode build` or Shift+Tab) and the executor walks the tasks directly.
-
-### Subagents
-
-Forge ships with 9 built-in subagents. Invoke them manually with `/agent <name> <task>` or let the planner dispatch them automatically.
-
-| Subagent | Context | Tools | When |
-|---|---|---|---|
-| `explorer` | YARN-scored | read-only | investigation, preflight |
-| `reviewer` | shared-read | read-only | diff review, PR sanity check |
-| `tester` | forked | read + `run_command` | run allowlisted test commands |
-| `builder` | forked | full mutating | executes ONE checklist task — invoked manually with `/agent builder <task>` or via `execute_task` when you want a forked, scoped context per task instead of running tasks inline in BUILD mode |
-| `refactorer` | forked | edit + write | scoped mechanical refactors |
-| `docs` | shared-read | edit + write | update README, changelog |
-| `commit` | shared-read | git + run_command | draft and stage conventional commits |
-| `debug` | forked | read + run_command | root-cause a failing test or error |
-| `summarizer` | YARN | read-only | compact session transcripts into YARN nodes |
-
-Parallel dispatch lives in the `spawn_subagents` tool. The TUI renders each batch as a live multi-lane block — pending → running → completed/error, updated in place:
-
-```
-  parallel subagents (3)
-    + [0] explorer    completed  found 4 call sites
-    > [1] reviewer    running    reading internal/agent/runtime.go
-    o [2] tester      pending
-```
-
-Parallel subagents cannot mutate files (enforced at dispatch); mutations go through BUILD mode (or a sequential `builder` subagent) one task at a time.
-
-### Native tools
-
-All registered in `internal/tools/builtin.go`:
+## Built-in Tools
 
 | Category | Tools |
 |---|---|
 | Filesystem | `read_file`, `list_files`, `write_file`, `edit_file`, `apply_patch` |
 | Search | `search_text`, `search_files` |
 | Git | `git_status`, `git_diff` |
-| Shell | `run_command`, `powershell_command` (auto-selected on Windows) |
-| Web | `web_fetch` (HTML → text via `golang.org/x/net/html`), `web_search` *(beta DDG HTML parser)* |
-| Plan/Task | `plan_write`, `plan_get`, `todo_write`, `task_create`, `task_list`, `task_get`, `task_update`, `execute_task` |
-| Subagents | `spawn_subagent`, `spawn_subagents` (max_concurrency 1–8) |
-| Interactive | `ask_user` (up to 3 suggested answers) |
-| Skills | `skill` (invoke a registered skills.sh skill) |
+| Shell | `run_command`, `powershell_command`, `python_setup`, `python_run` |
+| Web | `web_fetch`, `web_search` |
+| Planning | `plan_write`, `plan_get`, `todo_write`, `task_create`, `task_list`, `task_get`, `task_update`, `execute_task` |
+| Subagents | `spawn_subagent`, `spawn_subagents` |
+| Interactive | `ask_user` |
+| Skills | `skill` |
+| Claw | `whatsapp_send`, `claw_save_contact`, `claw_lookup_contact`, `claw_remember`, `claw_recall`, `claw_schedule_reminder`, `claw_list_reminders`, `claw_cancel_reminder`, `claw_workspace_note` |
 
-Mutating tools (`write_file`, `edit_file`, `apply_patch`, `run_command`) route through the approval system — the TUI shows a colored unified diff with +/− counts before you confirm.
-
-### Context engine: YARN
-
-Forge's context moat is `internal/context/builder.go` + the YARN scoring engine:
-
-- **YARN profiles** sized to the model: `2B` (5k budget), `4B` (6.5k), `9B` (8k, default), `14B` (12k), `26B` (20k).
-- **Render modes**: `head` (default — summary + first N lines of content), `full`, `summary`.
-- **Pins** and **@-mentions** are always-included — use `/pin @path/file.go` to lock a file into every turn.
-- **Auto-compaction** — when the token budget is exceeded, the session is summarized into YARN nodes via the `summarizer` subagent.
-- **Detected context length** — Forge queries LM Studio for the actual loaded context window and scales the budget proportionally (YaRN-extended Qwen, etc.).
-- **Tool-result compaction** — only the last 3 tool results are kept verbatim; older ones are stubbed (`internal/agent/runtime.go: compactOldToolResults`).
-
-Net effect: a typical Forge turn ships ~800–1,500 tokens of injection. OpenCode's equivalent sits at 10–16k because it dumps every tool description plus the XML skills catalog into every request.
-
----
-
-## Multi-Model Loading
-
-Even if you only have **one model loaded**, turn multi-model on. Here's why:
-
-```toml
-[model_loading]
-enabled = true
-strategy = "single"     # all roles reuse the active model
-parallel_slots = 2      # <-- this is the one that matters
-```
-
-`parallel_slots` governs how many concurrent generation slots Forge requests from LM Studio when it loads a model. With `parallel_slots = 1`, every `spawn_subagents` call, every `/btw` question, and every subagent dispatch queues through a single slot — you'll see lanes sit in "running" state serially instead of truly in parallel.
-
-With `parallel_slots = 2` (or more, VRAM permitting), three parallel subagents actually run concurrently and the multi-lane view evolves in real time instead of one-at-a-time.
-
-**When to switch to `strategy = "parallel"`:** you have VRAM for multiple models loaded simultaneously *and* want per-role tuning — e.g. a larger 14B for `planner` and a fast 4B for `explorer`. Configure per-role via `/model-multi` or the `[models]` table:
-
-```toml
-[models]
-chat      = "qwen3-14b"
-explorer  = "qwen3-4b"
-planner   = "qwen3-14b"
-editor    = "qwen3-14b"
-reviewer  = "qwen3-4b"
-summarizer = "qwen3-4b"
-```
-
----
-
-## Claude Code Plugin Compatibility
-
-Forge natively reads both `.forge/plugins/` and `.claude/plugins/` (project + user scope). If a directory contains a `.claude-plugin/plugin.json` manifest, Forge loads the plugin metadata and currently supports the Claude-compatible subset for commands, agents, hooks, and `.mcp.json`.
-
-```toml
-[plugins]
-enabled = true
-claude_compatible = true     # default
-marketplaces = []            # extend with custom plugin marketplaces
-```
-
-List discovered plugins with `/plugins`. Hooks loaded from plugins appear in `/hooks` alongside project hooks.
-
----
-
-## Skills (skills.sh)
-
-Browse and install skills directly from within the TUI:
-
-```
-/skills                      # open browser, pick from the skills.sh directory
-/skills refresh              # re-fetch catalog from https://skills.sh/
-/skills vercel-labs/skills   # install from a specific repo
-/skills cache                # inspect the local cache
-```
-
-Configured defaults (override in `.forge/config.toml`):
-
-```toml
-[skills]
-cli = "npx"
-directory_url = "https://skills.sh/"
-repositories = ["vercel-labs/agent-skills", "vercel-labs/skills"]
-agent = "codex"
-install_scope = "project"    # skills live in .forge/skills/
-copy = true                  # copy files locally for reproducibility
-```
-
-Installed skills are loaded into every turn's context as `kind:skill` YARN nodes and invokable via the `skill` tool.
-
----
-
-## MCP (Model Context Protocol)
-
-Drop an `.mcp.json` in your project root:
-
-```json
-{
-  "mcpServers": {
-    "github": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github"],
-      "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_..."}
-    },
-    "postgres": {
-      "transport": "sse",
-      "url": "http://localhost:3001/sse"
-    }
-  }
-}
-```
-
-Both `stdio` (default) and `sse`/`http` transports work. List live MCP tools with `/mcp`.
-
----
-
-## Hooks
-
-Project-scoped hooks live in `.forge/hooks.json`:
-
-```json
-{
-  "hooks": [
-    {
-      "event": "after:tool_call",
-      "match": "edit_file",
-      "command": "gofmt -w $FORGE_CHANGED_FILES",
-      "timeout": 30
-    },
-    {
-      "event": "session:end",
-      "command": "git status"
-    }
-  ]
-}
-```
-
-Events:
-- `session:start`, `session:end`, `session:prompt`
-- `before:tool_call` (blocking), `after:tool_call` (non-blocking)
-- `before:compact`
-
-Environment variables exposed: `FORGE_CWD`, `FORGE_TOOL`, `FORGE_EVENT`, `FORGE_CHANGED_FILES`.
-
----
-
-## Remote Control
-
-```
-/remote-control start        # default port 9595
-/remote-control status       # show LAN URL + viewer count
-/remote-control stop
-```
-
-Serves the active session over LAN with a random bearer token:
-
-- `GET /api/session` — JSON metadata
-- `GET /api/stream` — SSE live feed of every agent event (mirrors TUI)
-- `POST /api/input` — inject a prompt or slash command from a browser tab
-
-Great for pairing over Tailscale, or running Forge on a beefy workstation while watching the stream from a laptop.
-
----
-
-## Approval Profiles
-
-Set with `/permissions set <profile>` or `approval_profile = "..."` in config.
-
-| Profile | Shell commands | File edits |
-|---|---|---|
-| `safe` | all require approval | always ask |
-| `normal` *(default)* | allowlist (git status/diff/log, npm/pnpm/yarn test, go test) | always ask |
-| `fast` | broader allowlist (npm/pnpm/make/cargo run, pytest) | always ask |
-| `yolo` | allow all except denylist (`rm -rf`, `git reset --hard`, `curl`, `wget`) | always ask |
-
-File mutations (`edit_file`, `write_file`, `apply_patch`) always require approval regardless of profile — that's a hard invariant.
-
----
-
-## Slash Commands Reference
+## Slash Commands
 
 | Command | Purpose |
 |---|---|
-| `/help` | full list with subcommands |
-| `/mode [plan\|explore]` | switch mode (same as Shift+Tab) |
-| `/model [list\|set\|reload]` | manage models and per-role assignments |
-| `/model-multi [off]` | toggle multi-model routing |
-| `/provider` | configure base URL / API key |
-| `/plan [panel\|full\|todos\|new\|refine]` | manage plan document + checklist |
-| `/plan-new <goal>` | clear plan, start fresh interview |
-| `/agents` | list all 9 subagents |
-| `/agent <name> <task>` | run a subagent once |
-| `/btw <question>` | parallel side-channel question (doesn't block main agent) |
-| `/tools` | list registered tools |
-| `/mcp` | list MCP servers and their tools |
-| `/plugins` | list discovered plugins |
-| `/hooks` | list loaded hooks |
-| `/skills [repo\|refresh\|cache]` | install / manage skills |
-| `/context [pin\|drop\|yarn\|compact]` | manage context, pins, YARN |
-| `/pin @path` / `/drop @path` | pin / unpin a file |
-| `/yarn [settings\|profiles\|profile\|dry-run\|inspect]` | YARN tuning |
-| `/compact` | compact session into YARN summary |
-| `/diff` | show pending approval or workspace diff (colored) |
-| `/approve` / `/reject` | handle pending approval |
-| `/undo` | revert last approved edit |
-| `/test [cmd]` | run an allowlisted test command |
-| `/status` | mode, model, provider, permissions, context |
-| `/config` | effective `.forge/config.toml` |
-| `/session` | current session info |
-| `/sessions` | recent sessions |
-| `/resume <id\|latest>` | reopen a stored session |
-| `/analyze [refresh\|show]` | scan + cache project snapshot |
-| `/permissions [set <profile>]` | permission profile |
-| `/theme <name>` | switch theme (see Custom Themes below) |
-| `/think [on\|off]` | toggle thinking visibility |
-| `/copy` | copy last response to clipboard |
-| `/review` | reviewer subagent on current diff |
-| `/log` | path to the live plain-text log |
-| `/remote-control [start\|stop\|status]` | LAN viewer server |
-| `/quit` | exit + save history |
-
----
-
-## Keyboard Shortcuts
-
-| Key | Action |
-|---|---|
-| `Shift+Tab` | cycle modes (EXPLORE ↔ PLAN) |
-| `Ctrl+T` | toggle thinking visibility (live — re-renders the current stream) |
-| `Ctrl+F` | history search |
-| `Tab` | autocomplete `/command` or `@path` |
-| `Enter` | submit |
-| `Esc` → `Esc` | quit (double-tap confirms) |
-| `Ctrl+C` | quit immediately |
-| `PgUp` / `PgDn` | scroll viewport |
-
----
-
-## Custom Themes
-
-Built-ins: `default`, `light`, `ocean`, `mono`.
-
-Drop your own as JSON in `.forge/themes/<name>.json`:
-
-```json
-{
-  "name": "cosmic",
-  "cyan":   "#6FD8E7",
-  "green":  "#95F08D",
-  "yellow": "#F0D474",
-  "red":    "#F58E8E",
-  "purple": "#C89BF0",
-  "blue":   "#7EB7F5",
-  "dim":    "#707070",
-  "bright": "#FAFAFA",
-  "bar_bg": "#1A1A1A",
-  "input_bg": "#121212"
-}
-```
-
-Colors accept `#rrggbb` hex or ANSI256 numbers (`"86"`). Apply with `/theme cosmic`.
-
----
-
-## Benchmarks
-
-**Qwen3 ~35B, Q4_K quantization, 8 GB VRAM + 32 GB DDR5 RAM:**
-
-- Partial offload (MoE active experts on GPU) with `llama.cpp` / LM Studio
-- Typical streaming: **~35-45 tk/s** sustained
-- Forge TUI coalesces tokens at 33 ms intervals (~30 fps) — no frame drops, no janky redraws even under Ollama's burstiest output
-- `tui.stream_flush_ms = 16` in config gives 60fps on hardware-accelerated terminals (iTerm2, WezTerm, Alacritty)
-
-The TUI perf floor is an 8ms flush (clamped), so you can't accidentally freeze the event loop with a misconfigured value.
-
----
+| `/mode [name]` | switch between `chat`, `explore`, `plan`, `build` |
+| `/plan [panel\|full\|todos\|new\|refine]` | inspect or refresh the plan/checklist |
+| `/model`, `/provider` | manage models and provider config |
+| `/skills`, `/plugins`, `/mcp` | browse skills, plugins, MCP |
+| `/claw ...` | manage the resident Claw service |
+| `/review` | switch to review/diff workflow |
+| `/remote-control [start\|stop\|status] [port]` | expose the session over LAN |
+| `/status`, `/config` | runtime status and effective config |
 
 ## Configuration
 
-Full schema in `internal/config/config.go`. The most-touched keys:
+Two layers: global (`~/.forge/global.toml`) overridden per-workspace (`<repo>/.forge/config.toml`).
 
 ```toml
-# .forge/config.toml
-
-default_agent = "plan"
-approval_profile = "normal"          # safe | normal | fast | yolo
+default_agent = "build"
+approval_profile = "normal"
 
 [providers.default]
-name = "lmstudio"                     # or "openai_compatible"
-
-[context]
-engine = "yarn"                       # or "simple"
-budget_tokens = 8000
-auto_compact = true
-model_context_tokens = 16384
-reserve_output_tokens = 2000
-
-[context.yarn]
-profile = "9B"                        # 2B | 4B | 9B | 14B | 26B
-render_mode = "head"                  # head | full | summary
-render_head_lines = 40
-pins = "always"
-mentions = "always"
+name = "lmstudio"
 
 [model_loading]
+enabled = false
+strategy = "single"
+parallel_slots = 2
+
+[context.yarn]
+profile = "9B"
+render_mode = "head"
+
+[web_search]
+provider = "duckduckgo"
+
+[claw]
 enabled = true
-strategy = "single"                   # or "parallel"
-parallel_slots = 2                    # LM Studio GEN slots — bump for concurrency
+autostart = false
+tools_enabled = true
+default_channel = "mock"
+persona_name = "Claw"
+persona_tone = "warm"
 
-[models]
-chat = "qwen3-9b-q4_k_m"
-
-[tui]
-stream_flush_ms = 33                  # 16 for 60fps on modern terminals
+[build.subagents]
+enabled = true
+concurrency = 3
 ```
 
----
+Defaults: Claw tools on once Claw is enabled, plugin loading on, model loading uses `parallel_slots = 2`, Hub persists shared settings globally instead of stamping every workspace.
 
-## Architecture at a Glance
+## Build, Test, Format
 
-```
-  ┌──────────────────────────────────────────────────────┐
-  │ TUI — Bubble Tea, 30fps flush, fingerprint-keyed    │
-  │   render cache, multi-lane subagent view             │
-  └───────────────────────┬──────────────────────────────┘
-                          │ event stream
-  ┌───────────────────────┴──────────────────────────────┐
-  │ Session Runtime — JSONL transcript, undo stack,     │
-  │   approvals, event bus                               │
-  └───────────────────────┬──────────────────────────────┘
-                          │
-  ┌───────────────────────┴──────────────────────────────┐
-  │ Agent Runtime — modes, step loop, parser registry   │
-  │ Context Builder — YARN scoring, skills, pins, mcps   │
-  │ Tool Runtime — built-ins, external, MCP, plugins     │
-  └───────────────────────┬──────────────────────────────┘
-                          │
-  ┌───────────────────────┴──────────────────────────────┐
-  │ Policy Layer — approval profile, command denylist    │
-  └───────────────────────┬──────────────────────────────┘
-                          │
-  ┌───────────────────────┴──────────────────────────────┐
-  │ LLM Providers — OpenAI-compatible (SSE streaming)   │
-  └──────────────────────────────────────────────────────┘
-```
-
-See `docs/ARCHITECTURE.md` for a deeper walkthrough (Spanish).
-
----
-
-## Coming Soon
-
-- **Patronus** — cloud model as advisor. A Patronus hook will route specific checkpoints (plan review, risky approval, critical refactor) through a cloud model (Claude Opus / GPT-5) as a second-opinion layer, while the main loop stays on your local model. Latency is amortized by making the advisor calls async — you keep coding; Patronus surfaces its flags in the plan panel when they're ready. Target: opt-in via `[advisor]` config block.
-- **`web_search` tool** — implemented as a beta DuckDuckGo HTML parser; useful, but still parser-fragile compared with API-backed search.
-- **LSP integration** — `internal/lsp/` has the client interface; wiring into the context builder for symbol-aware injection is on the roadmap.
-
----
-
-## License
-
-See `LICENSE` (or add one).
-
----
-
-## Contributing
-
-Forge is in active development. Architecture docs: `docs/ARCHITECTURE.md`. Agent guidelines: `AGENTS.md`.
-
-Build & test:
 ```bash
 go build ./...
 go test ./...
+gofmt -w ./cmd ./internal
 ```
 
-The TUI tests live under `internal/tui/*_test.go` and cover the streaming, lane, and render-cache paths.
+## More
+
+- Architecture deep-dive: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- Agent guidelines: [`AGENTS.md`](AGENTS.md)
