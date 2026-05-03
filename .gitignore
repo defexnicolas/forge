@@ -3,6 +3,6 @@
 .forge/sessions/
 .forge/tasks/
 .forge/yarn/
-forge.exe
-forge.exe~
-forge
+/forge
+/forge.exe
+/forge.exe~
