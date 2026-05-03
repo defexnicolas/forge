@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -253,6 +254,9 @@ func (m model) yarnGraph() string {
 		return t.ErrorStyle.Render("YARN graph export failed: " + err.Error())
 	}
 	if err := openYarnGraphPath(path); err != nil {
+		if errors.Is(err, errHeadlessSession) {
+			return t.Muted.Render("YARN graph generated. Headless session — open this file from your local machine:") + "\n" + path
+		}
 		return t.Warning.Render("YARN graph generated, but browser open failed: "+err.Error()) + "\n" + path
 	}
 	return t.Success.Render("Opened YARN graph in browser.") + "\n" + path

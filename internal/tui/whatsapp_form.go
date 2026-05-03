@@ -274,6 +274,55 @@ func (f whatsAppForm) View() string {
 	return f.ViewSized(56, 0)
 }
 
+// renderQRAscii returns the QR encoded as half-block characters (each
+// terminal row covers two QR pixels via U+2580). The result is square
+// and scan-able from any monospaced terminal, including SSH sessions
+// where the on-disk PNG is unreachable. Returns "" when the token is
+// empty or the encoder rejects it.
+func renderQRAscii(token string) string {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return ""
+	}
+	q, err := qrcode.New(token, qrcode.Medium)
+	if err != nil {
+		return ""
+	}
+	bitmap := q.Bitmap()
+	if len(bitmap) == 0 {
+		return ""
+	}
+	const (
+		full  = "██" // ██  both pixels black
+		upper = "▀▀" // ▀▀  top black, bottom white
+		lower = "▄▄" // ▄▄  top white, bottom black
+		blank = "  "           // both white
+	)
+	var b strings.Builder
+	rows := len(bitmap)
+	for y := 0; y < rows; y += 2 {
+		for x := range bitmap[y] {
+			top := bitmap[y][x]
+			bot := false
+			if y+1 < rows {
+				bot = bitmap[y+1][x]
+			}
+			switch {
+			case top && bot:
+				b.WriteString(full)
+			case top && !bot:
+				b.WriteString(upper)
+			case !top && bot:
+				b.WriteString(lower)
+			default:
+				b.WriteString(blank)
+			}
+		}
+		b.WriteByte('\n')
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
 func (f whatsAppForm) ViewSized(maxWidth, maxHeight int) string {
 	t := f.theme
 	if maxWidth <= 0 {
@@ -281,6 +330,13 @@ func (f whatsAppForm) ViewSized(maxWidth, maxHeight int) string {
 	}
 
 	snap := f.state.snapshot()
+	// QR phase needs more horizontal room — go-qrcode at Medium produces
+	// a 33-module matrix at minimum, which is 66 columns when each module
+	// is rendered as two terminal cells. Bump the box width to keep the
+	// QR un-wrapped; the rest of the form stays compact.
+	if snap.phase == waPhaseQR && maxWidth < 80 {
+		maxWidth = 80
+	}
 
 	var b strings.Builder
 	title := t.TableHeader.Render("WhatsApp pairing")
@@ -296,16 +352,19 @@ func (f whatsAppForm) ViewSized(maxWidth, maxHeight int) string {
 		b.WriteString(t.Muted.Render("Booting the WhatsApp client and opening the local session store.") + "\n\n")
 		b.WriteString(t.Muted.Render("Esc: abort"))
 	case waPhaseQR:
-		// Render is intentionally text-only — the QR itself lives on disk
-		// as a PNG that the OS image viewer handles. ANSI block QRs
-		// don't survive the outer panel's lipgloss Width() wrapping and
-		// don't fit in 80-col terminals anyway.
+		// SSH-friendly: render the QR as text directly in the form so
+		// users without a desktop (or who would rather not context-switch
+		// to an image viewer) can scan straight from the terminal. The
+		// PNG on disk is still written for users who prefer it.
 		b.WriteString("\n" + t.StatusValue.Render(snap.statusMsg) + "\n\n")
+		if ascii := renderQRAscii(snap.qrText); ascii != "" {
+			b.WriteString(ascii + "\n\n")
+		}
 		if snap.pngErr != "" {
 			b.WriteString(t.ErrorStyle.Render(snap.pngErr) + "\n\n")
 		}
 		if snap.pngPath != "" {
-			b.WriteString(t.Muted.Render("File: ") + snap.pngPath + "\n")
+			b.WriteString(t.Muted.Render("Also saved as PNG: ") + snap.pngPath + "\n")
 		}
 		if snap.pngErr != "" && snap.qrText != "" {
 			// Last-resort fallback: dump the raw token so the user can
