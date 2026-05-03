@@ -499,6 +499,123 @@ parallel_slots = 2
 	}
 }
 
+// TestLoadWithGlobalAppliesDefaultProvider verifies the global
+// `default_provider` field flows into a workspace whose
+// providers.default.name is either absent or still at the built-in
+// default (the fresh-scaffold case). This is the single knob behind
+// "I picked openai_compatible in the Hub, why is the workspace still
+// on lmstudio?".
+func TestLoadWithGlobalAppliesDefaultProvider(t *testing.T) {
+	t.Setenv("FORGE_GLOBAL_HOME", t.TempDir())
+	cwd := t.TempDir()
+	// Workspace was scaffolded with the built-in default ("lmstudio").
+	writeWorkspaceConfig(t, cwd, `
+[providers.default]
+name = "lmstudio"
+`)
+	writeGlobal(t, globalconfig.GlobalConfig{
+		DefaultProvider: stringPtr("openai_compatible"),
+	})
+
+	cfg, err := LoadWithGlobal(cwd)
+	if err != nil {
+		t.Fatalf("LoadWithGlobal: %v", err)
+	}
+	if cfg.Providers.Default.Name != "openai_compatible" {
+		t.Fatalf("expected global default_provider to override scaffold lmstudio, got %q", cfg.Providers.Default.Name)
+	}
+}
+
+// TestLoadWithGlobalDefaultProviderRespectsExplicitWorkspace verifies a
+// workspace that picked a non-default provider name (i.e. "openai_compatible"
+// when the built-in default is "lmstudio") still wins over the global.
+func TestLoadWithGlobalDefaultProviderRespectsExplicitWorkspace(t *testing.T) {
+	t.Setenv("FORGE_GLOBAL_HOME", t.TempDir())
+	cwd := t.TempDir()
+	writeWorkspaceConfig(t, cwd, `
+[providers.default]
+name = "openai_compatible"
+`)
+	writeGlobal(t, globalconfig.GlobalConfig{
+		DefaultProvider: stringPtr("lmstudio"),
+	})
+
+	cfg, err := LoadWithGlobal(cwd)
+	if err != nil {
+		t.Fatalf("LoadWithGlobal: %v", err)
+	}
+	if cfg.Providers.Default.Name != "openai_compatible" {
+		t.Fatalf("explicit workspace provider should win, got %q", cfg.Providers.Default.Name)
+	}
+}
+
+// TestLoadWithGlobalOverridesScaffoldProviderEntry verifies a workspace
+// whose provider entry still matches the built-in default lets the global
+// flow through (the same scaffolded-escape behavior as model_loading).
+func TestLoadWithGlobalOverridesScaffoldProviderEntry(t *testing.T) {
+	t.Setenv("FORGE_GLOBAL_HOME", t.TempDir())
+	cwd := t.TempDir()
+	// Workspace lmstudio entry is the verbatim built-in default.
+	writeWorkspaceConfig(t, cwd, `
+[providers.lmstudio]
+type = "openai-compatible"
+base_url = "http://localhost:1234/v1"
+api_key = "lm-studio"
+default_model = "local-model"
+supports_tools = true
+`)
+	writeGlobal(t, globalconfig.GlobalConfig{
+		Providers: map[string]globalconfig.ProviderEntry{
+			"lmstudio": {
+				BaseURL:      stringPtr("http://192.168.1.50:1234/v1"),
+				DefaultModel: stringPtr("qwen/qwen3.6-35b-a3b"),
+			},
+		},
+	})
+
+	cfg, err := LoadWithGlobal(cwd)
+	if err != nil {
+		t.Fatalf("LoadWithGlobal: %v", err)
+	}
+	if cfg.Providers.LMStudio.BaseURL != "http://192.168.1.50:1234/v1" {
+		t.Fatalf("expected global base_url to override scaffold default, got %q", cfg.Providers.LMStudio.BaseURL)
+	}
+	if cfg.Providers.LMStudio.DefaultModel != "qwen/qwen3.6-35b-a3b" {
+		t.Fatalf("expected global default_model to override scaffold default, got %q", cfg.Providers.LMStudio.DefaultModel)
+	}
+}
+
+// TestLoadWithGlobalOverridesScaffoldModels verifies the per-role models
+// map inherits the global pick when the workspace value still matches the
+// built-in "local-model" default.
+func TestLoadWithGlobalOverridesScaffoldModels(t *testing.T) {
+	t.Setenv("FORGE_GLOBAL_HOME", t.TempDir())
+	cwd := t.TempDir()
+	writeWorkspaceConfig(t, cwd, `
+[models]
+chat = "local-model"
+editor = "local-model"
+planner = "local-model"
+`)
+	writeGlobal(t, globalconfig.GlobalConfig{
+		Models: map[string]string{
+			"chat":    "qwen/qwen3.6-35b-a3b",
+			"editor":  "qwen/qwen3.6-35b-a3b",
+			"planner": "qwen/qwen3.6-35b-a3b",
+		},
+	})
+
+	cfg, err := LoadWithGlobal(cwd)
+	if err != nil {
+		t.Fatalf("LoadWithGlobal: %v", err)
+	}
+	for _, role := range []string{"chat", "editor", "planner"} {
+		if cfg.Models[role] != "qwen/qwen3.6-35b-a3b" {
+			t.Fatalf("role %q expected global model to override scaffold default, got %q", role, cfg.Models[role])
+		}
+	}
+}
+
 func TestPersistWorkspaceConfigDoesNotMaterializeHubDefaults(t *testing.T) {
 	t.Setenv("FORGE_GLOBAL_HOME", t.TempDir())
 	cwd := t.TempDir()

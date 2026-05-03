@@ -349,9 +349,12 @@ func collectTOMLKeys(prefix string, m map[string]any, out map[string]bool) {
 // applyGlobalDefaults overlays a globalconfig.GlobalConfig onto an in-place
 // Config. Each pointer field in the global is applied only when its matching
 // dotted TOML key is absent from `keys` (i.e. the workspace did not write
-// it). Slice fields use the same key-presence test on the slice's parent
-// section.
+// it), OR when the workspace value still equals the built-in default — the
+// "scaffolded escape clause", since init.go materializes every default into
+// .forge/config.toml and we don't want those untouched scaffold values to
+// shadow the Hub's settings forever.
 func applyGlobalDefaults(cfg *Config, g globalconfig.GlobalConfig, keys map[string]bool) {
+	defaults := Defaults()
 	if g.Models != nil {
 		if cfg.Models == nil {
 			cfg.Models = map[string]string{}
@@ -360,7 +363,8 @@ func applyGlobalDefaults(cfg *Config, g globalconfig.GlobalConfig, keys map[stri
 			if gModel == "" {
 				continue
 			}
-			if !keys["models."+role] {
+			defModel := defaults.Models[role]
+			if !keys["models."+role] || cfg.Models[role] == defModel {
 				cfg.Models[role] = gModel
 			}
 		}
@@ -391,7 +395,6 @@ func applyGlobalDefaults(cfg *Config, g globalconfig.GlobalConfig, keys map[stri
 		// model_loading defaults into .forge/config.toml. Treat those untouched
 		// built-in values as inheritable so Hub global model-multi settings can
 		// still flow into newly opened workspaces.
-		defaults := Defaults()
 		if g.ModelLoading.Enabled != nil && (!keys["model_loading.enabled"] || cfg.ModelLoading.Enabled == defaults.ModelLoading.Enabled) {
 			cfg.ModelLoading.Enabled = *g.ModelLoading.Enabled
 		}
@@ -427,8 +430,17 @@ func applyGlobalDefaults(cfg *Config, g globalconfig.GlobalConfig, keys map[stri
 		applyPluginsDefaults(&cfg.Plugins, g.Plugins, keys)
 	}
 	if g.Providers != nil {
-		applyProviderEntry(&cfg.Providers.OpenAICompatible, g.Providers["openai_compatible"], keys, "providers.openai_compatible")
-		applyProviderEntry(&cfg.Providers.LMStudio, g.Providers["lmstudio"], keys, "providers.lmstudio")
+		applyProviderEntry(&cfg.Providers.OpenAICompatible, g.Providers["openai_compatible"], keys, "providers.openai_compatible", defaults.Providers.OpenAICompatible)
+		applyProviderEntry(&cfg.Providers.LMStudio, g.Providers["lmstudio"], keys, "providers.lmstudio", defaults.Providers.LMStudio)
+	}
+	// Active provider name. globalconfig.DefaultProvider is the only place
+	// the "which provider to use" picker can persist globally — there is no
+	// providers.default sub-entry on the global side because ProviderEntry
+	// has no Name field.
+	if g.DefaultProvider != nil && strings.TrimSpace(*g.DefaultProvider) != "" {
+		if !keys["providers.default.name"] || cfg.Providers.Default.Name == defaults.Providers.Default.Name {
+			cfg.Providers.Default.Name = strings.TrimSpace(*g.DefaultProvider)
+		}
 	}
 }
 
@@ -606,20 +618,25 @@ func applyPluginsDefaults(p *PluginsConfig, g *globalconfig.PluginsDefaults, key
 	}
 }
 
-func applyProviderEntry(p *ProviderConfig, g globalconfig.ProviderEntry, keys map[string]bool, sect string) {
-	if g.BaseURL != nil && !keys[sect+".base_url"] {
+// applyProviderEntry overlays a global provider block onto the workspace
+// provider config. Workspace value wins UNLESS it still equals the built-in
+// default (the fresh-scaffold case where init.go materialised every default
+// into .forge/config.toml — without this escape, untouched scaffold values
+// would permanently shadow the Hub's pick).
+func applyProviderEntry(p *ProviderConfig, g globalconfig.ProviderEntry, keys map[string]bool, sect string, def ProviderConfig) {
+	if g.BaseURL != nil && (!keys[sect+".base_url"] || p.BaseURL == def.BaseURL) {
 		p.BaseURL = *g.BaseURL
 	}
-	if g.APIKey != nil && !keys[sect+".api_key"] {
+	if g.APIKey != nil && (!keys[sect+".api_key"] || p.APIKey == def.APIKey) {
 		p.APIKey = *g.APIKey
 	}
-	if g.APIKeyEnv != nil && !keys[sect+".api_key_env"] {
+	if g.APIKeyEnv != nil && (!keys[sect+".api_key_env"] || p.APIKeyEnv == def.APIKeyEnv) {
 		p.APIKeyEnv = *g.APIKeyEnv
 	}
-	if g.DefaultModel != nil && !keys[sect+".default_model"] {
+	if g.DefaultModel != nil && (!keys[sect+".default_model"] || p.DefaultModel == def.DefaultModel) {
 		p.DefaultModel = *g.DefaultModel
 	}
-	if g.SupportsTools != nil && !keys[sect+".supports_tools"] {
+	if g.SupportsTools != nil && (!keys[sect+".supports_tools"] || p.SupportsTools == def.SupportsTools) {
 		p.SupportsTools = *g.SupportsTools
 	}
 }

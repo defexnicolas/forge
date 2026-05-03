@@ -43,6 +43,11 @@ func saveHubGlobalConfig(cfg config.Config) error {
 		"openai_compatible": toGlobalProvider(cfg.Providers.OpenAICompatible),
 		"lmstudio":          toGlobalProvider(cfg.Providers.LMStudio),
 	}
+	if name := strings.TrimSpace(cfg.Providers.Default.Name); name != "" {
+		current.DefaultProvider = stringPtr(name)
+	} else {
+		current.DefaultProvider = nil
+	}
 	current.Yarn = &globalconfig.YarnDefaults{
 		Profile:                stringPtr(cfg.Context.Yarn.Profile),
 		BudgetTokens:           intPtr(cfg.Context.BudgetTokens),

@@ -37,6 +37,7 @@ type GlobalConfig struct {
 	Theme           *string                  `toml:"theme,omitempty"`
 	ApprovalProfile *string                  `toml:"approval_profile,omitempty"`
 	OutputStyle     *string                  `toml:"output_style,omitempty"`
+	DefaultProvider *string                  `toml:"default_provider,omitempty"`
 	Providers       map[string]ProviderEntry `toml:"providers,omitempty"`
 	Models          map[string]string        `toml:"models,omitempty"`
 	DetectedByRole  map[string]DetectedModel `toml:"detected_by_role,omitempty"`
