@@ -534,13 +534,14 @@ func (f whatsAppForm) ViewSized(maxWidth, maxHeight int) string {
 		b.WriteString(opt1 + "\n")
 		b.WriteString("\n" + t.Muted.Render("1/2 or ↑/↓ to choose · Enter: confirm · Esc: cancel"))
 	case waPhasePhoneInput:
-		b.WriteString("Phone number (international format, digits only, no leading 0):\n\n")
+		b.WriteString("Your WhatsApp number (the one you'll link from):\n")
+		b.WriteString(t.Muted.Render("International format, digits only — no '+', no leading 0.") + "\n\n")
 		display := "+" + snap.phoneInput
 		if snap.phoneInput == "" {
 			display = "+_________________"
 		}
 		b.WriteString("  " + t.StatusValue.Render(display) + "\n\n")
-		b.WriteString(t.Muted.Render("e.g. +5215551234567 (52 = country code, then the rest)") + "\n")
+		b.WriteString(t.Muted.Render("e.g. 16473667140 (1 = country code) or 5215551234567 (52 = MX)") + "\n")
 		if snap.errMsg != "" {
 			b.WriteString("\n" + t.ErrorStyle.Render(snap.errMsg) + "\n")
 		}

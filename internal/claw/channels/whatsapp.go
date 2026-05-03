@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -296,24 +297,27 @@ func (w *WhatsApp) Connect(ctx context.Context) error {
 			case <-time.After(20 * time.Second):
 				return errors.New("whatsapp: timed out waiting for handshake before pair-phone")
 			}
+			// clientDisplayName must follow `Browser (OS)` and the
+			// browser/OS pair has to be one the server whitelists. Plain
+			// "Forge" returns 400 bad-request. "Chrome (Windows)" is the
+			// safe default — WhatsApp Web's own client uses the same
+			// format and the server doesn't tie it to your real OS.
 			code, err := client.PairPhone(ctx, w.opts.PhoneNumber, true,
-				whatsmeow.PairClientChrome, "Forge")
+				whatsmeow.PairClientChrome, "Chrome (Windows)")
 			if err != nil {
+				friendly := humanizePairPhoneError(err, w.opts.PhoneNumber)
 				w.mu.Lock()
-				w.lastError = "pair phone: " + err.Error()
+				w.lastError = friendly
 				w.notes = w.lastError
 				w.mu.Unlock()
-				return fmt.Errorf("whatsapp: pair phone: %w", err)
-			}
-			formatted := code
-			if len(code) == 8 {
-				formatted = code[:4] + "-" + code[4:]
+				return fmt.Errorf("whatsapp: pair phone: %s", friendly)
 			}
 			w.mu.Lock()
 			w.notes = "enter pair code in WhatsApp → Linked devices"
 			w.mu.Unlock()
 			if w.opts.PairCodeCallback != nil {
-				w.opts.PairCodeCallback(formatted)
+				// whatsmeow already returns the code as "XXXX-XXXX".
+				w.opts.PairCodeCallback(code)
 			}
 		}
 		return nil
@@ -337,6 +341,32 @@ func (w *WhatsApp) Connect(ctx context.Context) error {
 		fmt.Fprintf(os.Stderr, "[whatsapp] SendPresence(Available) failed: %v\n", err)
 	}
 	return nil
+}
+
+// humanizePairPhoneError turns whatsmeow's PairPhone errors into a
+// short message the form can show. The most common ones in the wild:
+//
+//   - bad-request / 400: server rejected either the number (not a real
+//     WhatsApp account, missing country code) or the device descriptor.
+//   - ErrPhoneNumberTooShort / ErrPhoneNumberIsNotInternational: caught
+//     locally before the network call.
+//
+// Falls back to err.Error() when nothing matches.
+func humanizePairPhoneError(err error, phone string) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, whatsmeow.ErrPhoneNumberTooShort) {
+		return "Number is too short — include the country code (e.g. 1 for US/Canada)."
+	}
+	if errors.Is(err, whatsmeow.ErrPhoneNumberIsNotInternational) {
+		return "Number starts with 0 — drop it and start with the country code."
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "400") || strings.Contains(strings.ToLower(msg), "bad-request") {
+		return fmt.Sprintf("WhatsApp rejected the request (400). Check that %q is your real WhatsApp number in international format with country code (no '+', no spaces) and that WhatsApp is active on that phone.", phone)
+	}
+	return msg
 }
 
 func (w *WhatsApp) Disconnect() error {
