@@ -223,9 +223,24 @@ func runClawChatWithTools(ctx context.Context, provider llm.Provider, modelID st
 		if resp == nil {
 			return "", fmt.Errorf("empty claw chat response")
 		}
-		// No tool calls → this is the final answer.
+		// No tool calls → this is the final answer, UNLESS it looks
+		// like the model bailed out ("I can't / no puedo / no tengo la
+		// capacidad") despite there being relevant tools. In that case
+		// retry once with a forceful nudge naming the tool by hand.
+		// Small local models routinely refuse actions they actually
+		// have tools for — this catches that without burning the loop
+		// on every chitchat turn.
 		if len(resp.ToolCalls) == 0 {
-			return strings.TrimSpace(resp.Content), nil
+			content := strings.TrimSpace(resp.Content)
+			if iter == 0 && len(defs) > 0 && looksLikeToolBailout(content) {
+				userMsg := lastUserMessage(msgs)
+				if hint := bailoutNudge(userMsg); hint != "" {
+					msgs = append(msgs, llm.Message{Role: "assistant", Content: content})
+					msgs = append(msgs, llm.Message{Role: "user", Content: hint})
+					continue
+				}
+			}
+			return content, nil
 		}
 		// Append the assistant message with tool_calls + each tool result
 		// as a role:tool message, then loop for the next round.
@@ -264,4 +279,148 @@ func runClawChatWithTools(ctx context.Context, provider llm.Provider, modelID st
 		return "(claw could not synthesize an answer from " + fmt.Sprintf("%d", clawMaxToolIterations) + " tool rounds)", nil
 	}
 	return strings.TrimSpace(finalResp.Content), nil
+}
+
+// bailoutPhrases is the set of substrings (lowercased, accent-stripped)
+// that signal the model is refusing an action one of its tools could
+// have performed. Matches both Spanish and English. Curated from
+// observed local-model regressions where Claw says things like "no
+// puedo configurar recordatorios automáticos en este entorno" despite
+// claw_schedule_reminder being live.
+var bailoutPhrases = []string{
+	"i can't",
+	"i cannot",
+	"i'm unable",
+	"i am unable",
+	"i don't have access",
+	"i do not have access",
+	"i do not have the ability",
+	"i don't have the ability",
+	"i don't have the capability",
+	"i lack the capability",
+	"in this environment",
+	"i'm just an ai",
+	"as an ai",
+	"no puedo",
+	"no tengo la capacidad",
+	"no tengo acceso",
+	"no tengo permiso",
+	"no es posible",
+	"no soy capaz",
+	"lo siento, no puedo",
+	"en este entorno",
+	"desde este entorno",
+}
+
+// looksLikeToolBailout returns true when reply opens with a refusal
+// matching one of bailoutPhrases. We only inspect the first 200
+// characters because real refusals (LLM "I can't / no puedo / lo
+// siento, no puedo...") put the phrase up front. Anchoring to the
+// prefix avoids false positives on legitimate replies that happen to
+// quote the phrase later ("la fuente dice que no puedo prometer...").
+func looksLikeToolBailout(reply string) bool {
+	r := strings.ToLower(strings.TrimSpace(reply))
+	if r == "" {
+		return false
+	}
+	// 100 chars is enough for real refusal openers ("Lo siento, no
+	// puedo X", "I'm sorry, I cannot Y", "As an AI assistant..."),
+	// short enough to skip mid-paragraph quotes of the phrase.
+	prefix := r
+	if len(prefix) > 100 {
+		prefix = prefix[:100]
+	}
+	for _, phrase := range bailoutPhrases {
+		if strings.Contains(prefix, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+// lastUserMessage returns the content of the most recent user-role
+// message in msgs, or "" if there is none. Used by the bailout-retry
+// path to inspect what the user originally asked for.
+func lastUserMessage(msgs []llm.Message) string {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "user" {
+			return msgs[i].Content
+		}
+	}
+	return ""
+}
+
+// bailoutNudge produces a forceful "yes you can — invoke the tool"
+// message tailored to whatever the user asked for. Returns "" when the
+// user's request doesn't obviously map to an actionable tool, in which
+// case we don't retry (no point — the model isn't refusing an action,
+// it's refusing knowledge it doesn't have).
+//
+// Pattern matches are intentionally broad: phone numbers + "send",
+// "remind"/"recuérdame" + a duration, "save"/"guarda" + a name. Each
+// branch names the specific tool the model should call, which works
+// far better than generic "use your tools" language.
+func bailoutNudge(userMsg string) string {
+	u := strings.ToLower(userMsg)
+	if u == "" {
+		return ""
+	}
+	hasPhone := containsPhoneNumber(userMsg)
+	hasSendVerb := containsAny(u, []string{"envíale", "envia", "envíalo", "mándale", "manda", "dile", "dígale", "send", "message", "whatsapp", "wpp"})
+	hasRemindVerb := containsAny(u, []string{"recuérdame", "recuerdame", "recordatorio", "remind me", "remind", "set a reminder", "ping me"})
+	hasSaveContact := containsAny(u, []string{"guarda contacto", "guarda este contacto", "save contact", "save this contact", "remember this number"})
+	hasRemember := containsAny(u, []string{"recuerda que", "recuerda esto", "remember that", "remember this", "anota que", "guárdate que", "ten en cuenta que"})
+	hasCron := containsAny(u, []string{"cada día", "cada mañana", "cada lunes", "cada semana", "todos los días", "every day", "every morning", "every monday", "weekly", "daily"})
+
+	switch {
+	case hasPhone && hasSendVerb:
+		return "STOP. You DO have whatsapp_send. Invoke it now: pass `to` = the phone number from my last message (with the country-code +) and `body` = the message I asked you to send. Do not refuse — the tool exists in this environment and the runtime will deliver it."
+	case hasRemindVerb:
+		return "STOP. You DO have claw_schedule_reminder. Compute the absolute UTC time from my request relative to the current time the system already gave you, then invoke claw_schedule_reminder with that ISO 8601 remind_at, the message body, the channel (default 'whatsapp' or 'mock'), and a target. Do not refuse — the reminder pump is live in this environment."
+	case hasCron:
+		return "STOP. You DO have claw_add_cron. Pick the right schedule syntax (@daily, @at HH:MM, @dow Mon HH:MM, etc.) and invoke claw_add_cron with name + schedule + prompt. The heartbeat will fire it. Do not refuse — the cron runtime is live."
+	case hasSaveContact:
+		return "STOP. You DO have claw_save_contact. Invoke it with name and any phone/email/notes from my message. Do not refuse — the contact store is local and live."
+	case hasRemember:
+		return "STOP. You DO have claw_remember. Invoke it with text = the fact I just told you. Do not refuse — the fact memory is local and live."
+	}
+	return ""
+}
+
+// containsPhoneNumber returns true if s contains a sequence that looks
+// like a phone number — a + optionally followed by digits/spaces/dashes
+// of total length >= 8 (covers most international formats while staying
+// noise-free). Used by the bailout heuristic to decide whether the
+// user actually gave a destination for whatsapp_send.
+func containsPhoneNumber(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] != '+' {
+			continue
+		}
+		digits := 0
+		for j := i + 1; j < len(s); j++ {
+			c := s[j]
+			if c >= '0' && c <= '9' {
+				digits++
+				continue
+			}
+			if c == ' ' || c == '-' || c == '(' || c == ')' {
+				continue
+			}
+			break
+		}
+		if digits >= 8 {
+			return true
+		}
+	}
+	return false
+}
+
+func containsAny(haystack string, needles []string) bool {
+	for _, n := range needles {
+		if strings.Contains(haystack, n) {
+			return true
+		}
+	}
+	return false
 }
