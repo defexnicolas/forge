@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/imgs/forge.png" alt="Forge" width="180" />
+  <img src="docs/imgs/forge.png" alt="Forge" width="420" />
 </p>
 
 <h1 align="center">Forge</h1>
