@@ -158,6 +158,14 @@ type shellModel struct {
 	migrationProposals []migrationProposal
 	statusMessage      string
 	lastEscTime        time.Time
+	// exitConfirm is non-nil only while the "agent task running"
+	// modal is on screen, intercepting input before the normal
+	// shell key dispatch sees it. nil = no modal, normal flow.
+	exitConfirm *exitWorkspaceConfirmForm
+	// backgroundWorkspacePath is the cwd of a workspace whose agent
+	// is still running while the user is in Hub. Empty = none.
+	// Re-opening this exact path reattaches instead of spawning fresh.
+	backgroundWorkspacePath string
 }
 
 type clawInterviewAnsweredMsg struct {
@@ -329,6 +337,19 @@ func (m shellModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.cancelPendingClawInterview()
 		return m, tea.Quit
 	}
+	// The exit-confirm modal must consume keys before anything else,
+	// otherwise Esc / Enter inside it would be eaten by the workspace
+	// shell or the hub form dispatcher and the modal would feel stuck.
+	if m.exitConfirm != nil {
+		if key, ok := msg.(tea.KeyMsg); ok {
+			updated, _ := m.exitConfirm.Update(key)
+			m.exitConfirm = &updated
+			if updated.done {
+				m.resolveExitConfirm(updated.choice)
+			}
+			return m, nil
+		}
+	}
 	if result, cmd, handled := m.handleHubFormUpdate(msg); handled {
 		return result, cmd
 	}
@@ -408,6 +429,12 @@ func (m shellModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m shellModel) View() string {
+	// Exit-confirm modal owns the screen until the user picks one of
+	// the three options. Same pattern as the workspace's per-form
+	// modals — a modal that ignores the rest of the layout.
+	if m.exitConfirm != nil {
+		return m.exitConfirm.View()
+	}
 	if m.mode == modeHub && m.activeView == viewChat && m.hubChatHasModal() {
 		return m.hubChat.View()
 	}
@@ -580,9 +607,7 @@ func (m *shellModel) handleEsc() (tea.Model, tea.Cmd) {
 			m.activePane = paneSidebar
 			return *m, m.resizeWorkspace()
 		}
-		if err := m.SwitchToHub(); err != nil {
-			m.statusMessage = "Close workspace failed: " + err.Error()
-		}
+		m.requestHubReturn()
 		return *m, nil
 	}
 	if m.mode == modeHub && m.activeView == viewClaw && m.activePane == paneInput {
@@ -831,6 +856,20 @@ func (m *shellModel) OpenWorkspace(cwd string) error {
 	if m.options.OpenWorkspace == nil {
 		return fmt.Errorf("workspace opener unavailable")
 	}
+	// Reattach path: if the user backgrounded a workspace at exactly
+	// this cwd, the model + session + agent are still alive in memory.
+	// Re-opening should drop them back into that live state, not spawn
+	// a fresh session that orphans the running agent.
+	target := normalizeDir(cwd)
+	if m.workspace != nil && m.backgroundWorkspacePath != "" && target == m.backgroundWorkspacePath {
+		_ = m.closeHubChat()
+		m.mode = modeWorkspace
+		m.activePane = paneInput
+		m.activeView = viewChat
+		m.statusMessage = "Reattached to background workspace: " + target
+		m.backgroundWorkspacePath = ""
+		return nil
+	}
 	session, err := m.options.OpenWorkspace(cwd, "")
 	if err != nil {
 		return err
@@ -852,11 +891,66 @@ func (m *shellModel) SwitchToHub() error {
 	if err := m.closeWorkspace(); err != nil {
 		return err
 	}
+	m.backgroundWorkspacePath = ""
 	m.mode = modeHub
 	m.activePane = paneMain
 	m.activeView = viewExplorer
 	m.selectSidebarView(viewExplorer)
 	return nil
+}
+
+// SwitchToHubBackground switches the UI to Hub mode without closing
+// the workspace. The agent keeps running, m.workspace and
+// m.workspaceSession stay populated, and re-opening the same cwd
+// reattaches to the live state instead of spawning fresh.
+func (m *shellModel) SwitchToHubBackground() {
+	if m.workspace == nil {
+		// Defensive: caller should have checked, but treat the
+		// no-workspace case as a plain hub switch so we never end
+		// up in a half-mode state.
+		_ = m.SwitchToHub()
+		return
+	}
+	m.backgroundWorkspacePath = normalizeDir(m.workspace.options.CWD)
+	m.mode = modeHub
+	m.activePane = paneMain
+	m.activeView = viewExplorer
+	m.selectSidebarView(viewExplorer)
+	if m.backgroundWorkspacePath != "" {
+		m.statusMessage = "Workspace running in background: " + m.backgroundWorkspacePath
+	}
+}
+
+// requestHubReturn is the single entry point for "user wants to leave
+// the workspace". When the agent is idle, we switch immediately. When
+// it is mid-task, we open the 3-option modal so the user explicitly
+// chooses background vs kill vs cancel — silently killing an in-flight
+// task on Esc was the bug behind "I lost my work going to Hub".
+func (m *shellModel) requestHubReturn() {
+	if m.workspace == nil || m.workspace.agentRuntime == nil || !m.workspace.agentRunning {
+		if err := m.SwitchToHub(); err != nil {
+			m.statusMessage = "Close workspace failed: " + err.Error()
+		}
+		return
+	}
+	form := newExitWorkspaceConfirmForm(m.theme, m.workspace.options.CWD)
+	m.exitConfirm = &form
+}
+
+// resolveExitConfirm runs the choice the user picked in the exit modal.
+// Background → keep workspace alive; Kill → full close; Cancel → no-op.
+func (m *shellModel) resolveExitConfirm(choice exitChoice) {
+	m.exitConfirm = nil
+	switch choice {
+	case exitChoiceBackground:
+		m.SwitchToHubBackground()
+	case exitChoiceKill:
+		if err := m.SwitchToHub(); err != nil {
+			m.statusMessage = "Close workspace failed: " + err.Error()
+		}
+	default:
+		// Cancel: nothing to do, modal already cleared.
+	}
 }
 
 func (m *shellModel) closeWorkspace() error {
@@ -1154,9 +1248,7 @@ func (m *shellModel) activateWorkspaceSidebar() tea.Cmd {
 		m.activeView = viewSettings
 		m.pushWorkspacePanelOutput("settings", m.workspace.describeWorkspaceSettings())
 	case viewHub:
-		if err := m.SwitchToHub(); err != nil {
-			m.statusMessage = "Close workspace failed: " + err.Error()
-		}
+		m.requestHubReturn()
 	}
 	return m.resizeWorkspace()
 }

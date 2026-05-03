@@ -133,3 +133,21 @@ func cloneStringMap(in map[string]string) map[string]string {
 func stringPtr(v string) *string { return &v }
 func intPtr(v int) *int          { return &v }
 func boolPtr(v bool) *bool       { return &v }
+
+// persistGlobalApprovalProfile writes approval_profile to
+// ~/.forge/global.toml without touching any other field. Used by the
+// Approval form's [Auto] action so picking "auto" once durably stops
+// future prompts across every workspace, not just the current one.
+func persistGlobalApprovalProfile(profile string) error {
+	current, err := globalconfig.Load()
+	if err != nil {
+		return err
+	}
+	profile = strings.TrimSpace(profile)
+	if profile == "" {
+		current.ApprovalProfile = nil
+	} else {
+		current.ApprovalProfile = stringPtr(profile)
+	}
+	return globalconfig.Save(current)
+}

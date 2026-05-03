@@ -26,7 +26,21 @@ func (m *model) handleFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 		if m.approvalForm.done {
 			req := m.approvalForm.request
 			approved := m.approvalForm.approved
+			autoMode := m.approvalForm.autoMode
 			m.activeForm = formNone
+			// "Auto" approves the current request AND flips the approval
+			// profile to "auto" so future mutating tools no longer prompt.
+			// Persist globally (rather than per-workspace) because the
+			// user's intent is "stop asking me, anywhere".
+			if autoMode {
+				m.options.Config.ApprovalProfile = "auto"
+				m.syncRuntimeConfig()
+				if err := persistGlobalApprovalProfile("auto"); err != nil {
+					m.history = append(m.history, m.theme.Warning.Render("Auto-approve set for this session, but global save failed: "+err.Error()))
+				} else {
+					m.history = append(m.history, m.theme.Success.Render("Auto-approve enabled. approval_profile = \"auto\" persisted to ~/.forge/global.toml."))
+				}
+			}
 			if req != nil {
 				req.Response <- agent.ApprovalResponse{Approved: approved}
 				var result string

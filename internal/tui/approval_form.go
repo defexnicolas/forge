@@ -11,9 +11,10 @@ import (
 
 type approvalForm struct {
 	request    *agent.ApprovalRequest
-	cursor     int // 0 = approve, 1 = deny
+	cursor     int // 0 = auto, 1 = approve, 2 = deny
 	done       bool
 	approved   bool
+	autoMode   bool // true when the user picked [Auto] -- caller flips approval_profile globally
 	theme      Theme
 	width      int
 	height     int
@@ -28,10 +29,13 @@ const approvalDiffPageDefault = 18
 func newApprovalForm(req *agent.ApprovalRequest, theme Theme, width, height int) approvalForm {
 	f := approvalForm{
 		request: req,
-		cursor:  0,
-		theme:   theme,
-		width:   width,
-		height:  height,
+		// Default cursor = Approve (the safe, single-action choice).
+		// The caller can later persist Auto if the user explicitly picks
+		// it, but we never default to it.
+		cursor: 1,
+		theme:  theme,
+		width:  width,
+		height: height,
 	}
 	if req != nil && req.Diff != "" {
 		colored := theme.FormatDiffColored(req.Diff)
@@ -74,9 +78,13 @@ func (f approvalForm) Update(msg tea.Msg) (approvalForm, tea.Cmd) {
 	}
 	switch key.Type {
 	case tea.KeyLeft:
-		f.cursor = 0
+		if f.cursor > 0 {
+			f.cursor--
+		}
 	case tea.KeyRight, tea.KeyTab:
-		f.cursor = 1
+		if f.cursor < 2 {
+			f.cursor++
+		}
 	case tea.KeyUp:
 		if f.diffOffset > 0 {
 			f.diffOffset--
@@ -103,10 +111,22 @@ func (f approvalForm) Update(msg tea.Msg) (approvalForm, tea.Cmd) {
 		f.approved = false
 		f.done = true
 	case tea.KeyEnter:
-		f.approved = f.cursor == 0
+		switch f.cursor {
+		case 0:
+			f.autoMode = true
+			f.approved = true
+		case 1:
+			f.approved = true
+		default:
+			f.approved = false
+		}
 		f.done = true
 	default:
 		switch strings.ToLower(key.String()) {
+		case "u":
+			f.autoMode = true
+			f.approved = true
+			f.done = true
 		case "y", "a":
 			f.approved = true
 			f.done = true
@@ -173,17 +193,26 @@ func (f approvalForm) View() string {
 		b.WriteString(t.Muted.Render("Input: ") + truncate(string(f.request.Input), 400) + "\n\n")
 	}
 
+	auto := "[  Auto  ]"
 	approve := "[ Approve ]"
 	deny := "[  Deny  ]"
-	if f.cursor == 0 {
+	switch f.cursor {
+	case 0:
+		auto = t.ApprovalStyle.Render("> " + auto + " <")
+		approve = t.Muted.Render("  " + approve + "  ")
+		deny = t.Muted.Render("  " + deny + "  ")
+	case 1:
+		auto = t.Muted.Render("  " + auto + "  ")
 		approve = t.Success.Render("> " + approve + " <")
 		deny = t.Muted.Render("  " + deny + "  ")
-	} else {
+	default:
+		auto = t.Muted.Render("  " + auto + "  ")
 		approve = t.Muted.Render("  " + approve + "  ")
 		deny = t.ErrorStyle.Render("> " + deny + " <")
 	}
-	b.WriteString(approve + "    " + deny + "\n")
-	b.WriteString("\n" + t.Muted.Render("  Left/Right choose  Up/Dn PgUp/PgDn Home/End scroll  Enter/y approve  Esc/n reject"))
+	b.WriteString(auto + "  " + approve + "  " + deny + "\n")
+	b.WriteString("\n" + t.Muted.Render("  [Auto] approves now and stops asking (sets approval_profile = auto globally)"))
+	b.WriteString("\n" + t.Muted.Render("  Left/Right choose  Up/Dn PgUp/PgDn Home/End scroll  Enter pick  u Auto  y/a Approve  n/d Deny  Esc reject"))
 
 	return box.Render(b.String())
 }
