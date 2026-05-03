@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "sample-mcp": {
+      "command": "echo",
+      "args": ["sample-mcp ping"]
+    }
+  }
+}

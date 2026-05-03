@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
+	"os"
 	"strings"
 	"time"
 
+	"forge/internal/config"
+	"forge/internal/tools/websearch"
 	"golang.org/x/net/html"
 )
 
@@ -148,134 +150,74 @@ func (webSearchTool) Run(ctx Context, input json.RawMessage) (Result, error) {
 		req.MaxResults = 5
 	}
 
-	// Use DuckDuckGo HTML search as a free, no-API-key search.
-	searchURL := "https://html.duckduckgo.com/html/?q=" + url.QueryEscape(req.Query)
-	client := &http.Client{Timeout: 15 * time.Second}
-	httpReq, err := http.NewRequestWithContext(ctx.Context, http.MethodGet, searchURL, nil)
+	backend := selectSearchBackend(ctx.CWD)
+	results, err := backend.Search(ctx.Context, req.Query, req.MaxResults)
 	if err != nil {
-		return Result{}, err
+		return Result{}, fmt.Errorf("%s search: %w", backend.Name(), err)
 	}
-	httpReq.Header.Set("User-Agent", "forge/0.1")
-
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		return Result{}, fmt.Errorf("search failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
-	if err != nil {
-		return Result{}, err
-	}
-
-	results := parseDDGResults(string(body), req.MaxResults)
 	if len(results) == 0 {
 		return Result{
 			Title:   "web_search",
-			Summary: "No results found for: " + req.Query,
+			Summary: fmt.Sprintf("No results (%s) for: %s", backend.Name(), req.Query),
 			Content: []ContentBlock{{Type: "text", Text: "No results found."}},
 		}, nil
 	}
 
 	var b strings.Builder
 	for i, r := range results {
-		fmt.Fprintf(&b, "%d. %s\n   %s\n   %s\n\n", i+1, r.title, r.url, r.snippet)
+		fmt.Fprintf(&b, "%d. %s\n   %s\n   %s\n\n", i+1, r.Title, r.URL, r.Snippet)
 	}
-
 	return Result{
 		Title:   "web_search",
-		Summary: fmt.Sprintf("%d results for: %s", len(results), req.Query),
+		Summary: fmt.Sprintf("%d results (%s) for: %s", len(results), backend.Name(), req.Query),
 		Content: []ContentBlock{{Type: "text", Text: strings.TrimSpace(b.String())}},
 	}, nil
 }
 
-type searchResult struct {
-	title   string
-	url     string
-	snippet string
-}
-
-func parseDDGResults(body string, maxResults int) []searchResult {
-	if strings.TrimSpace(body) == "" || maxResults <= 0 {
-		return nil
-	}
-	doc, err := html.Parse(strings.NewReader(body))
+// selectSearchBackend reads the effective workspace+global config and
+// returns the configured search backend. Falls back to DuckDuckGo when
+// nothing is configured (the no-API-key default), so first-run users get
+// useful results without setup.
+//
+// The config load is best-effort: a missing or malformed file defaults to
+// DuckDuckGo rather than failing the search.
+func selectSearchBackend(cwd string) websearch.Backend {
+	cfg, err := config.LoadWithGlobal(cwd)
 	if err != nil {
-		return nil
+		return websearch.DuckDuckGo{}
 	}
-	var results []searchResult
-	var walk func(*html.Node)
-	walk = func(n *html.Node) {
-		if len(results) >= maxResults {
-			return
-		}
-		if n.Type == html.ElementNode && n.Data == "a" {
-			class := getAttr(n, "class")
-			if strings.Contains(class, "result__a") {
-				href := getAttr(n, "href")
-				title := textContent(n)
-				// Find sibling snippet.
-				snippet := ""
-				for sib := n.Parent; sib != nil; sib = sib.Parent {
-					if getAttr(sib, "class") == "result" || strings.Contains(getAttr(sib, "class"), "result ") {
-						snippet = findSnippet(sib)
-						break
-					}
-				}
-				if title != "" && href != "" {
-					// DDG wraps URLs in redirect; extract actual URL.
-					if parsed, err := url.Parse(href); err == nil {
-						if actual := parsed.Query().Get("uddg"); actual != "" {
-							href = actual
-						}
-					}
-					results = append(results, searchResult{title: title, url: href, snippet: snippet})
-				}
+	provider := strings.ToLower(strings.TrimSpace(cfg.WebSearch.Provider))
+	switch provider {
+	case "ollama":
+		key := strings.TrimSpace(cfg.WebSearch.APIKey)
+		if key == "" {
+			if env := strings.TrimSpace(cfg.WebSearch.APIKeyEnv); env != "" {
+				key = os.Getenv(env)
 			}
 		}
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			walk(c)
+		if key == "" {
+			key = os.Getenv("OLLAMA_API_KEY")
 		}
+		return websearch.Ollama{
+			BaseURL: cfg.WebSearch.BaseURL,
+			APIKey:  key,
+		}
+	case "", "duckduckgo", "ddg":
+		return websearch.DuckDuckGo{}
+	default:
+		// Unknown provider — log via the result summary by returning DDG;
+		// the agent at least gets results instead of an opaque failure.
+		return websearch.DuckDuckGo{}
 	}
-	walk(doc)
-	return results
 }
 
-func getAttr(n *html.Node, key string) string {
-	for _, a := range n.Attr {
-		if a.Key == key {
-			return a.Val
-		}
-	}
-	return ""
-}
-
-func textContent(n *html.Node) string {
-	if n.Type == html.TextNode {
-		return n.Data
-	}
-	var b strings.Builder
-	for c := n.FirstChild; c != nil; c = c.NextSibling {
-		b.WriteString(textContent(c))
-	}
-	return strings.TrimSpace(b.String())
-}
-
-func findSnippet(n *html.Node) string {
-	var walk func(*html.Node) string
-	walk = func(node *html.Node) string {
-		if node.Type == html.ElementNode {
-			class := getAttr(node, "class")
-			if strings.Contains(class, "result__snippet") || strings.Contains(class, "result-snippet") {
-				return strings.TrimSpace(textContent(node))
-			}
-		}
-		for c := node.FirstChild; c != nil; c = c.NextSibling {
-			if result := walk(c); result != "" {
-				return result
-			}
-		}
-		return ""
-	}
-	return walk(n)
-}
+// reuseHTMLDeps keeps the html/io/time/http imports referenced after the
+// DDG parser moved to internal/tools/websearch. extractTextFromHTML still
+// uses html and webFetchTool still uses http/io/time, so this is just
+// belt-and-suspenders against an over-eager goimports run.
+var (
+	_ = html.Parse
+	_ = io.LimitReader
+	_ = http.MethodGet
+	_ = time.Second
+)

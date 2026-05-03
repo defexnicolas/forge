@@ -615,7 +615,9 @@ func (r *Runtime) invalidateSystemPromptCache() {
 
 // cachedSystemPrompt returns the system prompt for the current (mode, policy,
 // nativeTools) signature, computing and memoizing on first hit. Callers must
-// not mutate the returned string.
+// not mutate the returned string. The output style appendix (if any) is
+// folded into the cached value so a config change requires reset (which
+// SetMode already does).
 func (r *Runtime) cachedSystemPrompt(nativeToolCalling bool) string {
 	if r == nil {
 		return ""
@@ -630,6 +632,9 @@ func (r *Runtime) cachedSystemPrompt(nativeToolCalling bool) string {
 	}
 	r.mu.Unlock()
 	rendered := systemPrompt(nativeToolCalling, r.Mode, r.Policy)
+	if appendix := r.outputStyleAppendix(); appendix != "" {
+		rendered = rendered + "\n\n" + appendix
+	}
 	r.mu.Lock()
 	if r.systemPromptCache == nil {
 		r.systemPromptCache = map[string]string{}
@@ -637,6 +642,27 @@ func (r *Runtime) cachedSystemPrompt(nativeToolCalling bool) string {
 	r.systemPromptCache[key] = rendered
 	r.mu.Unlock()
 	return rendered
+}
+
+// outputStyleAppendix loads the configured output-style markdown and wraps
+// it in a clearly-marked section. Best-effort: a missing file returns ""
+// and the agent continues with the default voice. The file is read on
+// demand and not cached separately because cachedSystemPrompt's own cache
+// already amortizes it across the whole turn-chain.
+func (r *Runtime) outputStyleAppendix() string {
+	path := strings.TrimSpace(r.Config.OutputStyle)
+	if path == "" {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	body := strings.TrimSpace(string(data))
+	if body == "" {
+		return ""
+	}
+	return "--- output style ---\n" + body
 }
 
 // PreflightCacheGet returns a cached preflight result for (mode, line) if

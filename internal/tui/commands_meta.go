@@ -51,6 +51,7 @@ var tuiCommands = []commandDescriptor{
 	{Name: "/review", Usage: "/review", Description: "switch to review mode and show diff"},
 	{Name: "/analyze", Usage: "/analyze [refresh|show]", Description: "scan and cache project snapshot", Subcommands: []string{"refresh", "show"}},
 	{Name: "/btw", Usage: "/btw <question>", Description: "side LLM call using shared context (parallel)"},
+	{Name: "/claw", Usage: "/claw [status|start|stop|dream|interview|memory|soul|inbox|cron]", Description: "manage the resident Claw service", Subcommands: []string{"status", "start", "stop", "dream", "interview", "memory", "soul", "inbox", "cron"}},
 	{Name: "/remote-control", Usage: "/remote-control [start|stop|status] [port]", Description: "serve session over LAN for web/device access", Subcommands: []string{"start", "stop", "status"}},
 	{Name: "/code", Usage: "/code", Description: "open the workspace in VS Code"},
 	{Name: "/quit", Usage: "/quit", Description: "exit forge and save history"},

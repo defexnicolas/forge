@@ -9,11 +9,16 @@ import (
 	"strings"
 	"time"
 
+	"forge/internal/claw"
+	clawchannels "forge/internal/claw/channels"
 	"forge/internal/config"
 	"forge/internal/globalconfig"
 	"forge/internal/llm"
+	"forge/internal/plugins"
 	"forge/internal/session"
+	"forge/internal/tools"
 
+	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -86,6 +91,7 @@ const (
 	viewMCPs      appView = "mcps"
 	viewSettings  appView = "settings"
 	viewChat      appView = "chat"
+	viewClaw      appView = "claw"
 	viewPlan      appView = "plan"
 	viewDiff      appView = "diff"
 	viewHub       appView = "hub"
@@ -123,6 +129,7 @@ type shellModel struct {
 	pinnedIndex        int
 	hubChat            *model
 	hubChatSession     *WorkspaceSession
+	hubClaw            *claw.Service
 	workspace          *model
 	workspaceSession   *WorkspaceSession
 	activeHubForm      hubFormMode
@@ -132,10 +139,31 @@ type shellModel struct {
 	yarnSettingsForm   yarnSettingsForm
 	themeForm          themeForm
 	skillsForm         skillsForm
+	webSearchForm      webSearchForm
+	outputStyleForm    outputStyleForm
+	pluginsForm        pluginsForm
+	whatsAppForm       whatsAppForm
+	clawIdentityForm   clawIdentityForm
+	clawHeartbeatForm  clawHeartbeatForm
+	clawAllowlistForm  clawAllowlistForm
+	clawInput          textarea.Model
+	clawPendingAnswer  string
+	clawAwaitingReply  bool
+	clawPendingCancel  context.CancelFunc
+	clawSection        clawSection
+	clawChannelIndex   int
+	clawChannelSelect  bool
+	clawLogoutPending  bool // first 'L' press arms the confirm; second commits
 	hubSettingsIndex   int
 	migrationProposals []migrationProposal
 	statusMessage      string
 	lastEscTime        time.Time
+}
+
+type clawInterviewAnsweredMsg struct {
+	next string
+	done bool
+	err  error
 }
 
 func newShellModel(options ShellOptions) shellModel {
@@ -167,7 +195,7 @@ func newShellModel(options ShellOptions) shellModel {
 		height:        32,
 		mode:          modeHub,
 		activePane:    paneMain,
-		activeView:    viewExplorer,
+		activeView:    viewHub,
 		explorerDir:   dir,
 		explorerIndex: 0,
 		// hubState carries the just-loaded Pinned/Recent/LastHubDir/MigrationDone
@@ -176,6 +204,8 @@ func newShellModel(options ShellOptions) shellModel {
 		// silently wiping pinned and recent across restarts.
 		hubState: hubState,
 	}
+	m.selectSidebarView(viewHub)
+	m.clawInput = newShellClawInput()
 	m.loadExplorerDir(dir)
 	if options.InitialWorkspace != nil {
 		m.attachWorkspace(options.InitialWorkspace)
@@ -184,6 +214,91 @@ func newShellModel(options ShellOptions) shellModel {
 	// the user's choice from the very first frame.
 	if g, err := globalconfig.Load(); err == nil && g.Theme != nil && *g.Theme != "" {
 		m.theme = GetTheme(*g.Theme)
+	}
+	if cfg, err := loadHubGlobalConfig(); err == nil {
+		registry := tools.NewRegistry()
+		tools.RegisterBuiltins(registry)
+		if svc, serr := claw.Open(cfg, hubSettingsProviders(cfg), registry); serr == nil {
+			m.hubClaw = svc
+			// Wire Claw-local tools into the Hub registry. WhatsApp
+			// and contact tools both want a closure into the live
+			// service — register them after Open so they target this
+			// concrete instance. Hub mode uses the same registry the
+			// Claw chat dispatcher reads, so these become available
+			// to the LLM immediately.
+			tools.RegisterWhatsAppSendTool(registry, func(ctx context.Context, to, body string) error {
+				_, err := svc.SendVia(ctx, "whatsapp", clawchannels.Message{To: to, Body: body})
+				return err
+			})
+			tools.RegisterClawContactTools(
+				registry,
+				func(ctx context.Context, name, phone, email, notes string) (tools.ContactRecord, error) {
+					c, err := svc.SaveContact(name, phone, email, notes, "claw_save_contact")
+					if err != nil {
+						return tools.ContactRecord{}, err
+					}
+					return tools.ContactRecord{
+						Name: c.Name, Phone: c.Phone, Email: c.Email, Notes: c.Notes, Source: c.Source,
+					}, nil
+				},
+				func(ctx context.Context, name string) (tools.ContactRecord, bool) {
+					c, ok := svc.LookupContact(name)
+					if !ok {
+						return tools.ContactRecord{}, false
+					}
+					return tools.ContactRecord{
+						Name: c.Name, Phone: c.Phone, Email: c.Email, Notes: c.Notes, Source: c.Source,
+					}, true
+				},
+			)
+			tools.RegisterClawFactTools(
+				registry,
+				func(ctx context.Context, text, subject string) (tools.FactRecord, error) {
+					f, err := svc.RememberFact(text, subject, "claw_remember")
+					if err != nil {
+						return tools.FactRecord{}, err
+					}
+					return tools.FactRecord{ID: f.ID, Text: f.Text, Subject: f.Subject, Source: f.Source}, nil
+				},
+				func(ctx context.Context, query string, maxResults int) []tools.FactRecord {
+					hits := svc.RecallFacts(query, maxResults)
+					out := make([]tools.FactRecord, 0, len(hits))
+					for _, f := range hits {
+						out = append(out, tools.FactRecord{ID: f.ID, Text: f.Text, Subject: f.Subject, Source: f.Source})
+					}
+					return out
+				},
+			)
+			tools.RegisterClawReminderTools(
+				registry,
+				func(ctx context.Context, at time.Time, body, channel, target string) (tools.ReminderRecord, error) {
+					r, err := svc.ScheduleReminder(at, body, channel, target)
+					if err != nil {
+						return tools.ReminderRecord{}, err
+					}
+					return tools.ReminderRecord{
+						ID: r.ID, RemindAt: r.RemindAt.Format(time.RFC3339),
+						Body: r.Body, Channel: r.Channel, Target: r.Target, Status: r.Status,
+					}, nil
+				},
+				func(ctx context.Context, status string) []tools.ReminderRecord {
+					rs := svc.ListReminders(status)
+					out := make([]tools.ReminderRecord, 0, len(rs))
+					for _, r := range rs {
+						out = append(out, tools.ReminderRecord{
+							ID: r.ID, RemindAt: r.RemindAt.Format(time.RFC3339),
+							Body: r.Body, Channel: r.Channel, Target: r.Target, Status: r.Status,
+							LastError: r.LastError,
+						})
+					}
+					return out
+				},
+				func(ctx context.Context, id string) error { return svc.CancelReminder(id) },
+			)
+			tools.RegisterClawWorkspaceNoteTool(registry, func(ctx context.Context, file, note string) (string, error) {
+				return svc.AppendWorkspaceNote(file, note)
+			})
+		}
 	}
 	// First-run migration check: if the user has Recent / Pinned workspaces
 	// with theme/models/yarn we now serve from the global config, surface
@@ -210,17 +325,49 @@ func (m shellModel) Init() tea.Cmd {
 }
 
 func (m shellModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if key, ok := msg.(tea.KeyMsg); ok && key.Type == tea.KeyCtrlC {
+		m.cancelPendingClawInterview()
+		return m, tea.Quit
+	}
 	if result, cmd, handled := m.handleHubFormUpdate(msg); handled {
 		return result, cmd
 	}
 	switch msg := msg.(type) {
+	case clawInterviewAnsweredMsg:
+		m.clawAwaitingReply = false
+		m.clawPendingAnswer = ""
+		m.clawPendingCancel = nil
+		if msg.err != nil {
+			if msg.err == context.Canceled {
+				m.statusMessage = "Claw interview canceled."
+				return m, nil
+			}
+			m.statusMessage = "Claw interview failed: " + msg.err.Error()
+			return m, nil
+		}
+		if msg.done {
+			m.activePane = paneInput
+			m.syncClawFocus()
+			m.statusMessage = "Interview complete. You can keep chatting with Claw."
+			if strings.TrimSpace(msg.next) != "" {
+				m.statusMessage += " " + msg.next
+			}
+			return m, nil
+		}
+		m.statusMessage = msg.next
+		return m, nil
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.clawInput.SetWidth(max(20, m.hubContentWidth()-4))
 		return m, tea.Batch(m.resizeWorkspace(), m.resizeHubChat())
 	case tea.KeyMsg:
 		if msg.Type == tea.KeyCtrlC {
+			m.cancelPendingClawInterview()
 			return m, tea.Quit
+		}
+		if m.mode == modeHub && m.activeView == viewClaw && m.clawInputEnabled() && m.activePane == paneInput {
+			return m.handleClawInput(msg)
 		}
 		if m.mode == modeHub && m.activeView == viewChat && m.hubChat != nil && m.activePane == paneInput && !m.hubChatHasModal() {
 			if msg.String() == "ctrl+w" || msg.Type == tea.KeyF6 {
@@ -274,6 +421,9 @@ func (m shellModel) View() string {
 		}
 		return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, m.hubChatEmptyView())
 	}
+	if m.mode == modeHub && m.activeView == viewClaw {
+		return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, m.clawView())
+	}
 	if m.mode == modeWorkspace && m.workspace != nil {
 		return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, m.workspace.View())
 	}
@@ -281,6 +431,7 @@ func (m shellModel) View() string {
 }
 
 func (m *shellModel) Close() error {
+	m.cancelPendingClawInterview()
 	if err := m.closeHubChat(); err != nil {
 		return err
 	}
@@ -314,6 +465,39 @@ func (m *shellModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			case "p":
 				m.togglePinForActiveSelection()
 				return *m, nil
+			case "s":
+				if m.activeView == viewClaw {
+					if err := m.toggleClawHeartbeat(); err != nil {
+						m.statusMessage = "Claw heartbeat failed: " + err.Error()
+					}
+					return *m, nil
+				}
+			case "d":
+				if m.activeView == viewClaw {
+					if err := m.runClawDream(); err != nil {
+						m.statusMessage = "Claw dream failed: " + err.Error()
+					}
+					return *m, nil
+				}
+			case "r":
+				if m.activeView == viewClaw {
+					if err := m.resetClawChat(); err != nil {
+						m.statusMessage = "Claw chat reset failed: " + err.Error()
+					}
+					return *m, nil
+				}
+			case "i":
+				if m.activeView == viewClaw {
+					if err := m.ensureClawInterview(); err != nil {
+						m.statusMessage = "Claw interview failed: " + err.Error()
+					} else if m.clawInputEnabled() {
+						m.activePane = paneInput
+						m.syncClawFocus()
+					} else {
+						m.activePane = paneMain
+					}
+					return *m, nil
+				}
 			}
 		}
 	case tea.KeyF6:
@@ -332,6 +516,20 @@ func (m *shellModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.moveExplorerParent()
 			return *m, nil
 		}
+		// Claw section cycle (left). Only when we're on the main pane and
+		// not capturing keyboard input for the chat textarea — otherwise
+		// the user couldn't move the cursor inside their reply.
+		if m.mode == modeHub && m.activeView == viewClaw && m.activePane == paneMain && msg.Type == tea.KeyLeft {
+			m.clawChannelSelect = false
+			m.cycleClawSection(-1)
+			return *m, nil
+		}
+	case tea.KeyRight:
+		if m.mode == modeHub && m.activeView == viewClaw && m.activePane == paneMain {
+			m.clawChannelSelect = false
+			m.cycleClawSection(1)
+			return *m, nil
+		}
 	}
 	if msg.String() == "ctrl+w" {
 		m.rotatePane(1)
@@ -342,6 +540,22 @@ func (m *shellModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "h":
 			m.moveExplorerParent()
 			return *m, nil
+		case "l":
+			if m.activeView == viewClaw && m.clawSection == clawSectionChannels && m.clawChannelSelect {
+				return m.handleClawLogoutKey()
+			}
+		case "t":
+			if m.activeView == viewClaw && m.clawSection == clawSectionChannels && m.clawChannelSelect {
+				return m.handleClawAllowlistToggle()
+			}
+		case "a":
+			if m.activeView == viewClaw && m.clawSection == clawSectionChannels && m.clawChannelSelect {
+				return m.openClawAllowlistForm(clawAllowlistAdd)
+			}
+		case "r":
+			if m.activeView == viewClaw && m.clawSection == clawSectionChannels && m.clawChannelSelect {
+				return m.openClawAllowlistForm(clawAllowlistRemove)
+			}
 		}
 	}
 	if m.workspace != nil {
@@ -371,14 +585,25 @@ func (m *shellModel) handleEsc() (tea.Model, tea.Cmd) {
 		}
 		return *m, nil
 	}
+	if m.mode == modeHub && m.activeView == viewClaw && m.activePane == paneInput {
+		m.activePane = paneMain
+		m.syncClawFocus()
+		return *m, nil
+	}
+	if m.mode == modeHub && m.activeView == viewClaw && m.activePane == paneMain && m.clawSection == clawSectionChannels && m.clawChannelSelect {
+		m.clawChannelSelect = false
+		m.clawLogoutPending = false
+		m.statusMessage = "Channel selection closed."
+		return *m, nil
+	}
 	if m.activeView == viewMigration {
 		// Esc dismisses the wizard without applying. Mark Migration done
 		// regardless so the wizard does not re-trigger on the next launch.
 		m.dismissMigration()
 		return *m, nil
 	}
-	if m.activeView != viewExplorer {
-		m.selectSidebarView(viewExplorer)
+	if m.activeView != viewHub {
+		m.selectSidebarView(viewHub)
 		return *m, nil
 	}
 	if now.Sub(m.lastEscTime) < 500*time.Millisecond {
@@ -409,6 +634,11 @@ func (m *shellModel) handleUp() (tea.Model, tea.Cmd) {
 			case viewPinned:
 				if m.pinnedIndex > 0 {
 					m.pinnedIndex--
+				}
+			case viewClaw:
+				if m.clawSection == clawSectionChannels && m.clawChannelSelect && m.clawChannelIndex > 0 {
+					m.clawChannelIndex--
+					m.clawLogoutPending = false
 				}
 			case viewSettings:
 				if m.hubSettingsIndex > 0 {
@@ -447,6 +677,11 @@ func (m *shellModel) handleDown() (tea.Model, tea.Cmd) {
 				if m.pinnedIndex < len(m.hubState.Pinned)-1 {
 					m.pinnedIndex++
 				}
+			case viewClaw:
+				if m.clawSection == clawSectionChannels && m.clawChannelSelect && m.clawChannelIndex < len(knownChannelProviders)-1 {
+					m.clawChannelIndex++
+					m.clawLogoutPending = false
+				}
 			case viewSettings:
 				if m.hubSettingsIndex < len(m.hubSettingsItems())-1 {
 					m.hubSettingsIndex++
@@ -471,6 +706,11 @@ func (m *shellModel) handleEnter() (tea.Model, tea.Cmd) {
 		if m.activeView == viewChat {
 			m.activePane = paneInput
 			return *m, m.ensureHubChatSession()
+		}
+		if m.activeView == viewClaw && m.clawInputEnabled() {
+			m.activePane = paneInput
+			m.syncClawFocus()
+			return *m, nil
 		}
 		m.activePane = paneMain
 		return *m, nil
@@ -502,6 +742,49 @@ func (m *shellModel) handleEnter() (tea.Model, tea.Cmd) {
 			}
 			m.activePane = paneInput
 			return *m, m.resizeHubChat()
+		case viewClaw:
+			// Per-section Enter dispatch:
+			//   Status / Chat → land in Chat (chat input).
+			//   Identity      → open the Identity edit form.
+			//   Heartbeat     → open the Heartbeat+Dream cadence form.
+			//   Channels      → open the WhatsApp pairing form.
+			//   Soul / Memory → no-op (read-only views).
+			switch m.clawSection {
+			case clawSectionStatus, clawSectionChat:
+				m.clawSection = clawSectionChat
+			case clawSectionIdentity:
+				if svc := m.hubClawService(); svc != nil {
+					m.clawIdentityForm = newClawIdentityForm(svc.Status().State.Identity, m.theme)
+					m.activeHubForm = hubFormClawIdentity
+				}
+				return *m, nil
+			case clawSectionHeartbeat:
+				if cfg, ok := m.loadHubSettingsConfig(); ok {
+					m.clawHeartbeatForm = newClawHeartbeatForm(cfg.Claw, m.theme)
+					m.activeHubForm = hubFormClawHeartbeat
+				}
+				return *m, nil
+			case clawSectionChannels:
+				if !m.clawChannelSelect {
+					m.clawChannelSelect = true
+					m.statusMessage = "Select a channel with ↑/↓, then press Enter."
+					return *m, nil
+				}
+				return m.openSelectedClawChannel()
+			default:
+				return *m, nil
+			}
+			if err := m.ensureClawInterview(); err != nil {
+				m.statusMessage = "Claw interview failed: " + err.Error()
+				return *m, nil
+			}
+			if m.clawInputEnabled() {
+				m.activePane = paneInput
+				m.syncClawFocus()
+			} else {
+				m.activePane = paneMain
+			}
+			return *m, nil
 		}
 	}
 	if m.mode == modeWorkspace && m.activePane == paneMain && m.activeView == viewChat {
@@ -513,7 +796,7 @@ func (m *shellModel) handleEnter() (tea.Model, tea.Cmd) {
 
 func (m *shellModel) rotatePane(step int) {
 	panes := []appPane{paneSidebar, paneMain}
-	if m.mode == modeWorkspace || (m.mode == modeHub && m.activeView == viewChat) {
+	if m.mode == modeWorkspace || (m.mode == modeHub && m.activeView == viewChat) || (m.mode == modeHub && m.activeView == viewClaw && m.clawInputEnabled()) {
 		panes = append(panes, paneInput)
 	}
 	index := 0
@@ -602,18 +885,25 @@ func (m *shellModel) closeHubChat() error {
 }
 
 func (m *shellModel) applyHubChatConfig(cfg config.Config) {
+	providers := hubSettingsProviders(cfg)
+	if m.hubClaw != nil {
+		registry := tools.NewRegistry()
+		tools.RegisterBuiltins(registry)
+		m.hubClaw.SyncRuntime(cfg, providers, registry)
+	}
 	if m.hubChat == nil {
 		return
 	}
-	providers := hubSettingsProviders(cfg)
 	m.hubChat.options.Config = cfg
 	m.hubChat.options.Providers = providers
 	if m.hubChat.agentRuntime == nil {
 		return
 	}
-	m.hubChat.agentRuntime.Config = cfg
-	m.hubChat.agentRuntime.Builder.Config = cfg
+	m.hubChat.syncRuntimeConfig()
 	m.hubChat.agentRuntime.Providers = providers
+	if m.hubChat.options.Claw != nil {
+		m.hubChat.options.Claw.SyncRuntime(cfg, providers, m.hubChat.options.Tools)
+	}
 	for role, modelID := range cfg.Models {
 		modelID = strings.TrimSpace(modelID)
 		if modelID == "" {
@@ -740,6 +1030,14 @@ func (m *shellModel) syncHubChatFocus() {
 	m.hubChat.input.Blur()
 }
 
+func (m *shellModel) syncClawFocus() {
+	if m.mode == modeHub && m.activeView == viewClaw && m.activePane == paneInput && m.clawInputEnabled() {
+		m.clawInput.Focus()
+		return
+	}
+	m.clawInput.Blur()
+}
+
 func (m shellModel) sidebarView() string {
 	items := m.currentSidebarItems()
 	lines := []string{
@@ -794,6 +1092,7 @@ func (m shellModel) currentSidebarItems() []shellSidebarItem {
 		}
 	}
 	return []shellSidebarItem{
+		{View: viewHub, Label: "Hub", Hint: "overview"},
 		{View: viewExplorer, Label: "Explorer", Hint: "browse folders"},
 		{View: viewPinned, Label: "Pinned", Hint: "favorite workspaces"},
 		{View: viewRecent, Label: "Recent", Hint: "reopen quickly"},
@@ -802,6 +1101,7 @@ func (m shellModel) currentSidebarItems() []shellSidebarItem {
 		{View: viewMCPs, Label: "MCPs", Hint: "global info"},
 		{View: viewSettings, Label: "Settings", Hint: "hub state"},
 		{View: viewChat, Label: "Chat", Hint: "general chat"},
+		{View: viewClaw, Label: "Claw", Hint: "identity, soul, memory"},
 	}
 }
 
@@ -870,6 +1170,29 @@ func (m *shellModel) pushWorkspacePanelOutput(label, body string) {
 	m.workspace.refresh()
 }
 
+// discoverOutputStyles enumerates output-style files exposed by every
+// plugin reachable from this hub session. Walks both global plugin dirs
+// and (when a workspace is open) the workspace's local plugin dirs so the
+// user can pick a workspace-specific style without leaving the hub. Read
+// errors return whatever was discovered so far — the UI degrades to "no
+// styles available" rather than failing.
+func (m shellModel) discoverOutputStyles() []plugins.OutputStyle {
+	cwd := ""
+	if m.workspace != nil {
+		cwd = m.workspace.options.CWD
+	}
+	mgr := plugins.NewManager(cwd)
+	discovered, err := mgr.Discover()
+	if err != nil {
+		return nil
+	}
+	var out []plugins.OutputStyle
+	for _, p := range discovered {
+		out = append(out, p.ListOutputStyles()...)
+	}
+	return out
+}
+
 func (m shellModel) hubChatEmptyView() string {
 	style := lipgloss.NewStyle().
 		Width(m.hubContentWidth()).
@@ -884,6 +1207,150 @@ func (m shellModel) hubChatEmptyView() string {
 		m.theme.Muted.Render("Press Enter to open the Hub chat."),
 	}
 	return style.Render(strings.Join(lines, "\n"))
+}
+
+func (m shellModel) clawView() string {
+	formStyle := lipgloss.NewStyle().
+		Width(m.hubContentWidth()).
+		Height(m.hubInnerHeight())
+	style := lipgloss.NewStyle().
+		Width(m.hubContentWidth()).
+		Height(m.hubInnerHeight()).
+		Padding(1, 1)
+	if formView := m.activeHubFormView(); formView != "" {
+		body := clipLines(formView, max(1, m.hubInnerHeight()-1))
+		return formStyle.Render("\n" + body)
+	}
+	statusBar := m.clawStatusBar()
+	lines := []string{
+		m.theme.Accent.Render("  Claw"),
+		m.theme.Muted.Render("  Global companion: identity, soul, user, memory, heartbeat."),
+		"",
+	}
+	// Reserve one row for the status bar — the body has to clip a line
+	// shorter than before so the bar lands inside the panel instead of
+	// being pushed off the bottom.
+	bodyBudget := m.hubBodyLineBudget() - 5
+	if bodyBudget < 1 {
+		bodyBudget = 1
+	}
+	body := clipTailLines(m.renderClawMain(), bodyBudget)
+	if body != "" {
+		lines = append(lines, strings.Split(body, "\n")...)
+	}
+	// Pad to push the status bar to the bottom of the panel.
+	innerHeight := m.hubInnerHeight() - 2 // top + bottom padding from style
+	for len(lines) < innerHeight-1 {
+		lines = append(lines, "")
+	}
+	lines = append(lines, statusBar)
+	return style.Render(strings.Join(lines, "\n"))
+}
+
+// clawStatusBar mirrors the workspace chat status bar (app.go:671) so
+// the user gets the same at-a-glance telemetry when working with Claw:
+// mode, model, ctx usage, yarn entry count, language. Reads from the
+// service's last-turn telemetry.
+func (m shellModel) clawStatusBar() string {
+	t := m.theme
+	svc := m.hubClawService()
+	if svc == nil {
+		return t.StatusBar.Render(" claw service unavailable ")
+	}
+	status := svc.Status()
+	mode := strings.ToUpper(strings.TrimSpace(status.LastMode))
+	if mode == "" {
+		if status.State.Interview.Active {
+			mode = "INTERVIEW"
+		} else {
+			mode = "CHAT"
+		}
+	}
+	modeLabel := t.StatusValue.Render("[" + mode + "]")
+	if mode == "INTERVIEW" {
+		modeLabel = t.Warning.Render("[" + mode + "]")
+	}
+
+	modelName := strings.TrimSpace(status.LastModelUsed)
+	if modelName == "" {
+		modelName = strings.TrimSpace(status.ActiveModel.ModelID)
+	}
+	if modelName == "" {
+		modelName = "default"
+	}
+	provider := strings.TrimSpace(status.ActiveModel.ProviderName)
+	if provider == "" {
+		provider = "lmstudio"
+	}
+
+	ctxInfo := t.Muted.Render("ctx:--")
+	if total := status.LastTokensTotal; total > 0 {
+		used := status.LastTokensUsed
+		pct := (used * 100) / total
+		ctxStyle := t.Muted
+		if pct > 80 {
+			ctxStyle = t.Warning
+		}
+		if pct > 95 {
+			ctxStyle = t.ErrorStyle
+		}
+		ctxInfo = ctxStyle.Render(fmt.Sprintf("ctx:%s/%dk", formatTokenCount(status.LastTokensUsed), total/1000))
+	} else if used := status.LastTokensUsed; used > 0 {
+		ctxInfo = t.Muted.Render(fmt.Sprintf("ctx:%s", formatTokenCount(used)))
+	}
+
+	yarn := t.Muted.Render(fmt.Sprintf("yarn:%d", len(status.State.Memory.Events)))
+	lang := strings.TrimSpace(status.State.User.Preferences["preferred_language"])
+	langLabel := t.Muted.Render("lang:?")
+	if lang != "" {
+		langLabel = t.StatusActive.Render("lang:" + lang)
+	}
+
+	sep := t.Muted.Render(" | ")
+	bar := " " + modeLabel + sep +
+		t.StatusValue.Render(modelName) + sep +
+		t.Accent.Render(provider) + sep +
+		ctxInfo + sep +
+		yarn + sep +
+		langLabel
+	return t.StatusBar.Render(bar)
+}
+
+// renderClawMain dispatches by m.clawSection. The tab strip is always
+// rendered above the section body so the user sees the navigation tree
+// at a glance and can switch with ←/→.
+//
+// When the input pane is active (the user is typing to Claw), the Chat
+// section is forced regardless of clawSection — switching tabs while
+// composing a message would be confusing, and the input lives inside the
+// Chat panel.
+func (m shellModel) renderClawMain() string {
+	if m.hubClawService() == nil {
+		return m.theme.Muted.Render("Claw service unavailable.")
+	}
+	header := m.renderClawTabs()
+	section := m.clawSection
+	if m.activePane == paneInput {
+		section = clawSectionChat
+	}
+	var body string
+	switch section {
+	case clawSectionChat:
+		body = m.renderClawChat()
+	case clawSectionIdentity:
+		body = m.renderClawIdentity()
+	case clawSectionSoul:
+		body = m.renderClawSoul()
+	case clawSectionMemory:
+		body = m.renderClawMemory()
+	case clawSectionHeartbeat:
+		body = m.renderClawHeartbeat()
+	case clawSectionChannels:
+		body = m.renderClawChannels()
+	default:
+		body = m.renderClawStatus()
+	}
+	return header + "\n\n" + body
 }
 
 func (m *shellModel) ensureHubChatSession() tea.Cmd {
@@ -979,6 +1446,17 @@ func clipLines(text string, limit int) string {
 	return strings.Join(lines[:limit], "\n")
 }
 
+func clipTailLines(text string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	lines := strings.Split(text, "\n")
+	if len(lines) <= limit {
+		return text
+	}
+	return strings.Join(lines[len(lines)-limit:], "\n")
+}
+
 func truncateStrict(s string, limit int) string {
 	s = strings.ReplaceAll(s, "\n", " ")
 	if limit <= 0 {
@@ -1024,6 +1502,8 @@ func (m shellModel) renderHubMain() string {
 		return m.renderSettings()
 	case viewChat:
 		return stripAnsi(m.hubChatEmptyView())
+	case viewClaw:
+		return stripAnsi(m.renderClawMain())
 	default:
 		return ""
 	}
@@ -1193,33 +1673,35 @@ func (m shellModel) renderHubStatus() string {
 func (m shellModel) renderHubHelp() string {
 	var text string
 	if m.activePane == paneSidebar {
-		text = "Hub keys: Up/Down select view | Enter activate | Tab switch pane | Esc explorer/quit"
+		text = "Hub keys: Up/Down select view | Enter activate | Tab switch pane | Esc hub/quit"
 	} else {
 		switch m.activeView {
 		case viewExplorer:
-			text = "Explorer: Up/Down move | Enter open dir | O open workspace | Backspace parent | P pin | Esc explorer/quit"
+			text = "Explorer: Up/Down move | Enter open dir | O open workspace | Backspace parent | P pin | Esc hub | Tab switch pane"
 		case viewRecent:
-			text = "Recent: Up/Down move | Enter open workspace | Esc explorer | Tab switch pane"
+			text = "Recent: Up/Down move | Enter open workspace | Esc hub | Tab switch pane"
 		case viewPinned:
-			text = "Pinned: Up/Down move | Enter open workspace | P unpin | Esc explorer | Tab switch pane"
+			text = "Pinned: Up/Down move | Enter open workspace | P unpin | Esc hub | Tab switch pane"
 		case viewSettings:
 			if m.activeHubForm != hubFormNone {
 				text = "Settings form: Enter confirm | Esc cancel | Tab or arrows navigate"
 			} else {
-				text = "Settings: Up/Down select item | Enter edit | Esc explorer | Tab switch pane"
+				text = "Settings: Up/Down select item | Enter edit | Esc hub | Tab switch pane"
 			}
 		case viewChat:
-			text = "Hub Chat: general conversation | Ctrl+W or F6 switch pane | Esc explorer | Tab switch pane"
+			text = "Hub Chat: general conversation | Ctrl+W or F6 switch pane | Esc hub | Tab switch pane"
+		case viewClaw:
+			text = "Claw: Enter interview | S heartbeat | D dream | Esc hub | Tab switch pane"
 		case viewSessions:
-			text = "Sessions: review saved workspace sessions | Esc explorer | Tab switch pane"
+			text = "Sessions: review saved workspace sessions | Esc hub | Tab switch pane"
 		case viewTools:
-			text = "Tools: inspect available tools | Esc explorer | Tab switch pane"
+			text = "Tools: inspect available tools | Esc hub | Tab switch pane"
 		case viewMCPs:
-			text = "MCPs: inspect connected servers | Esc explorer | Tab switch pane"
+			text = "MCPs: inspect connected servers | Esc hub | Tab switch pane"
 		case viewMigration:
 			text = "Migration: Enter apply | Esc dismiss"
 		default:
-			text = "Hub: Tab switch pane | Esc explorer/quit"
+			text = "Hub: Tab switch pane | Esc quit"
 		}
 	}
 	return m.theme.Muted.Render(m.truncateHubText(text))
@@ -1274,6 +1756,46 @@ func (m *shellModel) hubSettingsItems() []hubSettingsItem {
 			Scope: scopeHub,
 			Open: func(m *shellModel) {
 				m.openHubSkillsBrowser()
+			},
+		},
+		{
+			Label: "Web Search",
+			Hint:  "backend + API key (duckduckgo / ollama)",
+			Scope: scopeHub,
+			Open: func(m *shellModel) {
+				if cfg, ok := m.loadHubSettingsConfig(); ok {
+					m.webSearchForm = newWebSearchForm(cfg, m.theme)
+					m.activeHubForm = hubFormWebSearch
+				}
+			},
+		},
+		{
+			Label: "Output Style",
+			Hint:  "pick a plugin output-style to inject into the system prompt",
+			Scope: scopeHub,
+			Open: func(m *shellModel) {
+				if cfg, ok := m.loadHubSettingsConfig(); ok {
+					m.outputStyleForm = newOutputStyleForm(cfg, m.discoverOutputStyles(), m.theme)
+					m.activeHubForm = hubFormOutputStyle
+				}
+			},
+		},
+		{
+			Label: "Plugins",
+			Hint:  "enable / disable discovered Claude-style plugins",
+			Scope: scopeHub,
+			Open: func(m *shellModel) {
+				cwd := ""
+				if m.workspace != nil {
+					cwd = m.workspace.options.CWD
+				}
+				form, err := newPluginsForm(cwd, m.theme)
+				if err != nil {
+					m.statusMessage = "Plugins discovery failed: " + err.Error()
+					return
+				}
+				m.pluginsForm = form
+				m.activeHubForm = hubFormPlugins
 			},
 		},
 
@@ -1465,6 +1987,362 @@ func (m *shellModel) saveHubState() {
 		return
 	}
 	_ = m.options.StateStore.Save(m.hubState)
+}
+
+func newShellClawInput() textarea.Model {
+	input := textarea.New()
+	input.Placeholder = "Answer Claw..."
+	input.CharLimit = 2048
+	input.ShowLineNumbers = false
+	input.SetHeight(3)
+	input.Prompt = ""
+	return input
+}
+
+func (m *shellModel) hubClawService() *claw.Service {
+	if m.hubChat != nil {
+		return m.hubChat.options.Claw
+	}
+	if m.workspace != nil {
+		return m.workspace.options.Claw
+	}
+	return m.hubClaw
+}
+
+func (m *shellModel) clawInterviewActive() bool {
+	service := m.hubClawService()
+	if service == nil {
+		return false
+	}
+	return service.Status().State.Interview.Active
+}
+
+func (m *shellModel) clawInputEnabled() bool {
+	service := m.hubClawService()
+	if service == nil {
+		return false
+	}
+	interview := service.Status().State.Interview
+	return interview.Active || !interview.CompletedAt.IsZero()
+}
+
+func (m shellModel) clawInterviewLabel(interview claw.Interview) string {
+	switch {
+	case interview.Active:
+		return "active"
+	case !interview.CompletedAt.IsZero():
+		return "completed"
+	default:
+		return "not started"
+	}
+}
+
+func lastClawTurn(turns []claw.InterviewTurn) string {
+	for i := len(turns) - 1; i >= 0; i-- {
+		turn := turns[i]
+		if turn.Speaker == "claw" && strings.TrimSpace(turn.Text) != "" {
+			return turn.Text
+		}
+	}
+	return ""
+}
+
+func lastClawInterviewTurn(interview claw.Interview) string {
+	return lastClawTurn(interview.Transcript)
+}
+
+func lastClawVisibleTurn(state claw.State) string {
+	if text := lastClawTurn(state.Chat.Transcript); text != "" {
+		return text
+	}
+	return lastClawInterviewTurn(state.Interview)
+}
+
+func (m shellModel) clawInputBoxView() string {
+	return m.theme.InputBorder.Width(max(20, m.hubContentWidth()-4)).Render(m.clawInput.View())
+}
+
+func (m *shellModel) ensureClawInterview() error {
+	service := m.hubClawService()
+	if service == nil {
+		return fmt.Errorf("claw service unavailable")
+	}
+	status := service.Status()
+	if status.State.Interview.Active || len(status.State.Interview.Transcript) > 0 || !status.State.Interview.CompletedAt.IsZero() {
+		m.statusMessage = lastClawVisibleTurn(status.State)
+		m.clawInput.Reset()
+		m.syncClawFocus()
+		return nil
+	}
+	prompt, err := service.BeginInterview()
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(prompt) != "" {
+		m.statusMessage = prompt
+	}
+	m.clawInput.Reset()
+	m.syncClawFocus()
+	return nil
+}
+
+func (m *shellModel) toggleClawHeartbeat() error {
+	service := m.hubClawService()
+	if service == nil {
+		return fmt.Errorf("claw service unavailable")
+	}
+	status := service.Status()
+	if status.State.Heartbeat.Running {
+		if err := service.Stop(); err != nil {
+			return err
+		}
+		m.statusMessage = "Claw heartbeat stopped."
+		return nil
+	}
+	if err := service.Start(); err != nil {
+		return err
+	}
+	m.statusMessage = "Claw heartbeat started."
+	return nil
+}
+
+func (m *shellModel) runClawDream() error {
+	service := m.hubClawService()
+	if service == nil {
+		return fmt.Errorf("claw service unavailable")
+	}
+	result, err := service.RunDream(context.Background(), "hub")
+	if err != nil {
+		return err
+	}
+	m.statusMessage = result.Summary
+	return nil
+}
+
+func (m *shellModel) openSelectedClawChannel() (tea.Model, tea.Cmd) {
+	channel := m.selectedClawChannel()
+	m.clawLogoutPending = false
+	switch channel.Name {
+	case "whatsapp":
+		m.whatsAppForm = newWhatsAppForm(m.theme)
+		m.activeHubForm = hubFormWhatsApp
+		return *m, nil
+	case "mock":
+		m.statusMessage = "Mock channel is always available. Use /claw inbox <message> to send test messages into Claw."
+		return *m, nil
+	default:
+		m.statusMessage = "Channel action not implemented for " + channel.Name
+		return *m, nil
+	}
+}
+
+// openClawAllowlistForm pops the add/remove text-input form for the
+// selected channel's allowlist. The form persists via Service.AddAllowed
+// or RemoveAllowed when the user submits.
+func (m *shellModel) openClawAllowlistForm(mode clawAllowlistFormMode) (tea.Model, tea.Cmd) {
+	channel := m.selectedClawChannel()
+	if channel.Name == "" {
+		return *m, nil
+	}
+	svc := m.hubClawService()
+	if svc == nil {
+		m.statusMessage = "Claw service unavailable."
+		return *m, nil
+	}
+	live, hasLive := svc.Status().State.Channels.Items[channel.Name]
+	if !hasLive {
+		m.statusMessage = "Channel not registered yet."
+		return *m, nil
+	}
+	if mode == clawAllowlistRemove && len(live.Allowlist) == 0 {
+		m.statusMessage = "Allowlist is empty — nothing to remove."
+		return *m, nil
+	}
+	m.clawAllowlistForm = newClawAllowlistForm(m.theme, mode, channel.Name, live.Allowlist)
+	m.activeHubForm = hubFormClawAllowlist
+	return *m, nil
+}
+
+// handleClawAllowlistToggle flips the channel's strict/permissive
+// gate. Adds the paired account JID on enable so the owner stays
+// reachable; otherwise leaves the list as-is.
+func (m *shellModel) handleClawAllowlistToggle() (tea.Model, tea.Cmd) {
+	channel := m.selectedClawChannel()
+	if channel.Name != "whatsapp" {
+		return *m, nil
+	}
+	svc := m.hubClawService()
+	if svc == nil {
+		m.statusMessage = "Claw service unavailable."
+		return *m, nil
+	}
+	live, hasLive := svc.Status().State.Channels.Items["whatsapp"]
+	if !hasLive {
+		m.statusMessage = "Pair WhatsApp first before changing the allowlist."
+		return *m, nil
+	}
+	newMode := !live.AllowlistEnabled
+	if err := svc.SetAllowlistEnabled("whatsapp", newMode); err != nil {
+		m.statusMessage = "Toggle failed: " + err.Error()
+		return *m, nil
+	}
+	if newMode {
+		m.statusMessage = "Allowlist: STRICT — only listed JIDs will receive replies. Owner JID auto-allowed."
+	} else {
+		m.statusMessage = "Allowlist: PERMISSIVE — every contact will receive replies."
+	}
+	return *m, nil
+}
+
+// handleClawLogoutKey arms the logout-confirm on the first 'L' press
+// and commits on the second. The double-tap protects against
+// accidentally unlinking — logout drops the WhatsApp session and clears
+// the local device store, so re-pairing requires another QR scan.
+func (m *shellModel) handleClawLogoutKey() (tea.Model, tea.Cmd) {
+	channel := m.selectedClawChannel()
+	if channel.Name != "whatsapp" {
+		m.clawLogoutPending = false
+		return *m, nil
+	}
+	svc := m.hubClawService()
+	if svc == nil {
+		m.statusMessage = "Claw service unavailable."
+		m.clawLogoutPending = false
+		return *m, nil
+	}
+	live, hasLive := svc.Status().State.Channels.Items["whatsapp"]
+	if !hasLive || !live.Enabled {
+		m.statusMessage = "WhatsApp is not paired — nothing to log out."
+		m.clawLogoutPending = false
+		return *m, nil
+	}
+	if !m.clawLogoutPending {
+		m.clawLogoutPending = true
+		m.statusMessage = "Press L again to confirm logout, or any other key to abort."
+		return *m, nil
+	}
+	// Second press: commit.
+	m.clawLogoutPending = false
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := svc.LogoutChannel(ctx, "whatsapp"); err != nil {
+		m.statusMessage = "Logout finished with a server error: " + err.Error() + " — local session cleared anyway."
+	} else {
+		m.statusMessage = "WhatsApp unlinked. Press Enter to re-pair."
+	}
+	return *m, nil
+}
+
+func (m *shellModel) resetClawChat() error {
+	service := m.hubClawService()
+	if service == nil {
+		return fmt.Errorf("claw service unavailable")
+	}
+	sessionID, err := service.ResetChatSession()
+	if err != nil {
+		return err
+	}
+	m.clawPendingAnswer = ""
+	m.clawAwaitingReply = false
+	m.statusMessage = "Claw chat reset. New session: " + sessionID
+	return nil
+}
+
+func (m shellModel) handleClawInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if msg.String() == "ctrl+w" || msg.Type == tea.KeyF6 {
+		m.rotatePane(1)
+		m.syncClawFocus()
+		return m, nil
+	}
+	if m.clawAwaitingReply {
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.clawInput, cmd = m.clawInput.Update(msg)
+	if msg.Type == tea.KeyEnter && !msg.Alt {
+		answer := strings.TrimSpace(m.clawInput.Value())
+		if answer == "" {
+			return m, nil
+		}
+		service := m.hubClawService()
+		if service == nil {
+			m.statusMessage = "Claw service unavailable."
+			return m, nil
+		}
+		m.clawPendingAnswer = answer
+		m.clawAwaitingReply = true
+		ctx, cancel := context.WithCancel(context.Background())
+		m.clawPendingCancel = cancel
+		m.clawInput.Reset()
+		m.statusMessage = "Claw is responding..."
+		return m, submitClawInterviewAnswer(ctx, service, answer)
+	}
+	return m, cmd
+}
+
+func (m *shellModel) cancelPendingClawInterview() {
+	if m.clawPendingCancel == nil {
+		return
+	}
+	m.clawPendingCancel()
+	m.clawPendingCancel = nil
+}
+
+func submitClawInterviewAnswer(ctx context.Context, service *claw.Service, answer string) tea.Cmd {
+	return func() tea.Msg {
+		if service.Status().State.Interview.Active {
+			next, done, err := service.AnswerInterviewContext(ctx, answer)
+			return clawInterviewAnsweredMsg{next: next, done: done, err: err}
+		}
+		next, err := service.ChatContext(ctx, answer)
+		return clawInterviewAnsweredMsg{next: next, done: false, err: err}
+	}
+}
+
+func valueOr(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
+}
+
+func previewShellText(text string, limit int) string {
+	text = strings.Join(strings.Fields(text), " ")
+	if len(text) <= limit {
+		return text
+	}
+	if limit <= 3 {
+		return text[:limit]
+	}
+	return text[:limit-3] + "..."
+}
+
+func compactShellText(text string) string {
+	return strings.Join(strings.Fields(text), " ")
+}
+
+func clawPendingTranscriptState(turns []claw.InterviewTurn, pending string) (showPending bool, showThinking bool) {
+	pending = compactShellText(pending)
+	if pending == "" {
+		return false, false
+	}
+	showPending = true
+	showThinking = true
+	if len(turns) == 0 {
+		return showPending, showThinking
+	}
+	last := turns[len(turns)-1]
+	if last.Speaker == "user" && compactShellText(last.Text) == pending {
+		showPending = false
+		return showPending, showThinking
+	}
+	if len(turns) >= 2 {
+		prev := turns[len(turns)-2]
+		if prev.Speaker == "user" && compactShellText(prev.Text) == pending && last.Speaker == "claw" {
+			return false, false
+		}
+	}
+	return showPending, showThinking
 }
 
 func normalizeDir(path string) string {

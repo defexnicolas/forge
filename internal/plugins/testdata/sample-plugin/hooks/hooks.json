@@ -1,0 +1,8 @@
+{
+  "hooks": [
+    {
+      "event": "before:tool_call",
+      "command": "echo sample-plugin observed tool"
+    }
+  ]
+}

@@ -1,4 +1,4 @@
-package tools
+package websearch
 
 import "testing"
 
@@ -14,7 +14,7 @@ func TestParseDDGResultsParsesResultAndSnippet(t *testing.T) {
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %#v", results)
 	}
-	if results[0].title != "Example Result" || results[0].url != "https://example.com/doc" || results[0].snippet != "Example snippet text" {
+	if results[0].Title != "Example Result" || results[0].URL != "https://example.com/doc" || results[0].Snippet != "Example snippet text" {
 		t.Fatalf("unexpected result: %#v", results[0])
 	}
 }

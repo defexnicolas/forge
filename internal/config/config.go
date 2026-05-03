@@ -14,20 +14,39 @@ import (
 )
 
 type Config struct {
-	DefaultAgent    string             `toml:"default_agent"`
-	ApprovalProfile string             `toml:"approval_profile"`
-	Providers       Providers          `toml:"providers"`
-	Context         ContextConfig      `toml:"context"`
-	Runtime         RuntimeConfig      `toml:"runtime"`
-	Skills          SkillsConfig       `toml:"skills"`
-	Plugins         PluginsConfig      `toml:"plugins"`
-	Git             GitConfig          `toml:"git"`
-	Models          map[string]string  `toml:"models"`
-	ModelLoading    ModelLoadingConfig `toml:"model_loading"`
-	Build           BuildConfig        `toml:"build"`
-	Explore         ExploreConfig      `toml:"explore"`
-	Plan            PlanConfig         `toml:"plan"`
-	TUI             TUIConfig          `toml:"tui"`
+	DefaultAgent    string `toml:"default_agent"`
+	ApprovalProfile string `toml:"approval_profile"`
+	// OutputStyle is the path to a plugin-shipped output-style markdown
+	// file whose body is appended to the agent's system prompt. Set via
+	// HUB > Settings > Output Style after the user picks one of the styles
+	// the discovered plugins exposed via output-styles/ directories.
+	OutputStyle  string             `toml:"output_style"`
+	Providers    Providers          `toml:"providers"`
+	Context      ContextConfig      `toml:"context"`
+	Runtime      RuntimeConfig      `toml:"runtime"`
+	Claw         ClawConfig         `toml:"claw"`
+	Skills       SkillsConfig       `toml:"skills"`
+	Plugins      PluginsConfig      `toml:"plugins"`
+	WebSearch    WebSearchConfig    `toml:"web_search"`
+	Git          GitConfig          `toml:"git"`
+	Models       map[string]string  `toml:"models"`
+	ModelLoading ModelLoadingConfig `toml:"model_loading"`
+	Build        BuildConfig        `toml:"build"`
+	Explore      ExploreConfig      `toml:"explore"`
+	Plan         PlanConfig         `toml:"plan"`
+	TUI          TUIConfig          `toml:"tui"`
+}
+
+// WebSearchConfig governs the web_search tool's backend selection. Provider
+// names are matched case-insensitively against the registered backends in
+// internal/tools/websearch (currently "duckduckgo" and "ollama"). Empty
+// provider falls back to DuckDuckGo so the tool stays functional with no
+// configuration.
+type WebSearchConfig struct {
+	Provider  string `toml:"provider"`
+	APIKey    string `toml:"api_key"`
+	APIKeyEnv string `toml:"api_key_env"`
+	BaseURL   string `toml:"base_url"`
 }
 
 // TUIConfig holds terminal UI preferences. StreamFlushMs governs how
@@ -105,9 +124,9 @@ type RuntimeConfig struct {
 	// is received within this window. The timer arms on the first chunk, so
 	// long prompt-processing pauses before any token is emitted do not
 	// trigger it. 0 disables idle detection entirely.
-	RequestIdleTimeoutSeconds int  `toml:"request_idle_timeout_seconds"`
-	SubagentTimeoutSeconds    int  `toml:"subagent_timeout_seconds"`
-	TaskTimeoutSeconds        int  `toml:"task_timeout_seconds"`
+	RequestIdleTimeoutSeconds int `toml:"request_idle_timeout_seconds"`
+	SubagentTimeoutSeconds    int `toml:"subagent_timeout_seconds"`
+	TaskTimeoutSeconds        int `toml:"task_timeout_seconds"`
 	// MaxSteps is the per-turn cap on (LLM call + tool result) iterations.
 	// 0 falls back to the built-in default (40). MaxStepsBuild, when > 0,
 	// overrides this in build mode where multi-task implementations
@@ -122,6 +141,27 @@ type RuntimeConfig struct {
 	MaxBuilderReadLoops    int  `toml:"max_builder_read_loops"`
 	RetryOnProviderTimeout bool `toml:"retry_on_provider_timeout"`
 	InlineBuilder          bool `toml:"inline_builder"`
+}
+
+type ClawConfig struct {
+	Enabled                  bool   `toml:"enabled"`
+	Autostart                bool   `toml:"autostart"`
+	HeartbeatIntervalSeconds int    `toml:"heartbeat_interval_seconds"`
+	DreamIntervalMinutes     int    `toml:"dream_interval_minutes"`
+	AutonomyPolicy           string `toml:"autonomy_policy"`
+	DefaultChannel           string `toml:"default_channel"`
+	PersonaName              string `toml:"persona_name"`
+	PersonaTone              string `toml:"persona_tone"`
+	IdentitySeed             string `toml:"identity_seed"`
+	// ToolsEnabled gates whether Claw chat advertises web_search,
+	// web_fetch, whatsapp_send, claw_save_contact, and other tools to
+	// the model. Defaults to true via Defaults() — without tools the
+	// assistant is conversation-only and can't save contacts, send
+	// WhatsApp, or research on the user's behalf, which is most of
+	// the value. Set claw.tools_enabled = false explicitly in
+	// global.toml if you're on a metered provider and want to gate
+	// over-eager web_search calls.
+	ToolsEnabled bool `toml:"tools_enabled"`
 }
 
 type GitConfig struct {
@@ -194,10 +234,14 @@ type SkillsConfig struct {
 	Installer    string   `toml:"installer"` // legacy
 }
 
+// PluginsConfig governs plugin discovery + activation. Forge always
+// understands the Claude Code plugin layout (.claude-plugin/plugin.json
+// + commands/agents/hooks/skills/output-styles/.lsp.json/.mcp.json/
+// settings.json). The historical claude_compatible toggle was removed —
+// it never gated any code path and was confusing in the settings UI.
 type PluginsConfig struct {
-	Enabled          bool     `toml:"enabled"`
-	ClaudeCompatible bool     `toml:"claude_compatible"`
-	Marketplaces     []string `toml:"marketplaces"`
+	Enabled      bool     `toml:"enabled"`
+	Marketplaces []string `toml:"marketplaces"`
 }
 
 type ModelLoadingConfig struct {
@@ -364,8 +408,17 @@ func applyGlobalDefaults(cfg *Config, g globalconfig.GlobalConfig, keys map[stri
 	if g.Runtime != nil {
 		applyRuntimeDefaults(&cfg.Runtime, g.Runtime, keys)
 	}
+	if g.WebSearch != nil {
+		applyWebSearchDefaults(&cfg.WebSearch, g.WebSearch, keys)
+	}
+	if g.Claw != nil {
+		applyClawDefaults(&cfg.Claw, g.Claw, keys)
+	}
 	if g.ApprovalProfile != nil && (!keys["approval_profile"] || cfg.ApprovalProfile == Defaults().ApprovalProfile) {
 		cfg.ApprovalProfile = *g.ApprovalProfile
+	}
+	if g.OutputStyle != nil && (!keys["output_style"] || cfg.OutputStyle == "") {
+		cfg.OutputStyle = *g.OutputStyle
 	}
 	if g.Skills != nil {
 		applySkillsDefaults(&cfg.Skills, g.Skills, keys)
@@ -464,6 +517,51 @@ func applyRuntimeDefaults(rt *RuntimeConfig, g *globalconfig.RuntimeDefaults, ke
 	applyBool("inline_builder", &rt.InlineBuilder, g.InlineBuilder, defaults.InlineBuilder)
 }
 
+// applyClawDefaults overlays the user's global claw block onto the
+// workspace ClawConfig. Workspace values win unless they still match
+// the built-in default — same pattern as applyRuntimeDefaults.
+func applyClawDefaults(c *ClawConfig, g *globalconfig.ClawDefaults, keys map[string]bool) {
+	defaults := Defaults().Claw
+	if g.HeartbeatIntervalSeconds != nil && (!keys["claw.heartbeat_interval_seconds"] || c.HeartbeatIntervalSeconds == defaults.HeartbeatIntervalSeconds) {
+		c.HeartbeatIntervalSeconds = *g.HeartbeatIntervalSeconds
+	}
+	if g.DreamIntervalMinutes != nil && (!keys["claw.dream_interval_minutes"] || c.DreamIntervalMinutes == defaults.DreamIntervalMinutes) {
+		c.DreamIntervalMinutes = *g.DreamIntervalMinutes
+	}
+	if g.PersonaName != nil && (!keys["claw.persona_name"] || c.PersonaName == defaults.PersonaName) {
+		c.PersonaName = *g.PersonaName
+	}
+	if g.PersonaTone != nil && (!keys["claw.persona_tone"] || c.PersonaTone == defaults.PersonaTone) {
+		c.PersonaTone = *g.PersonaTone
+	}
+	if g.AutonomyPolicy != nil && (!keys["claw.autonomy_policy"] || c.AutonomyPolicy == defaults.AutonomyPolicy) {
+		c.AutonomyPolicy = *g.AutonomyPolicy
+	}
+	if g.ToolsEnabled != nil && !keys["claw.tools_enabled"] {
+		c.ToolsEnabled = *g.ToolsEnabled
+	}
+}
+
+// applyWebSearchDefaults overlays the user's global web_search block onto
+// the workspace WebSearchConfig. Workspace-set values win unless they
+// equal the empty/zero default — Provider in particular often arrives
+// empty from a workspace that never thought about search, and we want
+// those workspaces to inherit the global pick.
+func applyWebSearchDefaults(ws *WebSearchConfig, g *globalconfig.WebSearchDefaults, keys map[string]bool) {
+	if g.Provider != nil && (!keys["web_search.provider"] || ws.Provider == "") {
+		ws.Provider = *g.Provider
+	}
+	if g.APIKey != nil && (!keys["web_search.api_key"] || ws.APIKey == "") {
+		ws.APIKey = *g.APIKey
+	}
+	if g.APIKeyEnv != nil && (!keys["web_search.api_key_env"] || ws.APIKeyEnv == "") {
+		ws.APIKeyEnv = *g.APIKeyEnv
+	}
+	if g.BaseURL != nil && (!keys["web_search.base_url"] || ws.BaseURL == "") {
+		ws.BaseURL = *g.BaseURL
+	}
+}
+
 func applySkillsDefaults(s *SkillsConfig, g *globalconfig.SkillsDefaults, keys map[string]bool) {
 	if g.CLI != nil && !keys["skills.cli"] {
 		s.CLI = *g.CLI
@@ -488,9 +586,6 @@ func applySkillsDefaults(s *SkillsConfig, g *globalconfig.SkillsDefaults, keys m
 func applyPluginsDefaults(p *PluginsConfig, g *globalconfig.PluginsDefaults, keys map[string]bool) {
 	if g.Enabled != nil && !keys["plugins.enabled"] {
 		p.Enabled = *g.Enabled
-	}
-	if g.ClaudeCompatible != nil && !keys["plugins.claude_compatible"] {
-		p.ClaudeCompatible = *g.ClaudeCompatible
 	}
 	// EnabledByDefault is purely additive: workspace marketplaces stay,
 	// plus any unique entries from the global list.
@@ -595,6 +690,26 @@ func Defaults() Config {
 			// also need more headroom than the original 8.
 			MaxBuilderReadLoops: 12,
 		},
+		Claw: ClawConfig{
+			Enabled:                  false,
+			Autostart:                false,
+			HeartbeatIntervalSeconds: 30,
+			DreamIntervalMinutes:     180,
+			AutonomyPolicy:           "supervised",
+			DefaultChannel:           "mock",
+			PersonaName:              "Claw",
+			PersonaTone:              "warm",
+			IdentitySeed:             "A resident Forge companion with memory, initiative, and restraint.",
+			// Tools default to enabled. The original false-by-default
+			// targeted hosted Ollama users worried about web_search
+			// firing on every chitchat turn. Local LM Studio (the
+			// realistic Claw deployment) has no per-call cost, and
+			// without tools the assistant can't save contacts or send
+			// WhatsApp on the user's behalf — which is most of the
+			// value. Users on metered providers can still set
+			// claw.tools_enabled = false explicitly in global.toml.
+			ToolsEnabled: true,
+		},
 		Git: GitConfig{
 			AutoInit:               true,
 			CreateBaselineCommit:   true,
@@ -613,8 +728,7 @@ func Defaults() Config {
 			Copy:         true,
 		},
 		Plugins: PluginsConfig{
-			Enabled:          true,
-			ClaudeCompatible: true,
+			Enabled: true,
 		},
 		ModelLoading: ModelLoadingConfig{
 			// Enabled=false keeps per-role model routing off so all main
@@ -767,6 +881,27 @@ func Normalize(cfg *Config) {
 	}
 	if cfg.Runtime.MaxBuilderReadLoops <= 0 {
 		cfg.Runtime.MaxBuilderReadLoops = defaults.Runtime.MaxBuilderReadLoops
+	}
+	if cfg.Claw.HeartbeatIntervalSeconds <= 0 {
+		cfg.Claw.HeartbeatIntervalSeconds = defaults.Claw.HeartbeatIntervalSeconds
+	}
+	if cfg.Claw.DreamIntervalMinutes <= 0 {
+		cfg.Claw.DreamIntervalMinutes = defaults.Claw.DreamIntervalMinutes
+	}
+	if cfg.Claw.AutonomyPolicy == "" {
+		cfg.Claw.AutonomyPolicy = defaults.Claw.AutonomyPolicy
+	}
+	if cfg.Claw.DefaultChannel == "" {
+		cfg.Claw.DefaultChannel = defaults.Claw.DefaultChannel
+	}
+	if cfg.Claw.PersonaName == "" {
+		cfg.Claw.PersonaName = defaults.Claw.PersonaName
+	}
+	if cfg.Claw.PersonaTone == "" {
+		cfg.Claw.PersonaTone = defaults.Claw.PersonaTone
+	}
+	if cfg.Claw.IdentitySeed == "" {
+		cfg.Claw.IdentitySeed = defaults.Claw.IdentitySeed
 	}
 	if cfg.Git.BaselineCommitMessage == "" {
 		cfg.Git.BaselineCommitMessage = defaults.Git.BaselineCommitMessage

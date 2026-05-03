@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"forge/internal/claw"
 	"forge/internal/globalconfig"
 	"forge/internal/plugins"
 	"forge/internal/session"
@@ -33,6 +34,10 @@ func openHubChatSession() (*WorkspaceSession, error) {
 		return nil, err
 	}
 	providers := hubSettingsProviders(cfg)
+	clawSvc, err := claw.Open(cfg, providers, registry)
+	if err != nil {
+		return nil, err
+	}
 	sessionStore, err := session.New(root)
 	if err != nil {
 		return nil, err
@@ -52,6 +57,7 @@ func openHubChatSession() (*WorkspaceSession, error) {
 			Config:    cfg,
 			Tools:     registry,
 			Providers: providers,
+			Claw:      clawSvc,
 			Session:   sessionStore,
 			Skills:    skillMgr,
 			Plugins:   plugins.NewManager(root),

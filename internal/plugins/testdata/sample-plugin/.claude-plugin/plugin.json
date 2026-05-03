@@ -1,0 +1,8 @@
+{
+  "name": "sample-plugin",
+  "version": "0.1.0",
+  "description": "Fixture plugin used by integration tests to exercise every Claude-compatible component (commands/, agents/, hooks/, skills/, settings.json, .lsp.json, output-styles/, .mcp.json).",
+  "user_config": {
+    "GREETING": "hello-from-sample"
+  }
+}

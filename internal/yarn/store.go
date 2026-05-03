@@ -36,6 +36,17 @@ func New(cwd string) *Store {
 	}
 }
 
+// NewAtPath creates a Store rooted at an absolute directory rather
+// than under a workspace cwd's .forge/yarn subdirectory. Used for
+// global stores like ~/.forge/yarn-claw/ where there is no enclosing
+// workspace and the standard cwd/.forge/yarn convention doesn't apply.
+func NewAtPath(dir string) *Store {
+	return &Store{
+		cwd:  dir,
+		path: filepath.Join(dir, "nodes.jsonl"),
+	}
+}
+
 func (s *Store) Path() string {
 	return s.path
 }

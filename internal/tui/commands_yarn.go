@@ -393,6 +393,9 @@ func (m *model) yarnProbe() string {
 func (m *model) syncRuntimeConfig() {
 	m.agentRuntime.Config = m.options.Config
 	m.agentRuntime.Builder.Config = m.options.Config
+	if m.options.Claw != nil {
+		m.options.Claw.SyncRuntime(m.options.Config, m.options.Providers, m.options.Tools)
+	}
 }
 
 func (m model) persistConfig() {

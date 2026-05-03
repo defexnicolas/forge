@@ -36,6 +36,7 @@ import (
 type GlobalConfig struct {
 	Theme           *string                  `toml:"theme,omitempty"`
 	ApprovalProfile *string                  `toml:"approval_profile,omitempty"`
+	OutputStyle     *string                  `toml:"output_style,omitempty"`
 	Providers       map[string]ProviderEntry `toml:"providers,omitempty"`
 	Models          map[string]string        `toml:"models,omitempty"`
 	DetectedByRole  map[string]DetectedModel `toml:"detected_by_role,omitempty"`
@@ -44,6 +45,8 @@ type GlobalConfig struct {
 	Skills          *SkillsDefaults          `toml:"skills,omitempty"`
 	Plugins         *PluginsDefaults         `toml:"plugins,omitempty"`
 	Runtime         *RuntimeDefaults         `toml:"runtime,omitempty"`
+	WebSearch       *WebSearchDefaults       `toml:"web_search,omitempty"`
+	Claw            *ClawDefaults            `toml:"claw,omitempty"`
 }
 
 // ProviderEntry mirrors config.ProviderConfig but every field is a pointer
@@ -98,11 +101,37 @@ type SkillsDefaults struct {
 	CacheDir     *string  `toml:"cache_dir,omitempty"`
 }
 
-// PluginsDefaults captures cross-workspace plugin defaults.
+// PluginsDefaults captures cross-workspace plugin defaults. Forge always
+// understands the Claude Code plugin layout — the historical
+// claude_compatible flag was removed because nothing in the loader ever
+// gated on it.
 type PluginsDefaults struct {
 	Enabled          *bool    `toml:"enabled,omitempty"`
-	ClaudeCompatible *bool    `toml:"claude_compatible,omitempty"`
 	EnabledByDefault []string `toml:"enabled_by_default,omitempty"`
+}
+
+// ClawDefaults captures cross-workspace defaults for the Claw
+// companion: heartbeat / dream cadences and a small set of identity
+// hints that survive across workspaces. Per-workspace overrides remain
+// possible via .forge/config.toml [claw], but the typical user will
+// edit these globally from the Hub Settings forms.
+type ClawDefaults struct {
+	HeartbeatIntervalSeconds *int    `toml:"heartbeat_interval_seconds,omitempty"`
+	DreamIntervalMinutes     *int    `toml:"dream_interval_minutes,omitempty"`
+	PersonaName              *string `toml:"persona_name,omitempty"`
+	PersonaTone              *string `toml:"persona_tone,omitempty"`
+	AutonomyPolicy           *string `toml:"autonomy_policy,omitempty"`
+	ToolsEnabled             *bool   `toml:"tools_enabled,omitempty"`
+}
+
+// WebSearchDefaults captures the default web_search backend selection
+// shared across workspaces. Provider names are matched case-insensitively
+// against the registered backends in internal/tools/websearch.
+type WebSearchDefaults struct {
+	Provider  *string `toml:"provider,omitempty"`
+	APIKey    *string `toml:"api_key,omitempty"`
+	APIKeyEnv *string `toml:"api_key_env,omitempty"`
+	BaseURL   *string `toml:"base_url,omitempty"`
 }
 
 // RuntimeDefaults captures cross-workspace agent-runtime defaults: timeouts,

@@ -11,6 +11,9 @@ import (
 	"strings"
 	"time"
 
+	"forge/internal/agent"
+	"forge/internal/claw"
+	clawchannels "forge/internal/claw/channels"
 	"forge/internal/config"
 	"forge/internal/db"
 	"forge/internal/gitops"
@@ -87,6 +90,116 @@ func openWorkspaceSession(ctx context.Context, cwd string, opts workspaceBootstr
 	providers.Register(llm.NewOpenAICompatible("openai_compatible", cfg.Providers.OpenAICompatible))
 	providers.Register(llm.NewOpenAICompatible("lmstudio", cfg.Providers.LMStudio))
 	probeActiveContext(cwd, &cfg, providers)
+	clawSvc, err := claw.Open(cfg, providers, registry)
+	if err != nil {
+		mcpManager.Shutdown()
+		return nil, err
+	}
+	if cfg.Claw.Enabled && cfg.Claw.Autostart {
+		if err := clawSvc.Start(); err != nil {
+			fmt.Fprintf(os.Stderr, "claw: %s\n", err)
+		}
+	}
+	// Register the whatsapp_send tool. The closure routes through Claw's
+	// channel registry so the tool sees whatever transport the user has
+	// paired (a no-op error until pairing happens — surfaced clearly to
+	// the model).
+	if clawSvc != nil {
+		tools.RegisterWhatsAppSendTool(registry, func(ctx context.Context, to, body string) error {
+			_, err := clawSvc.SendVia(ctx, "whatsapp", clawchannels.Message{To: to, Body: body})
+			return err
+		})
+		// Contact store is a Claw-local feature (no external side
+		// effects). Wired here so the workspace's tool registry
+		// advertises both save + lookup, matching how whatsapp_send
+		// gets its channel closure injected.
+		tools.RegisterClawContactTools(
+			registry,
+			func(ctx context.Context, name, phone, email, notes string) (tools.ContactRecord, error) {
+				c, err := clawSvc.SaveContact(name, phone, email, notes, "claw_save_contact")
+				if err != nil {
+					return tools.ContactRecord{}, err
+				}
+				return tools.ContactRecord{
+					Name:      c.Name,
+					Phone:     c.Phone,
+					Email:     c.Email,
+					Notes:     c.Notes,
+					Source:    c.Source,
+					CreatedAt: c.CreatedAt.Format("2006-01-02T15:04:05Z"),
+					UpdatedAt: c.UpdatedAt.Format("2006-01-02T15:04:05Z"),
+				}, nil
+			},
+			func(ctx context.Context, name string) (tools.ContactRecord, bool) {
+				c, ok := clawSvc.LookupContact(name)
+				if !ok {
+					return tools.ContactRecord{}, false
+				}
+				return tools.ContactRecord{
+					Name:      c.Name,
+					Phone:     c.Phone,
+					Email:     c.Email,
+					Notes:     c.Notes,
+					Source:    c.Source,
+					CreatedAt: c.CreatedAt.Format("2006-01-02T15:04:05Z"),
+					UpdatedAt: c.UpdatedAt.Format("2006-01-02T15:04:05Z"),
+				}, true
+			},
+		)
+		tools.RegisterClawFactTools(
+			registry,
+			func(ctx context.Context, text, subject string) (tools.FactRecord, error) {
+				f, err := clawSvc.RememberFact(text, subject, "claw_remember")
+				if err != nil {
+					return tools.FactRecord{}, err
+				}
+				return tools.FactRecord{
+					ID: f.ID, Text: f.Text, Subject: f.Subject, Source: f.Source,
+					CreatedAt: f.CreatedAt.Format("2006-01-02T15:04:05Z"),
+				}, nil
+			},
+			func(ctx context.Context, query string, maxResults int) []tools.FactRecord {
+				hits := clawSvc.RecallFacts(query, maxResults)
+				out := make([]tools.FactRecord, 0, len(hits))
+				for _, f := range hits {
+					out = append(out, tools.FactRecord{
+						ID: f.ID, Text: f.Text, Subject: f.Subject, Source: f.Source,
+						CreatedAt: f.CreatedAt.Format("2006-01-02T15:04:05Z"),
+					})
+				}
+				return out
+			},
+		)
+		tools.RegisterClawReminderTools(
+			registry,
+			func(ctx context.Context, at time.Time, body, channel, target string) (tools.ReminderRecord, error) {
+				r, err := clawSvc.ScheduleReminder(at, body, channel, target)
+				if err != nil {
+					return tools.ReminderRecord{}, err
+				}
+				return tools.ReminderRecord{
+					ID: r.ID, RemindAt: r.RemindAt.Format(time.RFC3339),
+					Body: r.Body, Channel: r.Channel, Target: r.Target, Status: r.Status,
+				}, nil
+			},
+			func(ctx context.Context, status string) []tools.ReminderRecord {
+				rs := clawSvc.ListReminders(status)
+				out := make([]tools.ReminderRecord, 0, len(rs))
+				for _, r := range rs {
+					out = append(out, tools.ReminderRecord{
+						ID: r.ID, RemindAt: r.RemindAt.Format(time.RFC3339),
+						Body: r.Body, Channel: r.Channel, Target: r.Target, Status: r.Status,
+						LastError: r.LastError,
+					})
+				}
+				return out
+			},
+			func(ctx context.Context, id string) error { return clawSvc.CancelReminder(id) },
+		)
+		tools.RegisterClawWorkspaceNoteTool(registry, func(ctx context.Context, file, note string) (string, error) {
+			return clawSvc.AppendWorkspaceNote(file, note)
+		})
+	}
 
 	sessionStore, err := openSession(cwd, opts.Resume)
 	if err != nil {
@@ -101,6 +214,7 @@ func openWorkspaceSession(ctx context.Context, cwd string, opts workspaceBootstr
 	var pluginLSPConfigs []string
 	var enabledPlugins []plugins.Plugin
 	var outputStyles []plugins.OutputStyle
+	var pluginAgents []agent.PluginAgent
 	if discoveredPlugins, err := pluginMgr.Discover(); err == nil {
 		for _, p := range discoveredPlugins {
 			if enabledState.Disabled[p.Name] {
@@ -124,6 +238,16 @@ func openWorkspaceSession(ctx context.Context, cwd string, opts workspaceBootstr
 				pluginLSPConfigs = append(pluginLSPConfigs, lspPath)
 			}
 			outputStyles = append(outputStyles, p.ListOutputStyles()...)
+			for _, def := range plugins.LoadAgents(p.Path) {
+				pluginAgents = append(pluginAgents, agent.PluginAgent{
+					Name:        def.Name,
+					Description: def.Description,
+					Source:      def.Source,
+					Body:        def.Body,
+					Tools:       def.Tools,
+					ModelRole:   def.ModelRole,
+				})
+			}
 		}
 	}
 	if len(pluginSkillDirs) > 0 {
@@ -173,6 +297,7 @@ func openWorkspaceSession(ctx context.Context, cwd string, opts workspaceBootstr
 			Config:       cfg,
 			Tools:        registry,
 			Providers:    providers,
+			Claw:         clawSvc,
 			Session:      sessionStore,
 			ProjectState: projectSvc,
 			Skills: skills.NewManager(cwd, skills.Options{
@@ -192,6 +317,7 @@ func openWorkspaceSession(ctx context.Context, cwd string, opts workspaceBootstr
 			LSP:            lspClient,
 			PluginSettings: pluginSettings,
 			OutputStyles:   outputStyles,
+			PluginAgents:   pluginAgents,
 		},
 	}
 	workspace.CloseFunc = func() error {

@@ -5,7 +5,31 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"forge/internal/plugins"
 )
+
+// pluginCommandSuggestions enumerates /<plugin>:<command> entries by
+// running the same Discover() the dispatcher uses. cwd is the workspace
+// root (or "" for hub-only). Failures are silently ignored so a broken
+// plugin cannot block autocomplete on the rest of the catalog.
+func pluginCommandSuggestions(cwd string) []string {
+	if strings.TrimSpace(cwd) == "" {
+		return nil
+	}
+	mgr := plugins.NewManager(cwd)
+	discovered, err := mgr.Discover()
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, p := range discovered {
+		for _, c := range plugins.LoadCommands(p.Path) {
+			out = append(out, "/"+p.Name+":"+c.Name)
+		}
+	}
+	return out
+}
 
 // Suggest returns autocomplete suggestions for the current input.
 func Suggest(input, cwd string) []string {
@@ -35,6 +59,14 @@ func Suggest(input, cwd string) []string {
 		}
 		var matches []string
 		for _, cmd := range slashCommandNames() {
+			if strings.HasPrefix(cmd, input) && cmd != input {
+				matches = append(matches, cmd)
+			}
+		}
+		// Plugin commands (/<plugin>:<command>) are discovered on the fly
+		// from the workspace + global plugin dirs. Treat them as additive
+		// suggestions so the static autocomplete tests keep passing.
+		for _, cmd := range pluginCommandSuggestions(cwd) {
 			if strings.HasPrefix(cmd, input) && cmd != input {
 				matches = append(matches, cmd)
 			}

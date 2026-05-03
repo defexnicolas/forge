@@ -193,7 +193,14 @@ func (f skillsForm) Update(msg tea.Msg) (skillsForm, tea.Cmd) {
 			f.notice = "refreshing Skills CLI cache"
 			return f, loadSkillsCmd(f.manager, f.repos, f.directory)
 		case tea.KeyDelete, tea.KeyBackspace:
-			if f.tab != skillsTabInstalled || len(f.filtered) == 0 || f.selected >= len(f.filtered) {
+			// Only the Installed tab repurposes Delete/Backspace as the
+			// "remove skill" trigger. On the Available tab those keys must
+			// fall through to the search textinput so the user can edit
+			// their query — otherwise typing-then-correcting feels broken.
+			if f.tab != skillsTabInstalled {
+				break
+			}
+			if len(f.filtered) == 0 || f.selected >= len(f.filtered) {
 				return f, nil
 			}
 			skill := f.filtered[f.selected]

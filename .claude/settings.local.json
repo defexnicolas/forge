@@ -43,7 +43,14 @@
       "Bash(xargs basename *)",
       "Bash(go add *)",
       "Read(//c/Users/nicod/.forge/**)",
-      "Read(//c/Users/nicod/.codex/forge/**)"
+      "Read(//c/Users/nicod/.codex/forge/**)",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\nicod\\\\Downloads\\\\letcode\")",
+      "Bash(Select-Object Name)",
+      "Read(//c/Users/nicod/**)",
+      "Bash(mkdir -p \"./.forge/claw/.backups\")",
+      "Bash(cp ./.forge/claw/state.json ./.forge/claw/.backups/state.json.__TRACKED_VAR__)",
+      "Bash(rm -rf ./.forge/hub/claw/.forge/sessions/*)",
+      "Bash(rm -f ./.forge/claw/state.json)"
     ]
   }
 }

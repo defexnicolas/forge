@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"forge/internal/agent"
+	"forge/internal/claw"
 	"forge/internal/config"
 	"forge/internal/gitops"
 	"forge/internal/hooks"
@@ -34,6 +35,7 @@ type Options struct {
 	Config         config.Config
 	Tools          *tools.Registry
 	Providers      *llm.Registry
+	Claw           *claw.Service
 	Session        *session.Store
 	Skills         *skills.Manager
 	Plugins        *plugins.Manager
@@ -44,6 +46,10 @@ type Options struct {
 	LSP            lsp.Client
 	PluginSettings plugins.MergedSettings
 	OutputStyles   []plugins.OutputStyle
+	// PluginAgents is the agent definitions discovered under each enabled
+	// plugin's agents/ directory. They are merged into the runtime's
+	// SubagentRegistry so spawn_subagent can target them by name.
+	PluginAgents []agent.PluginAgent
 }
 
 type App struct{ options Options }
@@ -224,8 +230,15 @@ func newModel(options Options) model {
 	if len(options.PluginSettings.AskTools) > 0 {
 		runtime.Commands.Ask = append(runtime.Commands.Ask, options.PluginSettings.AskTools...)
 	}
+	// Plugin-supplied subagents become first-class spawn_subagent targets.
+	if len(options.PluginAgents) > 0 {
+		agent.MergePluginAgents(&runtime.Subagents, options.PluginAgents)
+	}
 	runtime.Hooks = options.Hooks
 	runtime.SetGitSessionState(options.GitState)
+	if options.Claw != nil {
+		options.Claw.SyncRuntime(options.Config, options.Providers, options.Tools)
+	}
 
 	sessionName := "new"
 	if options.Session != nil {
@@ -1118,13 +1131,70 @@ func (m *model) handleCommand(line string) string {
 			return "Usage: /btw <question>"
 		}
 		return m.handleBtwCommand(strings.Join(fields[1:], " "))
+	case "/claw":
+		return m.handleClawCommand(fields)
 	case "/remote-control", "/remote":
 		return m.handleRemoteCommand(fields)
 	case "/code":
 		return m.openInVSCode()
 	default:
+		// Plugin commands: /<plugin>:<command>. Match before falling
+		// through to "Unknown command" so a Claude Code plugin's
+		// commands/ files become first-class TUI commands without each
+		// plugin needing to register code.
+		if msg, ok := m.dispatchPluginCommand(fields[0], fields[1:]); ok {
+			return msg
+		}
 		return "Unknown command. Try /help."
 	}
+}
+
+// dispatchPluginCommand matches /<plugin>:<command> against the discovered
+// plugins' commands/ directories. On a hit, the markdown content is sent to
+// the runtime as a user message — same path as if the user had typed the
+// instructions themselves. Extra args are appended verbatim so a command
+// like /sample-plugin:hello world expands to <command body>\n\nworld.
+//
+// Returns (statusMessage, true) on dispatch and ("", false) when the input
+// is not a plugin command.
+func (m *model) dispatchPluginCommand(head string, rest []string) (string, bool) {
+	if !strings.HasPrefix(head, "/") {
+		return "", false
+	}
+	if !strings.Contains(head, ":") {
+		return "", false
+	}
+	if m.options.Plugins == nil {
+		return "", false
+	}
+	parts := strings.SplitN(strings.TrimPrefix(head, "/"), ":", 2)
+	pluginName, cmdName := parts[0], parts[1]
+	if pluginName == "" || cmdName == "" {
+		return "", false
+	}
+	discovered, err := m.options.Plugins.Discover()
+	if err != nil {
+		return m.theme.ErrorStyle.Render("plugin discovery failed: " + err.Error()), true
+	}
+	for _, p := range discovered {
+		if p.Name != pluginName {
+			continue
+		}
+		for _, c := range plugins.LoadCommands(p.Path) {
+			if c.Name != cmdName {
+				continue
+			}
+			body := strings.TrimSpace(c.Content)
+			if extra := strings.TrimSpace(strings.Join(rest, " ")); extra != "" {
+				body += "\n\n" + extra
+			}
+			m.agentEvents = m.agentRuntime.Run(context.Background(), body)
+			m.agentRunning = true
+			m.pendingCommand = waitForAgentEvent(m.agentEvents)
+			return "Running " + head + " from " + pluginName, true
+		}
+	}
+	return m.theme.Warning.Render(head + ": plugin or command not found"), true
 }
 
 func (m model) helpText() string {

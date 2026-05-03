@@ -189,6 +189,17 @@ max_planner_summary_steps = 2
 max_builder_read_loops = 4
 retry_on_provider_timeout = false
 
+[claw]
+enabled = false
+autostart = false
+heartbeat_interval_seconds = 30
+dream_interval_minutes = 180
+autonomy_policy = "supervised"
+default_channel = "mock"
+persona_name = "Claw"
+persona_tone = "warm"
+identity_seed = "A resident Forge companion with memory, initiative, and restraint."
+
 [git]
 auto_init = true
 create_baseline_commit = true
@@ -218,7 +229,6 @@ copy = true
 
 [plugins]
 enabled = true
-claude_compatible = true
 `
 
 const defaultAgentsMD = `# AGENTS.md

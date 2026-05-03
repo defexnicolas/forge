@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": ["echo *", "git status"],
+    "deny": ["rm -rf *"],
+    "ask": ["pip install *"]
+  },
+  "env": {
+    "SAMPLE_PLUGIN_GREETING": "${user_config.GREETING}",
+    "SAMPLE_PLUGIN_ROOT": "${CLAUDE_PLUGIN_ROOT}"
+  }
+}

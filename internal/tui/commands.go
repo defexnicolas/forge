@@ -175,6 +175,7 @@ func (m model) describeStatus() string {
 		{"mode", m.agentRuntime.Mode},
 		{"provider", m.options.Config.Providers.Default.Name},
 		{"model", currentModelName(m)},
+		{"claw", clawAvailability(m.options.Claw)},
 		{"model_loading", fmt.Sprintf("%t/%s", m.options.Config.ModelLoading.Enabled, m.options.Config.ModelLoading.Strategy)},
 		{"parallel_slots", fmt.Sprintf("%d", m.options.Config.ModelLoading.ParallelSlots)},
 		{"build_subagents", fmt.Sprintf("%t/concurrency=%d", m.options.Config.Build.Subagents.Enabled, m.options.Config.Build.Subagents.Concurrency)},
@@ -249,8 +250,13 @@ func (m model) describeConfig() string {
 		{"skills.agent", cfg.Skills.Agent},
 		{"skills.install_scope", cfg.Skills.InstallScope},
 		{"skills.copy", fmt.Sprintf("%t", cfg.Skills.Copy)},
+		{"claw.enabled", fmt.Sprintf("%t", cfg.Claw.Enabled)},
+		{"claw.autostart", fmt.Sprintf("%t", cfg.Claw.Autostart)},
+		{"claw.autonomy_policy", cfg.Claw.AutonomyPolicy},
+		{"claw.default_channel", cfg.Claw.DefaultChannel},
+		{"claw.persona_name", cfg.Claw.PersonaName},
+		{"claw.persona_tone", cfg.Claw.PersonaTone},
 		{"plugins.enabled", fmt.Sprintf("%t", cfg.Plugins.Enabled)},
-		{"plugins.claude_compatible", fmt.Sprintf("%t", cfg.Plugins.ClaudeCompatible)},
 	}
 	for role, model := range cfg.Models {
 		rows = append(rows, []string{"models." + role, model})
@@ -350,6 +356,13 @@ func detectedLength(detected *config.DetectedContext) int {
 		return 0
 	}
 	return detected.LoadedContextLength
+}
+
+func clawAvailability(service any) string {
+	if service == nil {
+		return "unavailable"
+	}
+	return "available"
 }
 
 func (m *model) enterReviewMode() string {

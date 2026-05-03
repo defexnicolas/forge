@@ -20,6 +20,11 @@ type Subagent struct {
 	ModelRole    string
 	ContextMode  string
 	AllowedTools []string
+	// SystemBody is appended to the auto-generated subagent system prompt.
+	// Plugin-shipped agents use this to inject their role-specific
+	// instructions (the markdown body of their .md file). Empty for
+	// built-in agents that rely on the auto-generated prompt only.
+	SystemBody string
 }
 
 type SubagentRequest struct {
@@ -68,7 +73,7 @@ func DefaultSubagents() SubagentRegistry {
 			Description:  "Worker for running allowlisted test commands and summarizing failures.",
 			ModelRole:    "reviewer",
 			ContextMode:  "forked",
-			AllowedTools: []string{"read_file", "search_text", "search_files", "git_status", "git_diff", "run_command"},
+			AllowedTools: []string{"read_file", "search_text", "search_files", "git_status", "git_diff", "run_command", "python_setup", "python_run"},
 		},
 		{
 			Name:         "summarizer",
@@ -103,7 +108,7 @@ func DefaultSubagents() SubagentRegistry {
 			Description:  "Debugs issues: reads code, runs tests, finds root cause. Reports findings without editing.",
 			ModelRole:    "reviewer",
 			ContextMode:  "forked",
-			AllowedTools: []string{"read_file", "list_files", "search_text", "search_files", "git_status", "git_diff", "run_command"},
+			AllowedTools: []string{"read_file", "list_files", "search_text", "search_files", "git_status", "git_diff", "run_command", "python_setup", "python_run"},
 		},
 		{
 			Name:        "builder",
@@ -115,6 +120,7 @@ func DefaultSubagents() SubagentRegistry {
 				"edit_file", "write_file", "apply_patch", "run_command",
 				"git_status", "git_diff",
 				"task_get", "task_update",
+				"python_setup", "python_run",
 			},
 		},
 	}
@@ -136,6 +142,58 @@ func (r SubagentRegistry) List() []Subagent {
 		out = append(out, agent)
 	}
 	return out
+}
+
+// Register adds (or replaces) a subagent in the registry. Plugin-shipped
+// agents flow through here after Discover() so they become first-class
+// targets for spawn_subagent / spawn_subagents like the built-ins.
+func (r *SubagentRegistry) Register(agent Subagent) {
+	if r.agents == nil {
+		r.agents = map[string]Subagent{}
+	}
+	r.agents[agent.Name] = agent
+}
+
+// MergePluginAgents adopts every agent the plugin manager discovered into
+// the registry. Frontmatter fields drive ModelRole and AllowedTools;
+// missing values fall back to safe read-only defaults so a malformed agent
+// does not silently gain mutating capabilities.
+func MergePluginAgents(registry *SubagentRegistry, defs []PluginAgent) {
+	for _, def := range defs {
+		role := strings.TrimSpace(def.ModelRole)
+		if role == "" {
+			role = "explorer"
+		}
+		tools := def.Tools
+		if len(tools) == 0 {
+			tools = []string{"read_file", "list_files", "search_text", "search_files"}
+		}
+		desc := strings.TrimSpace(def.Description)
+		if desc == "" {
+			desc = "Plugin-supplied agent (" + def.Source + ")"
+		}
+		registry.Register(Subagent{
+			Name:         def.Name,
+			Description:  desc,
+			ModelRole:    role,
+			ContextMode:  "yarn",
+			AllowedTools: tools,
+			SystemBody:   strings.TrimSpace(def.Body),
+		})
+	}
+}
+
+// PluginAgent is the agent package's view of plugins.AgentDef. It mirrors
+// the relevant fields so the agent package does not need to import
+// internal/plugins (avoids the cycle: plugins → tools → agent? not today,
+// but keeping the boundary is cheap insurance).
+type PluginAgent struct {
+	Name        string
+	Description string
+	Source      string
+	Body        string
+	Tools       []string
+	ModelRole   string
 }
 
 func (r *Runtime) RunSubagent(ctx context.Context, request SubagentRequest) (tools.Result, error) {
@@ -709,7 +767,7 @@ func subagentSystemPrompt(worker Subagent, snapshot contextbuilder.Snapshot) str
 	} else {
 		rules.WriteString("Do not edit files.\n")
 	}
-	return strings.TrimSpace(`You are Forge subagent ` + worker.Name + `.
+	prompt := strings.TrimSpace(`You are Forge subagent ` + worker.Name + `.
 
 Role: ` + worker.Description + `
 Context mode: ` + worker.ContextMode + `
@@ -724,6 +782,12 @@ If you need information, request exactly one tool call:
 ` + strings.TrimSpace(rules.String()) + `
 Do not request tools outside the allowed list.
 Main context engine: ` + snapshot.ContextEngine)
+	if extra := strings.TrimSpace(worker.SystemBody); extra != "" {
+		// Append plugin-supplied agent body so the .md file's content
+		// becomes part of the subagent's instructions.
+		prompt += "\n\n--- plugin instructions ---\n" + extra
+	}
+	return prompt
 }
 
 func subagentStepLimit(worker Subagent) int {

@@ -50,6 +50,15 @@ func NewRootCommand() *cobra.Command {
 				}
 			}
 
+			// Redirect stderr to ~/.forge/forge.log before the TUI
+			// kicks in so Hub-only sessions (no workspace) still get a
+			// readable diagnostic log. openWorkspaceSession may already
+			// have redirected to a workspace-local file; that wins
+			// because os.Stderr is just reassigned again here.
+			if initialWorkspace == nil {
+				_ = RedirectStderrToHome()
+			}
+
 			app := tui.NewShell(tui.ShellOptions{
 				InitialWorkspace: initialWorkspace,
 				InitialHubDir:    launchDir,

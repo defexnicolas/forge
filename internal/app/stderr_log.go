@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"forge/internal/globalconfig"
 )
 
 // maxStderrLogBytes caps the size of .forge/forge.log at the start of a
@@ -25,10 +27,21 @@ const maxStderrLogBytes = 1 << 20 // 1 MB
 // at the TTY.
 func redirectStderrToLog(cwd string) *os.File {
 	forgeDir := filepath.Join(cwd, ".forge")
-	if err := os.MkdirAll(forgeDir, 0o755); err != nil {
+	return redirectStderrToPath(filepath.Join(forgeDir, "forge.log"))
+}
+
+// RedirectStderrToHome opens ~/.forge/forge.log and reassigns os.Stderr.
+// Used at Shell startup so Hub-only sessions (no workspace) still get a
+// readable log. When a workspace opens later, it'll redirect again to
+// the workspace-local forge.log.
+func RedirectStderrToHome() *os.File {
+	return redirectStderrToPath(filepath.Join(globalconfig.HomeDir(), "forge.log"))
+}
+
+func redirectStderrToPath(logPath string) *os.File {
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
 		return nil
 	}
-	logPath := filepath.Join(forgeDir, "forge.log")
 
 	if info, err := os.Stat(logPath); err == nil && info.Size() > maxStderrLogBytes {
 		_ = os.Rename(logPath, logPath+".old")

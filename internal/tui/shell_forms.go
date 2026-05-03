@@ -17,6 +17,13 @@ const (
 	hubFormYarn
 	hubFormTheme
 	hubFormSkills
+	hubFormWebSearch
+	hubFormOutputStyle
+	hubFormPlugins
+	hubFormWhatsApp
+	hubFormClawIdentity
+	hubFormClawHeartbeat
+	hubFormClawAllowlist
 )
 
 func (m *shellModel) handleHubFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
@@ -131,6 +138,123 @@ func (m *shellModel) handleHubFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd, bool)
 			m.activeHubForm = hubFormNone
 		}
 		return *m, cmd, true
+	case hubFormWebSearch:
+		var cmd tea.Cmd
+		m.webSearchForm, cmd = m.webSearchForm.Update(msg)
+		if m.webSearchForm.done {
+			result := "Web Search settings canceled."
+			if !m.webSearchForm.canceled {
+				if cfg, ok := m.loadHubSettingsConfig(); ok {
+					result = stripAnsi(m.webSearchForm.ApplyInMemory(&cfg))
+					if err := saveHubGlobalConfig(cfg); err != nil {
+						result = "Global save failed: " + err.Error()
+					}
+				}
+			}
+			m.statusMessage = result
+			m.activeHubForm = hubFormNone
+		}
+		return *m, cmd, true
+	case hubFormOutputStyle:
+		var cmd tea.Cmd
+		m.outputStyleForm, cmd = m.outputStyleForm.Update(msg)
+		if m.outputStyleForm.done {
+			result := "Output style change canceled."
+			if !m.outputStyleForm.canceled {
+				if cfg, ok := m.loadHubSettingsConfig(); ok {
+					result = stripAnsi(m.outputStyleForm.ApplyInMemory(&cfg))
+					if err := saveHubGlobalConfig(cfg); err != nil {
+						result = "Global save failed: " + err.Error()
+					}
+				}
+			}
+			m.statusMessage = result
+			m.activeHubForm = hubFormNone
+		}
+		return *m, cmd, true
+	case hubFormPlugins:
+		var cmd tea.Cmd
+		m.pluginsForm, cmd = m.pluginsForm.Update(msg)
+		if m.pluginsForm.done {
+			m.statusMessage = "Plugins manager closed."
+			m.activeHubForm = hubFormNone
+		}
+		return *m, cmd, true
+	case hubFormClawIdentity:
+		var cmd tea.Cmd
+		m.clawIdentityForm, cmd = m.clawIdentityForm.Update(msg)
+		if m.clawIdentityForm.done {
+			m.statusMessage = stripAnsi(m.clawIdentityForm.ApplyInMemory(m.hubClawService()))
+			m.activeHubForm = hubFormNone
+		}
+		return *m, cmd, true
+	case hubFormClawHeartbeat:
+		var cmd tea.Cmd
+		m.clawHeartbeatForm, cmd = m.clawHeartbeatForm.Update(msg)
+		if m.clawHeartbeatForm.done {
+			result := "Claw cadence canceled."
+			if !m.clawHeartbeatForm.canceled {
+				if cfg, ok := m.loadHubSettingsConfig(); ok {
+					result = stripAnsi(m.clawHeartbeatForm.ApplyInMemory(&cfg))
+					if err := saveHubGlobalConfig(cfg); err != nil {
+						result = "Global save failed: " + err.Error()
+					}
+				}
+			}
+			m.statusMessage = result
+			m.activeHubForm = hubFormNone
+		}
+		return *m, cmd, true
+	case hubFormWhatsApp:
+		var cmd tea.Cmd
+		m.whatsAppForm, cmd = m.whatsAppForm.Update(msg)
+		if m.whatsAppForm.done {
+			if m.whatsAppForm.canceled {
+				m.statusMessage = "WhatsApp pairing canceled."
+			} else {
+				m.statusMessage = "WhatsApp paired and persisted at ~/.forge/claw/whatsapp.db."
+				// Hand the live channel to the Claw service so
+				// whatsapp_send + the inbound→memory pump can find
+				// it. Done here (not inside the form) to keep the
+				// form's state machine free of cross-package wiring.
+				if svc := m.hubClawService(); svc != nil {
+					if ch := m.whatsAppForm.Channel(); ch != nil {
+						svc.RegisterChannel(ch)
+					}
+				}
+			}
+			m.activeHubForm = hubFormNone
+		}
+		return *m, cmd, true
+	case hubFormClawAllowlist:
+		var cmd tea.Cmd
+		m.clawAllowlistForm, cmd = m.clawAllowlistForm.Update(msg)
+		if m.clawAllowlistForm.done {
+			if m.clawAllowlistForm.canceled {
+				m.statusMessage = "Allowlist edit canceled."
+			} else {
+				jid := m.clawAllowlistForm.JID()
+				svc := m.hubClawService()
+				switch {
+				case svc == nil:
+					m.statusMessage = "Claw service unavailable."
+				case m.clawAllowlistForm.mode == clawAllowlistAdd:
+					if err := svc.AddAllowed(m.clawAllowlistForm.channelName, jid); err != nil {
+						m.statusMessage = "Add failed: " + err.Error()
+					} else {
+						m.statusMessage = "Added to allowlist: " + jid
+					}
+				case m.clawAllowlistForm.mode == clawAllowlistRemove:
+					if err := svc.RemoveAllowed(m.clawAllowlistForm.channelName, jid); err != nil {
+						m.statusMessage = "Remove failed: " + err.Error()
+					} else {
+						m.statusMessage = "Removed from allowlist: " + jid
+					}
+				}
+			}
+			m.activeHubForm = hubFormNone
+		}
+		return *m, cmd, true
 	default:
 		return *m, nil, false
 	}
@@ -150,6 +274,20 @@ func (m shellModel) activeHubFormView() string {
 		return m.themeForm.View()
 	case hubFormSkills:
 		return m.skillsForm.View()
+	case hubFormWebSearch:
+		return m.webSearchForm.View()
+	case hubFormOutputStyle:
+		return m.outputStyleForm.View()
+	case hubFormPlugins:
+		return m.pluginsForm.View()
+	case hubFormWhatsApp:
+		return m.whatsAppForm.ViewSized(m.hubContentWidth(), m.hubInnerHeight()-1)
+	case hubFormClawIdentity:
+		return m.clawIdentityForm.View()
+	case hubFormClawHeartbeat:
+		return m.clawHeartbeatForm.View()
+	case hubFormClawAllowlist:
+		return m.clawAllowlistForm.View()
 	default:
 		return ""
 	}

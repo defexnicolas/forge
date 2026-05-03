@@ -4,9 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
@@ -89,14 +87,7 @@ func buildYarnGraphHTML(nodes []yarn.Node) (string, error) {
 }
 
 func defaultOpenYarnGraphPath(path string) error {
-	switch runtime.GOOS {
-	case "windows":
-		return exec.Command("rundll32", "url.dll,FileProtocolHandler", path).Start()
-	case "darwin":
-		return exec.Command("open", path).Start()
-	default:
-		return exec.Command("xdg-open", path).Start()
-	}
+	return openInDefaultApp(path)
 }
 
 const yarnGraphHTMLTemplate = `<!doctype html>

@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"strings"
+
 	"forge/internal/config"
 	"forge/internal/globalconfig"
 )
@@ -55,6 +57,40 @@ func saveHubGlobalConfig(cfg config.Config) error {
 		CompactTranscriptChars: intPtr(cfg.Context.Yarn.CompactTranscriptChars),
 		RenderMode:             stringPtr(cfg.Context.Yarn.RenderMode),
 		RenderHeadLine:         intPtr(cfg.Context.Yarn.RenderHeadLines),
+	}
+	// WebSearch — only persist when at least one field is set, so the
+	// global file stays clean for users who never opened the form.
+	ws := cfg.WebSearch
+	if ws.Provider != "" || ws.APIKey != "" || ws.APIKeyEnv != "" || ws.BaseURL != "" {
+		current.WebSearch = &globalconfig.WebSearchDefaults{
+			Provider:  stringPtr(ws.Provider),
+			APIKey:    stringPtr(ws.APIKey),
+			APIKeyEnv: stringPtr(ws.APIKeyEnv),
+			BaseURL:   stringPtr(ws.BaseURL),
+		}
+	}
+	if strings.TrimSpace(cfg.OutputStyle) != "" {
+		current.OutputStyle = stringPtr(cfg.OutputStyle)
+	}
+	if strings.TrimSpace(cfg.ApprovalProfile) != "" {
+		current.ApprovalProfile = stringPtr(cfg.ApprovalProfile)
+	}
+	// Claw — persist any non-default cadence / persona / tools override.
+	defaults := config.Defaults().Claw
+	if cfg.Claw.HeartbeatIntervalSeconds != defaults.HeartbeatIntervalSeconds ||
+		cfg.Claw.DreamIntervalMinutes != defaults.DreamIntervalMinutes ||
+		cfg.Claw.PersonaName != defaults.PersonaName ||
+		cfg.Claw.PersonaTone != defaults.PersonaTone ||
+		cfg.Claw.AutonomyPolicy != defaults.AutonomyPolicy ||
+		cfg.Claw.ToolsEnabled != defaults.ToolsEnabled {
+		current.Claw = &globalconfig.ClawDefaults{
+			HeartbeatIntervalSeconds: intPtr(cfg.Claw.HeartbeatIntervalSeconds),
+			DreamIntervalMinutes:     intPtr(cfg.Claw.DreamIntervalMinutes),
+			PersonaName:              stringPtr(cfg.Claw.PersonaName),
+			PersonaTone:              stringPtr(cfg.Claw.PersonaTone),
+			AutonomyPolicy:           stringPtr(cfg.Claw.AutonomyPolicy),
+			ToolsEnabled:             boolPtr(cfg.Claw.ToolsEnabled),
+		}
 	}
 	return globalconfig.Save(current)
 }

@@ -11,6 +11,8 @@ func RegisterBuiltins(registry *Registry) {
 	registry.Register(writeFileTool{}, "Write")
 	registry.Register(applyPatchTool{})
 	registry.Register(runCommandTool{}, "Bash", "PowerShell")
+	registry.Register(pythonSetupTool{}, "PythonSetup")
+	registry.Register(pythonRunTool{}, "PythonRun")
 	registry.Register(planWriteTool{}, "PlanWrite")
 	registry.Register(planGetTool{}, "PlanGet")
 	registry.Register(todoWriteTool{}, "TodoWrite")

@@ -1,0 +1,10 @@
+{
+  "servers": [
+    {
+      "name": "sample-lsp",
+      "command": "echo",
+      "args": ["sample lsp invoked"],
+      "languages": ["plaintext"]
+    }
+  ]
+}

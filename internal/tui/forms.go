@@ -76,7 +76,7 @@ func (m *model) handleFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 			if m.providerForm.done {
 				m.activeForm = formNone
 				result := m.providerForm.Apply(&m.options.Config, m.options.Providers)
-				m.agentRuntime.Config = m.options.Config
+				m.syncRuntimeConfig()
 				m.history = append(m.history, result)
 				m.refresh()
 			}
@@ -135,8 +135,7 @@ func (m *model) handleFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 			m.activeForm = formNone
 			if !m.modelForm.canceled {
 				result := m.modelForm.Apply(&m.options.Config)
-				m.agentRuntime.Config = m.options.Config
-				m.agentRuntime.Builder.Config = m.options.Config
+				m.syncRuntimeConfig()
 				m.agentRuntime.SetChatModel(m.options.Config.Models["chat"])
 				if result != "" && m.agentRuntime.ActiveParserName != "" {
 					result += "\n" + m.theme.Muted.Render(fmt.Sprintf("family=%s parser=%s", m.agentRuntime.ActiveModelFamily, m.agentRuntime.ActiveParserName))
@@ -158,8 +157,7 @@ func (m *model) handleFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 			m.activeForm = formNone
 			if !m.modelMultiForm.canceled && m.modelMultiForm.errMsg == "" {
 				m.options.Config = m.modelMultiForm.cfg
-				m.agentRuntime.Config = m.options.Config
-				m.agentRuntime.Builder.Config = m.options.Config
+				m.syncRuntimeConfig()
 				activeRole := m.activeModelRole()
 				strategy := strings.ToLower(strings.TrimSpace(m.options.Config.ModelLoading.Strategy))
 				for _, selection := range m.modelMultiForm.selections {
