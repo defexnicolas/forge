@@ -180,10 +180,18 @@ func TestSystemPromptIncludesBuildModeInstructions(t *testing.T) {
 
 func TestSystemPromptHidesDeniedToolExamplesInBuildMode(t *testing.T) {
 	sp := systemPrompt(false, "build", NewBuildPolicy())
-	for _, denied := range []string{`"name":"plan_write"`, `"name":"todo_write"`, `"name":"task_create"`, `"name":"spawn_subagent"`} {
+	// task_create IS allowed in build mode (added so the executor can
+	// externalise newly-discovered work mid-implementation rather than
+	// looping in prose). plan_write / todo_write / spawn_subagent stay
+	// denied — those would let the executor re-plan or recurse, which
+	// is the planner's job.
+	for _, denied := range []string{`"name":"plan_write"`, `"name":"todo_write"`, `"name":"spawn_subagent"`} {
 		if strings.Contains(sp, denied) {
 			t.Fatalf("build-mode prompt should not advertise %s (build denies it):\n%s", denied, sp)
 		}
+	}
+	if !strings.Contains(sp, `"name":"task_create"`) {
+		t.Fatalf("build-mode prompt should ADVERTISE task_create (now allowed):\n%s", sp)
 	}
 }
 

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -23,6 +24,13 @@ import (
 type readCacheEntry struct {
 	result      tools.Result
 	observation string
+	// serveCount tracks how many times this entry was served from cache
+	// (excluding the original store). Cache lookups annotate the
+	// served result with this count so the model gets an explicit
+	// signal it just re-read a file it already saw this turn — small
+	// local models otherwise loop on read_file calls until they hit
+	// the consecutive-read-only guard.
+	serveCount int
 }
 
 type readCacheStore struct {
@@ -84,9 +92,38 @@ func (r *Runtime) lookupReadCache(input json.RawMessage) (*tools.Result, string,
 		return nil, "", false
 	}
 	r.readCache.hits++
-	// Return a defensive copy so callers can mutate without poisoning cache.
-	res := entry.result
-	return &res, entry.observation, true
+	entry.serveCount++
+	// Annotate so the model sees an explicit "you already read this"
+	// note in the tool result. The cached entry itself is left clean
+	// (the annotation is built per-lookup); only serveCount mutates.
+	res := annotateRereadResult(entry.result, entry.serveCount)
+	obs := "Tool result for read_file:\n" + summarizeResult(res)
+	return &res, obs, true
+}
+
+// annotateRereadResult prepends a NOTE block to the cached read_file
+// result telling the model "you already saw this file this turn".
+// Without this, models like Qwen3.6 cheerfully re-read the same path
+// 30+ times in a single session because the prompt response looks
+// identical to a fresh read.
+func annotateRereadResult(result tools.Result, serveCount int) tools.Result {
+	out := result
+	if len(out.Content) == 0 {
+		return out
+	}
+	timesWord := "time"
+	if serveCount > 1 {
+		timesWord = "times"
+	}
+	note := fmt.Sprintf("[NOTE: you already read this file %d %s in this turn. The content below is unchanged from your earlier read. Re-reading the same path costs a step but adds no new information. If you forgot what was here, write the relevant excerpts down in your reasoning before you move on. If you need a different range of lines, call read_file again with offset+limit instead of repeating the same call.]\n\n", serveCount, timesWord)
+	out.Content = append([]tools.ContentBlock(nil), out.Content...)
+	first := out.Content[0]
+	out.Content[0] = tools.ContentBlock{
+		Type: first.Type,
+		Text: note + first.Text,
+		Path: first.Path,
+	}
+	return out
 }
 
 func (r *Runtime) storeReadCache(input json.RawMessage, result *tools.Result, observation string) {

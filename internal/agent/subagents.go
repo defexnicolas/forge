@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
+	"time"
 
 	contextbuilder "forge/internal/context"
 	"forge/internal/llm"
@@ -556,6 +558,17 @@ func (r *Runtime) RunSubagents(ctx context.Context, request SubagentBatchRequest
 	}
 
 	items := make([]SubagentBatchItem, len(request.Tasks))
+	// Per-task timing for the parallelism diagnostic. The user reports
+	// they "never see real parallelism" — this records when each
+	// goroutine actually started executing RunSubagent (i.e. AFTER the
+	// semaphore acquire) and when it returned. The post-batch summary
+	// computes overlap so it is obvious whether requests are running
+	// concurrently or being serialised by either the client or LM
+	// Studio's GEN slots. Captured per-goroutine without locking — each
+	// index slot is written by a single writer.
+	starts := make([]time.Time, len(request.Tasks))
+	ends := make([]time.Time, len(request.Tasks))
+	batchStart := time.Now()
 	sem := make(chan struct{}, maxConcurrency)
 	var wg sync.WaitGroup
 	for i, task := range request.Tasks {
@@ -588,7 +601,9 @@ func (r *Runtime) RunSubagents(ctx context.Context, request SubagentBatchRequest
 				return
 			}
 			emit(i, agentName, "running", "starting", 0, false, "", "")
+			starts[i] = time.Now()
 			result, err := r.RunSubagent(ctx, task)
+			ends[i] = time.Now()
 			if err != nil {
 				var runErr *subagentRunError
 				phase := ""
@@ -614,6 +629,7 @@ func (r *Runtime) RunSubagents(ctx context.Context, request SubagentBatchRequest
 		}()
 	}
 	wg.Wait()
+	logSubagentBatchTiming(batchID, batchStart, starts, ends)
 
 	completed, failed := 0, 0
 	var b strings.Builder
@@ -650,6 +666,72 @@ func (r *Runtime) RunSubagents(ctx context.Context, request SubagentBatchRequest
 			{Type: "json", Text: string(payload)},
 		},
 	}, nil
+}
+
+// logSubagentBatchTiming writes a one-line summary to stderr (which is
+// redirected to .forge/sessions/<id>/live.log) showing when each
+// subagent in a batch actually executed and how much their windows
+// overlap. Diagnostic for the user's "I never see real parallelism"
+// observation: if overlap is high (>70%) the client truly fanned out
+// concurrently and any perceived serialisation is server-side (LM
+// Studio's GEN slot count). If overlap is low (<10%) the requests
+// effectively ran one after another despite the goroutines being
+// launched in parallel — pointing at server queuing or a hidden lock.
+//
+// Skipped silently when no goroutine ever started (zero starts) so
+// the log is not polluted by error-path early returns.
+func logSubagentBatchTiming(batchID string, batchStart time.Time, starts, ends []time.Time) {
+	if len(starts) == 0 {
+		return
+	}
+
+	var firstStart, lastStart, firstEnd, lastEnd time.Time
+	var totalRun time.Duration
+	count := 0
+	for i := range starts {
+		if starts[i].IsZero() || ends[i].IsZero() {
+			continue
+		}
+		if count == 0 || starts[i].Before(firstStart) {
+			firstStart = starts[i]
+		}
+		if count == 0 || starts[i].After(lastStart) {
+			lastStart = starts[i]
+		}
+		if count == 0 || ends[i].Before(firstEnd) {
+			firstEnd = ends[i]
+		}
+		if count == 0 || ends[i].After(lastEnd) {
+			lastEnd = ends[i]
+		}
+		totalRun += ends[i].Sub(starts[i])
+		count++
+	}
+	if count == 0 {
+		return
+	}
+
+	wall := lastEnd.Sub(batchStart)
+	// overlap = (sum of per-task durations) / (N * wall-clock)
+	// 1.0 means perfectly parallel, 1/N means perfectly serial.
+	var overlap float64
+	if wall > 0 {
+		overlap = float64(totalRun) / float64(int64(count)*int64(wall))
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "[subagent-timing] %s wall=%s overlap=%.0f%% n=%d", batchID, wall.Round(time.Millisecond), overlap*100, count)
+	for i := range starts {
+		if starts[i].IsZero() || ends[i].IsZero() {
+			continue
+		}
+		fmt.Fprintf(&b, " task[%d]=%s→%s",
+			i,
+			starts[i].Sub(batchStart).Round(time.Millisecond),
+			ends[i].Sub(batchStart).Round(time.Millisecond),
+		)
+	}
+	fmt.Fprintln(os.Stderr, b.String())
 }
 
 func (r *Runtime) executeSubagentTool(ctx context.Context, worker Subagent, call ToolCall) (string, error) {

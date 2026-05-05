@@ -195,6 +195,24 @@ func withOptionalTimeout(ctx context.Context, d time.Duration) (context.Context,
 	return context.WithTimeout(ctx, d)
 }
 
+// summarizeForReprompt quotes a short snippet of a string for inclusion in
+// a user reprompt message. Caps the length so a 100-char repeated line
+// doesn't bloat every subsequent prompt, and JSON-quotes it so the
+// model sees an obvious "this is what you said" rather than
+// free-floating prose that could confuse a parser.
+func summarizeForReprompt(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return `""`
+	}
+	const limit = 80
+	if len([]rune(s)) > limit {
+		runes := []rune(s)
+		s = string(runes[:limit]) + "…"
+	}
+	return fmt.Sprintf("%q", s)
+}
+
 func classifyProviderFailure(err error) string {
 	switch {
 	case llm.IsProviderTimeout(err):

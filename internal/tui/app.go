@@ -985,6 +985,8 @@ func (m *model) handleCommand(line string) string {
 	switch fields[0] {
 	case "/help":
 		return m.helpText()
+	case "/init":
+		return m.handleInitCommand(fields)
 	case "/quit", "/exit":
 		m.quitting = true
 		return m.theme.Muted.Render("Goodbye.")

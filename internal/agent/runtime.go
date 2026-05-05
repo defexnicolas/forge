@@ -148,6 +148,15 @@ type Runtime struct {
 	LastTokensBudget        int
 	LastModelUsed           string
 	LastParserUsed          string
+	// lastNarrationCancel carries the offending repeated line when the
+	// streaming narration-loop guard cancels a request. Set by the
+	// streaming loop, consumed (and cleared) by the outer turn loop.
+	// Used to (a) skip the empty-response counter for this iteration —
+	// reasoning-only narration cancels leave `accumulated` empty and
+	// would otherwise double-punish the model — and (b) emit a tailored
+	// reprompt that names the offending line instead of the generic
+	// "no tool call" prompt.
+	lastNarrationCancel string
 	// ActiveParserName is the parser selected at model-load time (via
 	// SetChatModel). Cached so the TUI can display it without re-running
 	// ForModel every frame. The per-turn LastParserUsed still tracks which
@@ -1230,6 +1239,32 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 			return
 		}
 
+		// Narration-loop cancellation handoff. The streaming guard sets
+		// r.lastNarrationCancel before returning when it kills a
+		// reasoning-only or text-only loop. We emit a tailored reprompt
+		// that names the offending line (a generic "use a tool" nudge
+		// is too vague when the model just got cut off) and SHORT-CIRCUIT
+		// the empty-response counter — reasoning-channel cancellations
+		// produce no `accumulated` text and would otherwise be
+		// double-punished as both a narration loop AND an empty turn.
+		// Counts as a no_progress step so repeated narration cancels
+		// still hit the cap and stop the agent gracefully.
+		if r.lastNarrationCancel != "" {
+			loopLine := r.lastNarrationCancel
+			r.lastNarrationCancel = ""
+			noProgressSteps++
+			if noProgressSteps >= r.maxNoProgressSteps() {
+				events <- Event{Type: EventError, Error: fmt.Errorf("stopped: %d narration-loop cancellations in a row — the model is stuck looping in reasoning. Switch back to plan mode and split the work into smaller, more concrete tasks", noProgressSteps)}
+				events <- Event{Type: EventDone}
+				return
+			}
+			messages = append(messages,
+				llm.Message{Role: "assistant", Content: accumulated},
+				llm.Message{Role: "user", Content: "Your last response was cancelled because you kept repeating the line " + summarizeForReprompt(loopLine) + " in your reasoning without producing a tool_call. STOP analysing. Pick the simplest pending task. If a task is too vague, call task_update with notes describing what you actually need to do, then call edit_file/write_file/apply_patch on the FIRST file you would touch — even a partial commit is better than another reasoning loop. If you genuinely cannot proceed, call ask_user with a single concrete question. Return exactly ONE tool call now, no prose."},
+			)
+			continue
+		}
+
 		// Handle empty responses from local models.
 		if strings.TrimSpace(accumulated) == "" && len(toolCalls) == 0 {
 			emptyResponses++
@@ -1626,11 +1661,15 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 
 // isMutatingToolCall returns true when the tool produces a real side effect
 // (file edit, command run, plan/todo write, patch apply). Used by the
-// no-progress stall guard in build mode.
+// no-progress stall guard in build mode. task_create counts here too —
+// in build mode the executor uses it to externalize newly-discovered
+// work so it doesn't have to keep the discovery in prose only and risk
+// re-rediscovering it on the next read loop.
 func isMutatingToolCall(name string) bool {
 	switch name {
 	case "write_file", "edit_file", "apply_patch", "run_command",
-		"plan_write", "todo_write", "task_update", "task_add", "task_complete":
+		"plan_write", "todo_write", "task_update", "task_create",
+		"task_add", "task_complete":
 		return true
 	}
 	return false
@@ -1656,7 +1695,7 @@ func shouldRefundToolStep(name string) bool {
 // an aimless-exploration stall.
 func isReadOnlyExploration(name string) bool {
 	switch name {
-	case "read_file", "list_files", "search_text", "search_files", "git_diff":
+	case "read_file", "read_files", "list_files", "search_text", "search_files", "git_diff":
 		return true
 	}
 	return false
@@ -2041,6 +2080,7 @@ func (r *Runtime) streamResponseWithInput(ctx context.Context, provider llm.Prov
 				cancel()
 				for range stream {
 				}
+				r.lastNarrationCancel = line
 				events <- Event{Type: EventError, Error: fmt.Errorf("narration loop detected in reasoning (line %q repeated %d times); cancelled stream and re-prompting for a tool_call", line, count)}
 				return text.String(), toolCalls, usage, nil
 			}
@@ -2074,6 +2114,7 @@ func (r *Runtime) streamResponseWithInput(ctx context.Context, provider llm.Prov
 					cancel()
 					for range stream {
 					}
+					r.lastNarrationCancel = line
 					events <- Event{Type: EventError, Error: fmt.Errorf("narration loop detected (line %q repeated %d times); cancelled stream and re-prompting for a tool_call", line, count)}
 					return text.String(), toolCalls, usage, nil
 				}

@@ -999,7 +999,9 @@ func compactResultForPrompt(result tools.Result) tools.Result {
 }
 
 func isReadFileResult(result tools.Result) bool {
-	if strings.EqualFold(strings.TrimSpace(result.Title), "Read file") {
+	title := strings.EqualFold(strings.TrimSpace(result.Title), "Read file") ||
+		strings.EqualFold(strings.TrimSpace(result.Title), "Read files")
+	if title {
 		return true
 	}
 	if len(result.Content) == 1 && strings.TrimSpace(result.Content[0].Path) != "" && len(result.ChangedFiles) == 0 {

@@ -9,10 +9,10 @@ type todoWriteTool struct{}
 
 func (todoWriteTool) Name() string { return "todo_write" }
 func (todoWriteTool) Description() string {
-	return "Replace the visible executable checklist. Use plan_write for the full plan document."
+	return "Replace the visible executable checklist. Use plan_write for the full plan document. Each item MUST be a concrete, verifiable action — name the target file or component, the specific change, and how you'll know it worked. Vague items like 'Fix all combat.log' or 'Review remaining file' are forbidden: count first (search_text or read_file), then create N specific items, OR one item that names the count and file explicitly. Good: 'Replace the 12 combat.log calls in src/Game.tsx with console.log; verify with grep'. Bad: 'Fix combat.log calls'."
 }
 func (todoWriteTool) Schema() json.RawMessage {
-	return json.RawMessage(`{"type":"object","required":["items"],"properties":{"items":{"oneOf":[{"type":"array","items":{"type":"string"}},{"type":"array","items":{"type":"object","required":["title"],"properties":{"title":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed"]},"notes":{"type":"string"}}}}],"description":"Task titles. Prefer simple strings: [\"step 1\",\"step 2\"]. Objects also accepted: [{\"title\":\"step 1\",\"status\":\"completed\"}]."}}}`)
+	return json.RawMessage(`{"type":"object","required":["items"],"properties":{"items":{"oneOf":[{"type":"array","items":{"type":"string"}},{"type":"array","items":{"type":"object","required":["title"],"properties":{"title":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed"]},"notes":{"type":"string"}}}}],"description":"Task titles. Each title must reference a concrete file/component AND a verifiable acceptance condition. Prefer simple strings: [\"Replace 12 combat.log calls in src/Game.tsx with console.log; verify with grep\",\"Fix entry.itemId.includes() in src/loot.ts:34 by checking string equality instead\"]. Objects also accepted: [{\"title\":\"...\",\"status\":\"completed\"}]."}}}`)
 }
 func (todoWriteTool) Permission(Context, json.RawMessage) PermissionRequest {
 	return PermissionRequest{Decision: PermissionAllow}
@@ -39,10 +39,10 @@ type taskCreateTool struct{}
 
 func (taskCreateTool) Name() string { return "task_create" }
 func (taskCreateTool) Description() string {
-	return "Create a new task in the session plan. Use this to add individual items without replacing the whole plan."
+	return "Create a new task in the session plan. Use this to add individual items without replacing the whole plan. The title MUST name (a) the target file or component, (b) the specific change, and (c) the verification step. Vague titles like 'Fix all X' or 'Review remaining' are forbidden — count occurrences first, then create one task per occurrence (or one task that explicitly states the count + file + verification). Good: 'Replace setEmpty() with reset() in src/initEmp.ts; verify with grep -c setEmpty src/'. Bad: 'Fix initEmp'."
 }
 func (taskCreateTool) Schema() json.RawMessage {
-	return json.RawMessage(`{"type":"object","required":["title"],"properties":{"title":{"type":"string","description":"Task title"},"notes":{"type":"string","description":"Optional notes / acceptance criteria"}}}`)
+	return json.RawMessage(`{"type":"object","required":["title"],"properties":{"title":{"type":"string","description":"Concrete, verifiable task title. MUST include target file/component + specific change + how you'll verify (build, test, grep, etc)."},"notes":{"type":"string","description":"Optional notes / acceptance criteria. Use this for line numbers, expected diff size, or which test to re-run."}}}`)
 }
 func (taskCreateTool) Permission(Context, json.RawMessage) PermissionRequest {
 	return PermissionRequest{Decision: PermissionAllow}

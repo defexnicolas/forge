@@ -22,6 +22,7 @@ func NewSprintPolicy() SprintPolicy {
 	allowed := map[string]bool{}
 	for _, name := range []string{
 		"read_file",
+		"read_files",
 		"list_files",
 		"search_text",
 		"search_files",
@@ -62,7 +63,7 @@ func NewReadOnlyPolicy() SprintPolicy {
 func NewPlanPolicy() SprintPolicy {
 	allowed := map[string]bool{}
 	for _, name := range []string{
-		"read_file", "list_files", "search_text", "search_files",
+		"read_file", "read_files", "list_files", "search_text", "search_files",
 		"git_status", "git_diff",
 		"plan_write", "plan_get",
 		"todo_write",
@@ -77,7 +78,7 @@ func NewPlanPolicy() SprintPolicy {
 func NewChatPolicy() SprintPolicy {
 	allowed := map[string]bool{}
 	for _, name := range []string{
-		"read_file", "list_files", "search_text", "search_files",
+		"read_file", "read_files", "list_files", "search_text", "search_files",
 		"git_status", "git_diff",
 		"ask_user",
 	} {
@@ -87,15 +88,22 @@ func NewChatPolicy() SprintPolicy {
 }
 
 // NewBuildPolicy returns the policy for the executor mode: read tools allowed
-// outright, mutating tools require per-call approval, and planning/dispatch
-// tools are denied so the executor cannot re-plan or recurse into subagents.
+// outright, mutating tools require per-call approval, and planning tools that
+// would let the executor REWRITE the plan (plan_write, todo_write) stay
+// denied so the executor can't loop on re-plans. task_create IS allowed
+// because the model often discovers new sub-work mid-implementation
+// ("oh, this also depends on Z") and without an externalising tool it
+// carries the discovery in prose, forgets, and re-rediscovers — a real
+// driver of the read-then-narrate loops we've been chasing. Letting the
+// executor add a task is strictly additive: it never replaces what the
+// planner produced.
 func NewBuildPolicy() SprintPolicy {
 	allowed := map[string]bool{}
 	for _, name := range []string{
-		"read_file", "list_files", "search_text", "search_files",
+		"read_file", "read_files", "list_files", "search_text", "search_files",
 		"git_status", "git_diff",
 		"plan_get",
-		"task_list", "task_get", "task_update",
+		"task_create", "task_list", "task_get", "task_update",
 		"ask_user",
 	} {
 		allowed[name] = true
@@ -120,7 +128,7 @@ func WithInlineEdits(p SprintPolicy) SprintPolicy {
 func NewExplorePolicy() SprintPolicy {
 	allowed := map[string]bool{}
 	for _, name := range []string{
-		"read_file", "list_files", "search_text", "search_files",
+		"read_file", "read_files", "list_files", "search_text", "search_files",
 		"git_status", "git_diff",
 		// Read-only fan-out is consistent with explore's purpose: the
 		// subagents are themselves bound to read-only tools, so letting
@@ -136,7 +144,7 @@ func NewExplorePolicy() SprintPolicy {
 func NewReviewPolicy() SprintPolicy {
 	allowed := map[string]bool{}
 	for _, name := range []string{
-		"read_file", "list_files", "search_text", "search_files",
+		"read_file", "read_files", "list_files", "search_text", "search_files",
 		"git_status", "git_diff",
 		"plan_write", "plan_get",
 		"todo_write", "spawn_subagent", "spawn_subagents",

@@ -2,6 +2,7 @@ package tools
 
 func RegisterBuiltins(registry *Registry) {
 	registry.Register(readFileTool{}, "Read")
+	registry.Register(readFilesTool{}, "ReadFiles")
 	registry.Register(listFilesTool{}, "LS")
 	registry.Register(searchTextTool{}, "Grep")
 	registry.Register(searchFilesTool{}, "Glob")
