@@ -382,6 +382,113 @@ request_timeout_seconds = 1800
 	}
 }
 
+// TestLoadWithGlobalMigratesLegacyScaffoldRuntime verifies that the
+// pre-bump scaffold fingerprint (max_consecutive_read_only=6 AND
+// max_builder_read_loops=4 simultaneously) is treated as not-set so
+// global values flow through.
+func TestLoadWithGlobalMigratesLegacyScaffoldRuntime(t *testing.T) {
+	t.Setenv("FORGE_GLOBAL_HOME", t.TempDir())
+	cwd := t.TempDir()
+	writeWorkspaceConfig(t, cwd, `
+[runtime]
+max_consecutive_read_only = 6
+max_builder_read_loops = 4
+`)
+	readOnly := 25
+	builderLoops := 30
+	writeGlobal(t, globalconfig.GlobalConfig{
+		Runtime: &globalconfig.RuntimeDefaults{
+			MaxConsecutiveReadOnly: &readOnly,
+			MaxBuilderReadLoops:    &builderLoops,
+		},
+	})
+
+	cfg, err := LoadWithGlobal(cwd)
+	if err != nil {
+		t.Fatalf("LoadWithGlobal: %v", err)
+	}
+	if cfg.Runtime.MaxConsecutiveReadOnly != 25 {
+		t.Errorf("legacy scaffold read-only should yield to global, got %d", cfg.Runtime.MaxConsecutiveReadOnly)
+	}
+	if cfg.Runtime.MaxBuilderReadLoops != 30 {
+		t.Errorf("legacy scaffold builder loops should yield to global, got %d", cfg.Runtime.MaxBuilderReadLoops)
+	}
+}
+
+// TestLoadWithGlobalMigrationFallbackToDefaults verifies that when no
+// global runtime block is defined, the migration still erases the
+// legacy scaffold and the built-in defaults take effect.
+func TestLoadWithGlobalMigrationFallbackToDefaults(t *testing.T) {
+	t.Setenv("FORGE_GLOBAL_HOME", t.TempDir())
+	cwd := t.TempDir()
+	writeWorkspaceConfig(t, cwd, `
+[runtime]
+max_consecutive_read_only = 6
+max_builder_read_loops = 4
+`)
+	writeGlobal(t, globalconfig.GlobalConfig{})
+
+	cfg, err := LoadWithGlobal(cwd)
+	if err != nil {
+		t.Fatalf("LoadWithGlobal: %v", err)
+	}
+	defaults := Defaults().Runtime
+	if cfg.Runtime.MaxConsecutiveReadOnly != defaults.MaxConsecutiveReadOnly {
+		t.Errorf("legacy read-only without global should fall back to default %d, got %d", defaults.MaxConsecutiveReadOnly, cfg.Runtime.MaxConsecutiveReadOnly)
+	}
+	if cfg.Runtime.MaxBuilderReadLoops != defaults.MaxBuilderReadLoops {
+		t.Errorf("legacy builder loops without global should fall back to default %d, got %d", defaults.MaxBuilderReadLoops, cfg.Runtime.MaxBuilderReadLoops)
+	}
+}
+
+// TestLoadWithGlobalMigrationPreservesPartialOverride verifies the
+// migration only fires when BOTH legacy values match. A user who set
+// just one of them deliberately should keep that override.
+func TestLoadWithGlobalMigrationPreservesPartialOverride(t *testing.T) {
+	t.Setenv("FORGE_GLOBAL_HOME", t.TempDir())
+	cwd := t.TempDir()
+	// Only max_consecutive_read_only matches the legacy value;
+	// max_builder_read_loops is something else.
+	writeWorkspaceConfig(t, cwd, `
+[runtime]
+max_consecutive_read_only = 6
+max_builder_read_loops = 20
+`)
+	readOnly := 25
+	writeGlobal(t, globalconfig.GlobalConfig{
+		Runtime: &globalconfig.RuntimeDefaults{
+			MaxConsecutiveReadOnly: &readOnly,
+		},
+	})
+
+	cfg, err := LoadWithGlobal(cwd)
+	if err != nil {
+		t.Fatalf("LoadWithGlobal: %v", err)
+	}
+	if cfg.Runtime.MaxConsecutiveReadOnly != 6 {
+		t.Errorf("partial-match should preserve workspace override, got %d", cfg.Runtime.MaxConsecutiveReadOnly)
+	}
+	if cfg.Runtime.MaxBuilderReadLoops != 20 {
+		t.Errorf("non-legacy builder loops should be preserved, got %d", cfg.Runtime.MaxBuilderReadLoops)
+	}
+}
+
+// TestNormalizePreservesNegativeReadOnlyOptOut verifies that a negative
+// max_consecutive_read_only / max_builder_read_loops survives Normalize
+// so the runtime can interpret it as "unlimited".
+func TestNormalizePreservesNegativeReadOnlyOptOut(t *testing.T) {
+	cfg := Defaults()
+	cfg.Runtime.MaxConsecutiveReadOnly = -1
+	cfg.Runtime.MaxBuilderReadLoops = -1
+	Normalize(&cfg)
+	if cfg.Runtime.MaxConsecutiveReadOnly != -1 {
+		t.Errorf("MaxConsecutiveReadOnly = %d, want -1", cfg.Runtime.MaxConsecutiveReadOnly)
+	}
+	if cfg.Runtime.MaxBuilderReadLoops != -1 {
+		t.Errorf("MaxBuilderReadLoops = %d, want -1", cfg.Runtime.MaxBuilderReadLoops)
+	}
+}
+
 func TestLoadWithGlobalRespectsWorkspaceOverride(t *testing.T) {
 	t.Setenv("FORGE_GLOBAL_HOME", t.TempDir())
 	cwd := t.TempDir()

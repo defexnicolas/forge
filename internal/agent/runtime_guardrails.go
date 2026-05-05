@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -137,7 +138,11 @@ func (r *Runtime) maxSameToolFailures() int {
 }
 
 func (r *Runtime) maxConsecutiveReadOnly() int {
-	if v := r.Config.Runtime.MaxConsecutiveReadOnly; v > 0 {
+	v := r.Config.Runtime.MaxConsecutiveReadOnly
+	if v < 0 {
+		return math.MaxInt32
+	}
+	if v > 0 {
 		return v
 	}
 	return 6
@@ -151,7 +156,15 @@ func (r *Runtime) maxPlannerSummarySteps() int {
 }
 
 func (r *Runtime) maxBuilderReadLoops() int {
-	if v := r.Config.Runtime.MaxBuilderReadLoops; v > 0 {
+	v := r.Config.Runtime.MaxBuilderReadLoops
+	// Negative value = explicitly opt out of the guard. Useful when the
+	// user knows their model needs to read deeply (large codebase
+	// exploration) and would rather the runtime never preempt with a
+	// "too many reads" error. Caller still hits MaxSteps eventually.
+	if v < 0 {
+		return math.MaxInt32
+	}
+	if v > 0 {
 		// Floor at 8 — anything lower fires before the agent finishes
 		// reading the relevant files for even a small task.
 		if v < 8 {

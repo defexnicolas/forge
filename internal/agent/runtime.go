@@ -1956,12 +1956,45 @@ func (r *Runtime) streamResponseWithInput(ctx context.Context, provider llm.Prov
 	const toolCallTag = "<tool_call>"
 	searchFrom := 0
 
+	// inReasoning tracks whether the most recent stream chunk was a
+	// reasoning_content delta (Qwen, GPT-OSS, etc. emit reasoning over a
+	// dedicated SSE field separate from content). The TUI renders thinking
+	// when it sees literal <think>...</think> in the assistant deltas, so
+	// we synthesize those tags around the reasoning stream — the model
+	// never emits the tags itself but the user-facing semantics are the
+	// same. Reasoning text is intentionally NOT appended to `text` so the
+	// tool-call scanner and final assistant text stay clean.
+	inReasoning := false
+	openReasoning := func() {
+		if !inReasoning {
+			inReasoning = true
+			events <- Event{Type: EventAssistantDelta, Text: "<think>"}
+		}
+	}
+	closeReasoning := func() {
+		if inReasoning {
+			inReasoning = false
+			events <- Event{Type: EventAssistantDelta, Text: "</think>"}
+		}
+	}
+
 	for event := range stream {
 		switch event.Type {
+		case "reasoning":
+			if firstTokenAt.IsZero() {
+				firstTokenAt = time.Now()
+			}
+			if event.Text == "" {
+				continue
+			}
+			openReasoning()
+			events <- Event{Type: EventAssistantDelta, Text: event.Text}
+			emitProgress("streaming", false)
 		case "text":
 			if firstTokenAt.IsZero() {
 				firstTokenAt = time.Now()
 			}
+			closeReasoning()
 			text.WriteString(event.Text)
 			emitProgress("streaming", false)
 			// Once we detect <tool_call> in the accumulated text, stop streaming to UI.
@@ -1977,17 +2010,22 @@ func (r *Runtime) streamResponseWithInput(ctx context.Context, provider llm.Prov
 				searchFrom = len(accumulated)
 			}
 		case "tool_calls":
+			closeReasoning()
 			toolCalls = event.ToolCalls
 			emitProgress("tool_call", false)
 		case "usage":
 			usage = event.Usage
 			emitProgress("streaming", false)
 		case "error":
+			closeReasoning()
 			return text.String(), toolCalls, usage, event.Error
 		case "done":
 			// Stream finished.
 		}
 	}
+	// Stream may have ended mid-reasoning (no text follow-up). Close the
+	// synthesized tag so the UI's <think> filter sees a balanced block.
+	closeReasoning()
 	// Capture the final tk/s for this stream so the TUI footer and the
 	// per-turn log line can show it alongside timing + token counts.
 	if !firstTokenAt.IsZero() {

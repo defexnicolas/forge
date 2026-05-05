@@ -141,6 +141,28 @@ func (m *model) handleFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 		}
 	}
 
+	if m.activeForm == formProfile {
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			var cmd tea.Cmd
+			m.profileForm, cmd = m.profileForm.Update(msg)
+			cmds = append(cmds, cmd)
+			if m.profileForm.done {
+				m.activeForm = formNone
+				if !m.profileForm.canceled && m.profileForm.chosen != "" {
+					line := m.setPermissionProfile(m.profileForm.chosen)
+					if line != "" {
+						m.history = append(m.history, line)
+					}
+				}
+				m.refresh()
+			}
+			return m, tea.Batch(cmds...), true
+		default:
+			return m, nil, true
+		}
+	}
+
 	if m.activeForm == formModel {
 		var cmd tea.Cmd
 		m.modelForm, cmd = m.modelForm.Update(msg)

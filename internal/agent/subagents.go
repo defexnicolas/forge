@@ -466,6 +466,10 @@ func (r *Runtime) streamSubagentResponse(ctx context.Context, provider llm.Provi
 		switch event.Type {
 		case "text":
 			text.WriteString(event.Text)
+		case "reasoning":
+			// Reasoning_content from the provider is for thinking; subagents
+			// don't surface it to the user and it must not pollute the
+			// tool-call scan or the final returned text. Drain and drop.
 		case "tool_calls":
 			toolCalls = event.ToolCalls
 		case "error":

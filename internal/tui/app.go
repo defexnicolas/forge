@@ -79,6 +79,7 @@ const (
 	formApproval
 	formAskUser
 	formConfirmPlanReset
+	formProfile
 )
 
 var lastAgentResponse string
@@ -118,6 +119,7 @@ type model struct {
 	yarnMenuForm           yarnMenuForm
 	approvalForm           approvalForm
 	askUserForm            askUserForm
+	profileForm            profileForm
 	currentAssistant       *strings.Builder
 	modelProgress          *agent.ModelProgress
 	pendingExecuteLine     string
@@ -260,7 +262,7 @@ func newModel(options Options) model {
 		viewport:             vp,
 		width:                100,
 		height:               33,
-		thinkEnabled:         true,
+		thinkEnabled:         false,
 		theme:                theme,
 		currentAssistant:     &strings.Builder{},
 		streamingRaw:         &strings.Builder{},
@@ -550,6 +552,9 @@ func (m model) View() string {
 	if m.activeForm == formTheme {
 		return m.viewport.View() + "\n" + m.themeForm.View() + "\n\n" + statusLine
 	}
+	if m.activeForm == formProfile {
+		return m.viewport.View() + "\n" + m.profileForm.View() + "\n\n" + statusLine
+	}
 	if m.activeForm == formModel {
 		return m.viewport.View() + "\n" + m.modelForm.View() + "\n\n" + statusLine
 	}
@@ -763,9 +768,9 @@ func (m model) statusLineView() string {
 		gitInfo = t.Muted.Render("git:clean")
 	}
 
-	thinkLabel := t.Muted.Render("Think:OFF")
+	thinkLabel := t.Muted.Render("Think:PEEK")
 	if m.thinkEnabled {
-		thinkLabel = t.StatusActive.Render("Think:ON")
+		thinkLabel = t.StatusActive.Render("Think:FULL")
 	}
 	modelMultiLabel := t.Muted.Render("Multi:OFF")
 	if m.options.Config.ModelLoading.Enabled {
@@ -1041,14 +1046,17 @@ func (m *model) handleCommand(line string) string {
 		//   /permissions set <name>   /profile set <name>
 		//   /permissions <name>       /profile <name>
 		// The bare `/profile <name>` form skips the "set" verb because the
-		// /profile alias is meant to be the fast path.
+		// /profile alias is meant to be the fast path. With no args the
+		// command opens the interactive picker.
 		if len(fields) >= 3 && fields[1] == "set" {
 			return m.setPermissionProfile(fields[2])
 		}
 		if len(fields) >= 2 && fields[1] != "set" {
 			return m.setPermissionProfile(fields[1])
 		}
-		return m.describePermissions()
+		m.activeForm = formProfile
+		m.profileForm = newProfileForm(commandProfileName(m.agentRuntime.Commands), m.theme)
+		return "Opening permission profile selector..."
 	case "/session":
 		return m.describeSession()
 	case "/sessions":
@@ -1662,6 +1670,8 @@ func (m model) activeFormView() string {
 		return m.yarnSettingsForm.View()
 	case formYarnMenu:
 		return m.yarnMenuForm.View()
+	case formProfile:
+		return m.profileForm.View()
 	default:
 		return ""
 	}

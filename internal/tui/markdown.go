@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 
@@ -145,18 +146,25 @@ func markdownStyleFor(themeName string) string {
 	}
 }
 
+// thinkingPeekChars caps the rolling preview when thinking is collapsed.
+// Tuned so the peek fits on one line at most realistic terminal widths
+// (~120 cols minus the 4-space indent) while still surfacing enough of
+// the reasoning to be informative.
+const thinkingPeekChars = 100
+
 // formatStreamingText renders the raw streamed text for the viewport, applying
 // the <think> filter controlled by thinkEnabled. Unlike formatAssistantBlock
 // (which runs once at turn end through Glamour), this runs on every flush
 // tick — so it stays cheap and avoids ANSI-preserving markdown reflow.
 //
-// When thinkEnabled is true: thinking spans are shown inline with muted
-// italic styling and explicit markers so the reasoning is legible but
-// visually separated from the final answer.
+// When thinkEnabled is true: thinking spans are shown inline in full with
+// muted italic styling so the reasoning is legible but visually separated
+// from the final answer.
 //
-// When thinkEnabled is false: completed <think>...</think> spans collapse
-// to a single "[thinking elided]" placeholder; an open <think> without
-// a close (still streaming) becomes "[thinking…]".
+// When thinkEnabled is false: a rolling "peek" of the last ~100 chars of
+// the in-progress reasoning is shown, plus a compact "[thinking, Nc]"
+// marker for completed blocks. The peek is what tells the user what the
+// model is reasoning about right now without flooding the viewport.
 func formatStreamingText(raw string, thinkEnabled bool, theme Theme) string {
 	const open = "<think>"
 	const close = "</think>"
@@ -177,10 +185,11 @@ func formatStreamingText(raw string, thinkEnabled bool, theme Theme) string {
 		end := strings.Index(rest, close)
 		if end < 0 {
 			// Still mid-stream inside <think> — no closing tag yet.
+			thinking := strings.TrimSpace(rest)
 			if thinkEnabled {
-				b.WriteString(theme.Muted.Italic(true).Render("[ thinking: " + strings.TrimSpace(rest) + " ]"))
+				b.WriteString(theme.Muted.Italic(true).Render("[ thinking: " + thinking + " ]"))
 			} else {
-				b.WriteString(theme.Muted.Render("[thinking...]"))
+				b.WriteString(theme.Muted.Italic(true).Render("[ thinking ⋯ " + tailRunes(thinking, thinkingPeekChars) + " ]"))
 			}
 			return b.String()
 		}
@@ -188,11 +197,22 @@ func formatStreamingText(raw string, thinkEnabled bool, theme Theme) string {
 		if thinkEnabled {
 			b.WriteString(theme.Muted.Italic(true).Render("[ thinking: " + thinking + " ]"))
 		} else {
-			b.WriteString(theme.Muted.Render("[thinking elided]"))
+			b.WriteString(theme.Muted.Render(fmt.Sprintf("[thinking, %dc — Ctrl+T to expand]", len([]rune(thinking)))))
 		}
 		remaining = rest[end+len(close):]
 	}
 	return b.String()
+}
+
+// tailRunes returns the last n runes of s (or all of s if shorter), with a
+// leading "…" when truncation happened. Operating on runes preserves
+// multi-byte UTF-8 chars when the model emits non-ASCII reasoning.
+func tailRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return "…" + string(r[len(r)-n:])
 }
 
 func abs(x int) int {

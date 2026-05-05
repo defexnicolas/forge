@@ -177,18 +177,6 @@ max_nodes = 6
 max_file_bytes = 8000
 history_events = 4
 
-[runtime]
-request_timeout_seconds = 45
-subagent_timeout_seconds = 90
-task_timeout_seconds = 180
-max_no_progress_steps = 3
-max_empty_responses = 2
-max_same_tool_failures = 2
-max_consecutive_read_only = 6
-max_planner_summary_steps = 2
-max_builder_read_loops = 4
-retry_on_provider_timeout = false
-
 [claw]
 enabled = false
 autostart = false

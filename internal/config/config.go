@@ -308,6 +308,7 @@ func LoadWithGlobal(cwd string) (Config, error) {
 		return cfg, err
 	}
 	keys := loadWorkspaceKeys(cwd)
+	migrateLegacyScaffoldRuntime(&cfg, keys)
 	g, gerr := globalconfig.Load()
 	if gerr != nil {
 		// Surface the error but still hand back the workspace-only config so
@@ -360,6 +361,50 @@ func collectTOMLKeys(prefix string, m map[string]any, out map[string]bool) {
 			collectTOMLKeys(full, sub, out)
 		}
 	}
+}
+
+// migrateLegacyScaffoldRuntime erases the fingerprint of the pre-bump
+// init.go scaffold from a freshly loaded workspace config so global
+// defaults can flow through.
+//
+// Background: an older scaffold wrote max_consecutive_read_only = 6 and
+// max_builder_read_loops = 4 into every new workspace. After Defaults()
+// were bumped to 10 and 12, those scaffolded values stopped matching the
+// built-in defaults — so applyRuntimeDefaults' "value still equals default"
+// escape clause stopped firing for them, and the global was permanently
+// shadowed. The other 8 keys the old scaffold wrote already match the
+// current defaults, so they don't need migrating; only the two divergent
+// ones do.
+//
+// We require BOTH divergent values to match the old scaffold simultaneously
+// (6 AND 4) before treating them as leftover scaffold. The conjunction
+// guards against a user who legitimately wants one of those numbers — a
+// dual-coincidence is overwhelmingly likely to be a stale scaffold, since
+// 4 is below the runtime floor of 8 and meaningless in isolation anyway.
+//
+// Mutates `keys` so applyRuntimeDefaults sees the keys as unset; resets
+// the in-memory values to Defaults() so behaviour is correct even when
+// the global doesn't define a runtime block. The on-disk file is left
+// untouched — the next PersistWorkspaceConfig() call will naturally drop
+// the now-redundant keys.
+func migrateLegacyScaffoldRuntime(cfg *Config, keys map[string]bool) {
+	const legacyReadOnly = 6
+	const legacyBuilderLoops = 4
+
+	if !keys["runtime.max_consecutive_read_only"] || !keys["runtime.max_builder_read_loops"] {
+		return
+	}
+	if cfg.Runtime.MaxConsecutiveReadOnly != legacyReadOnly {
+		return
+	}
+	if cfg.Runtime.MaxBuilderReadLoops != legacyBuilderLoops {
+		return
+	}
+	defaults := Defaults().Runtime
+	cfg.Runtime.MaxConsecutiveReadOnly = defaults.MaxConsecutiveReadOnly
+	cfg.Runtime.MaxBuilderReadLoops = defaults.MaxBuilderReadLoops
+	delete(keys, "runtime.max_consecutive_read_only")
+	delete(keys, "runtime.max_builder_read_loops")
 }
 
 // applyGlobalDefaults overlays a globalconfig.GlobalConfig onto an in-place
@@ -932,13 +977,15 @@ func Normalize(cfg *Config) {
 	if cfg.Runtime.MaxSameToolFailures <= 0 {
 		cfg.Runtime.MaxSameToolFailures = defaults.Runtime.MaxSameToolFailures
 	}
-	if cfg.Runtime.MaxConsecutiveReadOnly <= 0 {
+	// Negative is reserved as the "unlimited" opt-out sentinel; only
+	// coerce literal zero (the unset default) back to the built-in.
+	if cfg.Runtime.MaxConsecutiveReadOnly == 0 {
 		cfg.Runtime.MaxConsecutiveReadOnly = defaults.Runtime.MaxConsecutiveReadOnly
 	}
 	if cfg.Runtime.MaxPlannerSummarySteps <= 0 {
 		cfg.Runtime.MaxPlannerSummarySteps = defaults.Runtime.MaxPlannerSummarySteps
 	}
-	if cfg.Runtime.MaxBuilderReadLoops <= 0 {
+	if cfg.Runtime.MaxBuilderReadLoops == 0 {
 		cfg.Runtime.MaxBuilderReadLoops = defaults.Runtime.MaxBuilderReadLoops
 	}
 	if cfg.Claw.HeartbeatIntervalSeconds <= 0 {
