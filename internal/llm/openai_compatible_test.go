@@ -49,6 +49,45 @@ func TestBuildChatPayloadIncludesTemperatureWhenExplicit(t *testing.T) {
 	}
 }
 
+func TestBuildChatPayloadOmitsToolChoiceWithoutTools(t *testing.T) {
+	payload := buildChatPayload(ChatRequest{
+		Model:      "local-model",
+		Messages:   []Message{{Role: "user", Content: "hi"}},
+		ToolChoice: "required",
+	}, false)
+	// tool_choice is only meaningful when tools are present — sending
+	// it without tools is invalid for OpenAI-compatible endpoints, so
+	// the builder strips it.
+	if _, ok := payload["tool_choice"]; ok {
+		t.Fatalf("tool_choice must be omitted when no tools are advertised: %#v", payload)
+	}
+}
+
+func TestBuildChatPayloadIncludesToolChoiceWithTools(t *testing.T) {
+	tools := []ToolDef{{Type: "function", Function: FunctionDef{Name: "whatsapp_send"}}}
+	choice := map[string]any{
+		"type":     "function",
+		"function": map[string]string{"name": "whatsapp_send"},
+	}
+	payload := buildChatPayload(ChatRequest{
+		Model:      "local-model",
+		Messages:   []Message{{Role: "user", Content: "hi"}},
+		Tools:      tools,
+		ToolChoice: choice,
+	}, false)
+	got, ok := payload["tool_choice"]
+	if !ok {
+		t.Fatalf("tool_choice missing from payload: %#v", payload)
+	}
+	gotMap, ok := got.(map[string]any)
+	if !ok {
+		t.Fatalf("tool_choice = %#v, want map", got)
+	}
+	if gotMap["type"] != "function" {
+		t.Fatalf("tool_choice type = %#v, want 'function'", gotMap["type"])
+	}
+}
+
 // TestStreamWithIdleFiresWhenProviderGoesSilent simulates a backend that
 // emits a first chunk and then stalls. With idle=200ms, the watchdog must
 // cancel the request and surface the error as ErrIdleTimeout (so the runtime

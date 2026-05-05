@@ -1956,6 +1956,52 @@ func (r *Runtime) streamResponseWithInput(ctx context.Context, provider llm.Prov
 	const toolCallTag = "<tool_call>"
 	searchFrom := 0
 
+	// Narration-loop guard. Small/medium local models occasionally
+	// degenerate into self-talk loops where they keep emitting "Let me
+	// make this edit" / "OK, I'm going to do it now" / "Alright, let me
+	// start with X" without ever producing a tool_call tag. The per-turn
+	// no_progress guard catches this AFTER the response finishes — by
+	// then the user has already watched 2000+ tokens of useless prose
+	// stream to the viewport. We watch the streamed text for repeated
+	// substantial lines and cancel the request the moment a loop is
+	// confirmed. The outer runtime then sees an empty/short response and
+	// applies its normal "no tool call" reprompt path.
+	//
+	// The guard runs against BOTH the regular text stream and the
+	// reasoning_content stream (Qwen3, GPT-OSS, etc.) — many models do
+	// their narrating inside the dedicated reasoning channel, so a
+	// text-only guard would miss the case entirely. The seen-map is
+	// shared because a single repeated line across any mix of channels
+	// is still loop-shaped behaviour.
+	loopSeen := map[string]int{}
+	loopTextLineStart := 0
+	var loopReasoningBuf strings.Builder
+	loopReasoningLineStart := 0
+	const loopMinLineLen = 15
+	const loopThreshold = 3
+	checkLoopGuard := func(buf string, lineStart *int) (string, int, bool) {
+		for {
+			rest := buf[*lineStart:]
+			nl := strings.IndexByte(rest, '\n')
+			if nl < 0 {
+				return "", 0, false
+			}
+			line := rest[:nl]
+			*lineStart += nl + 1
+			norm := strings.ToLower(strings.TrimSpace(line))
+			if len(norm) < loopMinLineLen {
+				continue
+			}
+			if len(norm) > 100 {
+				norm = norm[:100]
+			}
+			loopSeen[norm]++
+			if loopSeen[norm] >= loopThreshold {
+				return norm, loopSeen[norm], true
+			}
+		}
+	}
+
 	// inReasoning tracks whether the most recent stream chunk was a
 	// reasoning_content delta (Qwen, GPT-OSS, etc. emit reasoning over a
 	// dedicated SSE field separate from content). The TUI renders thinking
@@ -1990,6 +2036,14 @@ func (r *Runtime) streamResponseWithInput(ctx context.Context, provider llm.Prov
 			openReasoning()
 			events <- Event{Type: EventAssistantDelta, Text: event.Text}
 			emitProgress("streaming", false)
+			loopReasoningBuf.WriteString(event.Text)
+			if line, count, hit := checkLoopGuard(loopReasoningBuf.String(), &loopReasoningLineStart); hit {
+				cancel()
+				for range stream {
+				}
+				events <- Event{Type: EventError, Error: fmt.Errorf("narration loop detected in reasoning (line %q repeated %d times); cancelled stream and re-prompting for a tool_call", line, count)}
+				return text.String(), toolCalls, usage, nil
+			}
 		case "text":
 			if firstTokenAt.IsZero() {
 				firstTokenAt = time.Now()
@@ -2008,6 +2062,21 @@ func (r *Runtime) streamResponseWithInput(ctx context.Context, provider llm.Prov
 					events <- Event{Type: EventAssistantDelta, Text: event.Text}
 				}
 				searchFrom = len(accumulated)
+
+				// Narration-loop check on the regular text channel.
+				// Scoped to the pre-tool-call window so legitimate long
+				// final answers (no tool call needed) aren't penalized
+				// after they've structurally committed. On detection we
+				// cancel the SSE, drain the channel, emit a visible
+				// warning, and return without error so the outer
+				// runtime's existing "no tool call" branch reprompts.
+				if line, count, hit := checkLoopGuard(accumulated, &loopTextLineStart); hit {
+					cancel()
+					for range stream {
+					}
+					events <- Event{Type: EventError, Error: fmt.Errorf("narration loop detected (line %q repeated %d times); cancelled stream and re-prompting for a tool_call", line, count)}
+					return text.String(), toolCalls, usage, nil
+				}
 			}
 		case "tool_calls":
 			closeReasoning()

@@ -3,8 +3,11 @@ package tools
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os/exec"
 	"runtime"
+	"strings"
 )
 
 type runCommandTool struct{}
@@ -43,6 +46,40 @@ func (runCommandTool) Run(ctx Context, input json.RawMessage) (Result, error) {
 	if stderr.Len() > 0 {
 		text += "\n" + stderr.String()
 	}
+
+	// A non-zero exit is the model's output to interpret, not a runtime
+	// tool failure. `npm test` with a failing test, `grep` with no match,
+	// `git diff` with pending changes — they all return non-zero and the
+	// model needs to see the result. Surface the exit code in the content
+	// but DO NOT propagate as a Go error: the runtime's loop guard halts
+	// the session after two consecutive tool failures, and "exit status 1"
+	// from a perfectly working `cmd.Run` was tripping it on every other
+	// real-world session.
+	//
+	// Genuine tool failures (binary missing, exec setup error, ctx
+	// cancellation) still propagate. The check order matters: ctx errors
+	// can manifest as ExitError when the spawned process is killed by the
+	// cancellation, so we look at ctx.Err first.
+	if ctxErr := ctx.Context.Err(); ctxErr != nil {
+		return Result{
+			Title:   "Run command",
+			Summary: req.Command,
+			Content: []ContentBlock{{Type: "text", Text: text}},
+		}, ctxErr
+	}
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			suffix := fmt.Sprintf("[exit %d]", exitErr.ExitCode())
+			if text == "" {
+				text = suffix
+			} else {
+				text = strings.TrimRight(text, "\n") + "\n" + suffix
+			}
+			err = nil
+		}
+	}
+
 	return Result{
 		Title:   "Run command",
 		Summary: req.Command,

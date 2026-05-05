@@ -364,6 +364,12 @@ func buildChatPayload(req ChatRequest, stream bool) map[string]any {
 	}
 	if len(req.Tools) > 0 {
 		payload["tools"] = req.Tools
+		// tool_choice is only meaningful when tools are advertised. If a
+		// caller set ToolChoice without sending Tools, ignore it rather
+		// than emit an invalid request body.
+		if req.ToolChoice != nil {
+			payload["tool_choice"] = req.ToolChoice
+		}
 	}
 	if req.Temperature != nil {
 		payload["temperature"] = *req.Temperature

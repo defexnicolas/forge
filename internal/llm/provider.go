@@ -45,6 +45,15 @@ type ChatRequest struct {
 	Messages    []Message `json:"messages"`
 	Tools       []ToolDef `json:"tools,omitempty"`
 	Temperature *float64  `json:"temperature,omitempty"`
+	// ToolChoice is the OpenAI-shaped tool_choice override. Accepts
+	// "none" / "auto" / "required" (as a string) or a specific function
+	// pin like {"type":"function","function":{"name":"whatsapp_send"}}.
+	// Leave nil to let the provider default (auto when tools are
+	// present). Used by the bailout-retry paths that need to FORCE a
+	// specific tool call when the model has been observed inventing
+	// excuses for tools it actually has — every other call site leaves
+	// this nil and behaves exactly as before.
+	ToolChoice any `json:"-"`
 }
 
 type ChatResponse struct {

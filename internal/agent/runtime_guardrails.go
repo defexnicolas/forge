@@ -206,12 +206,34 @@ func classifyProviderFailure(err error) string {
 	}
 }
 
+// isToolFailureSummary detects whether a tool result summary represents a
+// genuine tool failure that should count toward the loop-breaker guard.
+//
+// The previous implementation matched the substrings "error", "failed",
+// "denied" and "not found" anywhere in the (lower-cased) summary. That
+// triggered on legitimate tool output — for instance `run_command`
+// summaries like "npm test failed: exit status 1" (a real test result the
+// model needs to see, NOT a tool failure), or a search summary mentioning
+// "no matches found" — and stopped real-world sessions on the second
+// matching call. We now require a stronger signal: the failure indicator
+// must appear with a colon (the canonical "{tool} failed: {err}" /
+// "error: {err}" / "denied by {policy}" / "{path}: not found" pattern
+// produced by the runtime's tool wrappers) or anchor at the start of the
+// summary. Substrings inside command names or normal output no longer
+// trip the guard.
 func isToolFailureSummary(summary string) bool {
-	summary = strings.ToLower(strings.TrimSpace(summary))
-	return strings.Contains(summary, "not found") ||
-		strings.Contains(summary, "error") ||
-		strings.Contains(summary, "denied") ||
-		strings.Contains(summary, "failed")
+	s := strings.ToLower(strings.TrimSpace(summary))
+	if s == "" {
+		return false
+	}
+	if strings.HasPrefix(s, "error") || strings.HasPrefix(s, "failed") {
+		return true
+	}
+	return strings.Contains(s, "failed: ") ||
+		strings.Contains(s, "error: ") ||
+		strings.Contains(s, "denied by ") ||
+		strings.Contains(s, "not found: ") ||
+		strings.HasSuffix(s, ": not found")
 }
 
 func executeTaskIDFromInput(input json.RawMessage) string {

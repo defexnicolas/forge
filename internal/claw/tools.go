@@ -188,6 +188,19 @@ const clawMaxToolIterations = 4
 // model to synthesize an answer from the tool results gathered so far.
 // That converts the previous "(claw stopped after N rounds)" dead-end
 // into an actual answer the user can read.
+//
+// Two distinct bailout-retry paths run inside the loop:
+//
+//   - looksLikeToolBailout: model refuses outright at the prefix
+//     ("Lo siento, no puedo configurar recordatorios..."). Caught when
+//     resp.ToolCalls is empty on iter 0.
+//   - looksLikePartialBailout: model completes one tool but invents an
+//     excuse for skipping another ("El recordatorio está configurado.
+//     Sin embargo, el mensaje por WhatsApp no se pudo enviar porque el
+//     canal no está registrado..." while whatsapp_send was never even
+//     called). Caught at every iteration when calledTools shows the
+//     model skipped the tool the user clearly asked for. Retries once
+//     per call with a nudge that names the missing tool.
 func runClawChatWithTools(ctx context.Context, provider llm.Provider, modelID string, registry *tools.Registry, msgs []llm.Message, temperature *float64, toolsEnabled bool) (string, error) {
 	if !toolsEnabled {
 		// Plain chat — no tool defs advertised, no loop. The system
@@ -207,6 +220,15 @@ func runClawChatWithTools(ctx context.Context, provider llm.Provider, modelID st
 		return strings.TrimSpace(resp.Content), nil
 	}
 	defs := clawToolDefs(registry)
+	calledTools := map[string]bool{}
+	partialBailoutRetried := false
+	// forceToolName, when non-empty, pins tool_choice to that specific
+	// function for ONE iteration. Cleared after the call so the loop
+	// returns to its normal "auto" behaviour. Used exclusively by the
+	// partial-bailout retry path to make the model unable to fall back
+	// into prose excuses — the provider literally rejects a text-only
+	// completion when tool_choice is pinned.
+	forceToolName := ""
 	for iter := 0; iter < clawMaxToolIterations; iter++ {
 		req := llm.ChatRequest{
 			Model:       modelID,
@@ -215,7 +237,17 @@ func runClawChatWithTools(ctx context.Context, provider llm.Provider, modelID st
 		}
 		if len(defs) > 0 {
 			req.Tools = defs
+			if forceToolName != "" {
+				req.ToolChoice = map[string]any{
+					"type":     "function",
+					"function": map[string]string{"name": forceToolName},
+				}
+				fmt.Fprintf(os.Stderr, "claw forcing tool_choice=%s on retry\n", forceToolName)
+			}
 		}
+		// Single-shot: clear after building the request so the next loop
+		// iteration starts fresh.
+		forceToolName = ""
 		resp, err := provider.Chat(ctx, req)
 		if err != nil {
 			return "", err
@@ -240,6 +272,25 @@ func runClawChatWithTools(ctx context.Context, provider llm.Provider, modelID st
 					continue
 				}
 			}
+			// Partial-bailout: did some tool work but invented an excuse
+			// to skip another action the user clearly asked for.
+			// `calledTools` shows what was actually dispatched this
+			// turn; if the user wanted whatsapp_send and the model's
+			// response says "couldn't send / manually / not registered"
+			// without ever calling whatsapp_send, retry with a nudge
+			// that names the missing tool by hand AND pins
+			// tool_choice to that exact function so the model cannot
+			// fall back to prose. Single-shot: cleared after one use.
+			if !partialBailoutRetried && len(defs) > 0 && looksLikePartialBailout(content) {
+				userMsg := lastUserMessage(msgs)
+				if hint, missingTool := partialBailoutNudgeWithTool(userMsg, calledTools); hint != "" {
+					msgs = append(msgs, llm.Message{Role: "assistant", Content: content})
+					msgs = append(msgs, llm.Message{Role: "user", Content: hint})
+					partialBailoutRetried = true
+					forceToolName = missingTool
+					continue
+				}
+			}
 			return content, nil
 		}
 		// Append the assistant message with tool_calls + each tool result
@@ -250,6 +301,7 @@ func runClawChatWithTools(ctx context.Context, provider llm.Provider, modelID st
 			ToolCalls: resp.ToolCalls,
 		})
 		for _, call := range resp.ToolCalls {
+			calledTools[call.Function.Name] = true
 			msgs = append(msgs, llm.Message{
 				Role:       "tool",
 				ToolCallID: call.ID,
@@ -423,4 +475,70 @@ func containsAny(haystack string, needles []string) bool {
 		}
 	}
 	return false
+}
+
+// partialBailoutPivots are connectives that signal "did one thing,
+// bailing on the next". Combined with a giveUp phrase later in the
+// response, they identify the partial-bailout pattern.
+var partialBailoutPivots = []string{
+	"however", "sin embargo", "pero ", "but ", "no obstante", "aunque ",
+}
+
+// partialBailoutGiveUps are excuses that signal the model declined a
+// tool action it actually had. Curated from observed regressions:
+// "no se pudo enviar porque el canal no está registrado", "you'll have
+// to send it manually", "is not registered in this environment".
+var partialBailoutGiveUps = []string{
+	"could not", "couldn't", "no se pudo", "no pude",
+	"is not registered", "no está registrado", "no esta registrado",
+	"is not connected", "no está conectado", "no esta conectado",
+	"tendrás que", "tendras que", "you'll have to", "you will have to",
+	"manualmente", "manually", "send it manually",
+	"not available in this environment", "no está disponible en este entorno",
+}
+
+// looksLikePartialBailout returns true when the response acknowledges
+// completing some action while declining another with a fabricated
+// "tool not available" excuse. Requires both a pivot connective and a
+// give-up phrase, since either alone produces too many false positives
+// (long answers naturally contain "however" or "no se pudo" without
+// implying the model bailed on a tool).
+func looksLikePartialBailout(reply string) bool {
+	r := strings.ToLower(strings.TrimSpace(reply))
+	if r == "" {
+		return false
+	}
+	if !containsAny(r, partialBailoutPivots) {
+		return false
+	}
+	return containsAny(r, partialBailoutGiveUps)
+}
+
+// partialBailoutNudge returns a forceful retry message tailored to the
+// tool the model skipped. We figure out what the user wanted from
+// `userMsg` (same heuristics as bailoutNudge) and confirm via
+// `calledTools` that the model never actually invoked the tool — a
+// real tool error is the model's job to quote, not ours to second-guess.
+func partialBailoutNudge(userMsg string, calledTools map[string]bool) string {
+	hint, _ := partialBailoutNudgeWithTool(userMsg, calledTools)
+	return hint
+}
+
+// partialBailoutNudgeWithTool is partialBailoutNudge plus the name of
+// the tool the model skipped. The caller pins that name into
+// tool_choice on the retry call so the provider cannot honour another
+// prose-only completion. Returns ("", "") when no actionable bailout
+// pattern is detected.
+func partialBailoutNudgeWithTool(userMsg string, calledTools map[string]bool) (string, string) {
+	u := strings.ToLower(userMsg)
+	if u == "" {
+		return "", ""
+	}
+	hasPhone := containsPhoneNumber(userMsg)
+	hasSendVerb := containsAny(u, []string{"envíale", "envia", "envíalo", "mándale", "manda", "dile", "dígale", "send", "message", "whatsapp", "wpp"})
+
+	if hasPhone && hasSendVerb && !calledTools["whatsapp_send"] {
+		return "STOP. You claimed the WhatsApp message could not be sent or that the channel is not registered, but you NEVER called whatsapp_send in this turn. The tool exists and the channel is paired in this environment. Invoke whatsapp_send NOW with `to` = the phone number from my message (with country-code +) and `body` = the message I asked you to send. If — and ONLY if — the tool actually returns an error, quote that error verbatim instead of inventing one. Do not tell me to send it manually.", "whatsapp_send"
+	}
+	return "", ""
 }

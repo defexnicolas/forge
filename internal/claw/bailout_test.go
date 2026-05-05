@@ -26,6 +26,47 @@ func TestLooksLikeToolBailout(t *testing.T) {
 	}
 }
 
+func TestLooksLikePartialBailout(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want bool
+	}{
+		{"empty", "", false},
+		{"plain answer", "Listo, ya envié tu mensaje.", false},
+		{"the urgp regression — reminder ok, whatsapp invented excuse",
+			"El recordatorio está configurado: te avisaré a la 1:44 a. m. (hora de Bogotá) para que te vayas a dormir. Sin embargo, el mensaje por WhatsApp no se pudo enviar porque el canal no está registrado en este entorno. Tendrás que enviarlo manualmente.",
+			true},
+		{"english variant", "I scheduled the reminder. However, the WhatsApp message could not be sent because the channel is not registered. You'll have to send it manually.", true},
+		{"pivot but no give-up", "Saved the contact. However, you might also want to add a note.", false},
+		{"give-up but no pivot (single failure not partial)", "No se pudo enviar el mensaje.", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := looksLikePartialBailout(tc.in); got != tc.want {
+				t.Fatalf("looksLikePartialBailout = %v; want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPartialBailoutNudgeNamesWhatsApp(t *testing.T) {
+	got := partialBailoutNudge("1:44A.M me envias un mensaje por whatsapp a este numero +573214447235", map[string]bool{"claw_schedule_reminder": true})
+	if got == "" {
+		t.Fatal("expected nudge when whatsapp_send was skipped despite phone+send request")
+	}
+	if !contains(got, "whatsapp_send") {
+		t.Fatalf("expected nudge to name whatsapp_send, got %q", got)
+	}
+}
+
+func TestPartialBailoutNudgeSilentWhenToolWasCalled(t *testing.T) {
+	got := partialBailoutNudge("manda whatsapp a +573214447235", map[string]bool{"whatsapp_send": true, "claw_schedule_reminder": true})
+	if got != "" {
+		t.Fatalf("expected no nudge when whatsapp_send was actually called, got %q", got)
+	}
+}
+
 func TestBailoutNudgePhoneSend(t *testing.T) {
 	got := bailoutNudge("envíale un mensaje por whatsapp a +573214447235, dile hola desde Forge")
 	if got == "" {
