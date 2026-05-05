@@ -162,6 +162,15 @@ type model struct {
 	lastEscTime           time.Time
 	lastRuneInputAt       time.Time
 	pasteGuardUntil       time.Time
+	// pastes maps a paste id (1-based, monotonic per session) to the
+	// raw content the user pasted. The textarea shows
+	// "[Pasted text #N +M lines]" while the user composes their
+	// message; on submit, expandPastes() swaps every marker back to
+	// the original text before handleLine forwards it to the agent.
+	// This keeps the input box readable for big pastes without
+	// dropping any of the actual content.
+	pastes       map[int]pastedBlock
+	pasteCounter int
 	width                 int
 	height                int
 	input                 textarea.Model
@@ -381,6 +390,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		now := time.Now()
 		m.updatePasteGuard(msg, now)
+		// Collapse multi-line pastes (>= pasteMinLines) into an inline
+		// "[Pasted text #N +M lines]" marker before any other key
+		// handling sees the message. The original bytes are stashed in
+		// m.pastes and expanded back at submit time. Single-line pastes
+		// pass through unchanged so editing snippets stays direct.
+		// KeyMsg has slice fields (Runes) so we can't compare structs
+		// for equality; just unconditionally re-assign — when no
+		// rewrite happened interceptPasteKey returns the same value
+		// and the assignment is a no-op.
+		if k, ok := m.interceptPasteKey(msg).(tea.KeyMsg); ok {
+			msg = k
+		}
 		// Clear suggestions on Enter or Esc; auto-suggest handles the rest.
 		if (msg.Type == tea.KeyEnter || msg.Type == tea.KeyEsc) && len(m.suggestions) > 0 {
 			m.suggestions = nil
@@ -457,6 +478,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			line := strings.TrimSpace(m.input.Value())
 			m.input.SetValue("")
+			// Expand "[Pasted text #N +M lines]" markers back to their
+			// original raw content before forwarding to the agent —
+			// the marker is for display only.
+			line = m.expandPastes(line)
 			if line != "" {
 				m.stickyBottom = true
 				cmds = append(cmds, m.handleLine(line))
@@ -1028,7 +1053,7 @@ func (m *model) handleCommand(line string) string {
 		return m.describeAgents()
 	case "/agent":
 		if len(fields) < 3 {
-			return "Usage: /agent <explorer|reviewer|tester> <task>"
+			return m.agentUsageHint()
 		}
 		return m.runSubagentCommand(fields[1], strings.Join(fields[2:], " "))
 	case "/plan-new":
@@ -1642,6 +1667,18 @@ func (m model) lowerChromeHeight() int {
 	}
 
 	height := lipgloss.Height(m.inputAreaView())
+	// gitBannerView is rendered between the viewport and the input
+	// (see View() near the chatArea/inputArea concatenation). When the
+	// worktree goes dirty the banner adds 2 visible rows; without
+	// counting them here the viewport height comes out 2 too tall and
+	// the last rows of chat content overlap the input — the user sees
+	// the latest reply hidden underneath the textarea until something
+	// triggers another recalcLayout (Esc, new stream, resize). Empty
+	// banner returns "" so we guard against the lipgloss empty-string
+	// quirk that would otherwise add 1 phantom line.
+	if banner := m.gitBannerView(); banner != "" {
+		height += lipgloss.Height(banner)
+	}
 	if len(m.suggestions) > 0 {
 		height += 1 + lipgloss.Height(m.suggestionView())
 	}

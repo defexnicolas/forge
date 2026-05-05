@@ -1,6 +1,11 @@
 package tui
 
-import "forge/internal/permissions"
+import (
+	"sort"
+
+	"forge/internal/agent"
+	"forge/internal/permissions"
+)
 
 type commandDescriptor struct {
 	Name        string
@@ -66,15 +71,32 @@ var tuiCommands = []commandDescriptor{
 // so autocomplete suggests the actual profile names from permissions.ProfileNames()
 // without duplicating the list. Adding a new profile in internal/permissions
 // automatically surfaces it in the TUI suggestions and the status table.
+//
+// Same trick for /agent and /agents — we pull the built-in subagent names
+// from agent.DefaultSubagents() so Tab completion shows ["explorer",
+// "reviewer", "tester", ...] instead of leaving the user guessing. Plugin
+// subagents are NOT included here because plugin discovery runs after
+// startup and the autocomplete list is static; users can still type
+// plugin names by hand and they will dispatch correctly.
 func init() {
 	profileSubs := append([]string(nil), permissions.ProfileNames()...)
 	permissionsSubs := append([]string{"set"}, permissions.ProfileNames()...)
+
+	defaultAgents := agent.DefaultSubagents()
+	agentNames := make([]string, 0)
+	for _, w := range defaultAgents.List() {
+		agentNames = append(agentNames, w.Name)
+	}
+	sort.Strings(agentNames)
+
 	for i := range tuiCommands {
 		switch tuiCommands[i].Name {
 		case "/profile":
 			tuiCommands[i].Subcommands = profileSubs
 		case "/permissions":
 			tuiCommands[i].Subcommands = permissionsSubs
+		case "/agent":
+			tuiCommands[i].Subcommands = agentNames
 		}
 	}
 }

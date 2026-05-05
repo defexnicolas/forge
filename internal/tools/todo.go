@@ -24,11 +24,34 @@ func (todoWriteTool) Run(ctx Context, input json.RawMessage) (Result, error) {
 	if err := json.Unmarshal(input, &req); err != nil {
 		return Result{}, err
 	}
+	clean := make([]string, 0, len(req.Items))
+	for _, raw := range req.Items {
+		if t := normalizeTaskTitle(raw); t != "" {
+			clean = append(clean, t)
+		}
+	}
 	return Result{
 		Title:   "Todo plan",
 		Summary: "Updated plan",
-		Content: []ContentBlock{{Type: "text", Text: strings.Join(req.Items, "\n")}},
+		Content: []ContentBlock{{Type: "text", Text: strings.Join(clean, "\n")}},
 	}, nil
+}
+
+// normalizeTaskTitle collapses embedded whitespace (newlines + runs of
+// spaces) in a task title down to a single space. Models occasionally
+// emit "[ \"Fix X with stuff,\\n      and more stuff,\\n      and...\" ]"
+// which renders as a multi-line task title with random indentation when
+// the runtime later wraps the content for display — the right viewport
+// looks broken even though the underlying data is fine. Stripping at
+// the tool boundary keeps everything downstream (plan panel, tool
+// result echo, transcript) working with single-line titles regardless
+// of how the model formats its JSON string literals.
+func normalizeTaskTitle(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	return strings.Join(strings.Fields(s), " ")
 }
 
 // Task tool shells. The actual implementation lives in agent/runtime_exec.go

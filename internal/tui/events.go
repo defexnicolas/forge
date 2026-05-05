@@ -92,8 +92,22 @@ func (m *model) appendAgentEvent(event agent.Event) {
 			m.streamingRaw.WriteString(event.Text)
 		}
 	case agent.EventAssistantText:
+		// Capture the streaming index BEFORE clearing it. If a stream
+		// was still in flight when this event arrived, the half-formed
+		// streaming line at that index is about to be duplicated by the
+		// formatted block we are about to append. Truncating cleans the
+		// stale line — without this, "I'll save the plan now…" (raw
+		// streamed) sits right above the Glamour-formatted final block
+		// and reads as a duplicate. Skipped when streamingStartIdx is
+		// already -1 (a prior EventClearStreaming did the truncation).
+		streamingIdx := m.streamingStartIdx
 		m.streaming = false
 		m.streamingStartIdx = -1
+		if streamingIdx >= 0 && streamingIdx <= len(m.history) {
+			m.history = m.history[:streamingIdx]
+			m.streamingRaw.Reset()
+			m.prefixDirty = true
+		}
 		// Assistant is speaking again — any new tool group restarts from zero.
 		m.toolUsesInTurn = 0
 		m.collapsedToolLineIdx = -1

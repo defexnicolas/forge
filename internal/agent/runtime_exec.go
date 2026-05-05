@@ -472,6 +472,12 @@ func (r *Runtime) runTaskTool(toolName string, input json.RawMessage) (tools.Res
 		if err := json.Unmarshal(input, &req); err != nil {
 			return tools.Result{}, err
 		}
+		// Collapse whitespace so a multi-line title with embedded \n and
+		// indented continuations doesn't render as broken-looking wrap
+		// in the chat viewport or plan panel. Notes can keep their
+		// structure since they're shown in expanded views, not the
+		// dense checklist row.
+		req.Title = strings.Join(strings.Fields(req.Title), " ")
 		task, err := r.Tasks.Create(req.Title, req.Notes)
 		if err != nil {
 			return tools.Result{}, err
@@ -504,6 +510,12 @@ func (r *Runtime) runTaskTool(toolName string, input json.RawMessage) (tools.Res
 		}
 		if err := json.Unmarshal(input, &req); err != nil {
 			return tools.Result{}, err
+		}
+		// Same single-line policy as task_create — covers the case
+		// where the executor task_update's a title to something
+		// long-winded mid-build.
+		if req.Title != "" {
+			req.Title = strings.Join(strings.Fields(req.Title), " ")
 		}
 		task, err := r.Tasks.Update(req.ID, req.Title, req.Status, req.Notes)
 		if err != nil {

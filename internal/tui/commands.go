@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 
@@ -371,11 +372,57 @@ func (m *model) enterReviewMode() string {
 
 func (m model) describeAgents() string {
 	t := m.theme
-	rows := make([][]string, 0)
-	for _, w := range m.agentRuntime.Subagents.List() {
+	list := m.agentRuntime.Subagents.List()
+	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
+
+	rows := make([][]string, 0, len(list))
+	for _, w := range list {
 		rows = append(rows, []string{w.Name, w.Description, w.ModelRole, w.ContextMode})
 	}
-	return t.FormatTable([]string{"Agent", "Description", "Model", "Context"}, rows)
+	table := t.FormatTable([]string{"Agent", "Description", "Model role", "Context"}, rows)
+
+	// Short example using the first agent in the registry so the user has
+	// a copy-pasteable starting point — listing alone doesn't tell them
+	// the syntax, and "/agent" without args is what dropped them here.
+	example := ""
+	if len(list) > 0 {
+		example = "\n\n" + t.Muted.Render("Run one with:") + "\n  " +
+			t.StatusValue.Render("/agent "+list[0].Name+" \"<task description>\"") + "\n  " +
+			t.Muted.Render("Tab autocompletes the agent name. Quote the task if it contains spaces.")
+	}
+	return table + example
+}
+
+// agentUsageHint produces the message shown when /agent is invoked
+// without enough arguments. Pulls names from the live registry instead
+// of a hardcoded list, so plugin-supplied agents surface here too.
+func (m model) agentUsageHint() string {
+	t := m.theme
+	list := m.agentRuntime.Subagents.List()
+	names := make([]string, 0, len(list))
+	for _, w := range list {
+		names = append(names, w.Name)
+	}
+	sort.Strings(names)
+
+	var b strings.Builder
+	b.WriteString(t.Warning.Render("Usage: /agent <name> <task>"))
+	if len(names) > 0 {
+		b.WriteString("\n\n")
+		b.WriteString(t.Muted.Render("Available agents (Tab to autocomplete):"))
+		b.WriteString("\n  ")
+		b.WriteString(t.StatusValue.Render(strings.Join(names, ", ")))
+		b.WriteString("\n\n")
+		b.WriteString(t.Muted.Render("Examples:"))
+		b.WriteString("\n  ")
+		b.WriteString(t.StatusValue.Render("/agent explorer \"find every place that calls render()\""))
+		b.WriteString("\n  ")
+		b.WriteString(t.StatusValue.Render("/agent reviewer \"review the current diff\""))
+		b.WriteString("\n  ")
+		b.WriteString(t.StatusValue.Render("/agents"))
+		b.WriteString(t.Muted.Render("  — show this list with descriptions"))
+	}
+	return b.String()
 }
 
 func (m *model) runSubagentCommand(agentName, prompt string) string {

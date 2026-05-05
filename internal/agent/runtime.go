@@ -1200,8 +1200,8 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 	lastFailedTool := ""
 	consecutiveToolFailures := 0
 	consecutiveReadOnly := 0
-	lastBuildReadPath := ""
-	sameBuildReadPathCount := 0
+	lastBuildReadKey := ""
+	sameBuildReadCount := 0
 	planModeReprompts := 0
 	taskAttempts := map[string]int{}
 	blockedTaskRetries := map[string]bool{}
@@ -1335,7 +1335,7 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 				if shouldRefundToolStep(agentCall.Name) {
 					step--
 				}
-				if err := r.enforceRepeatedReadFileGuard(agentCall.Name, agentCall.Input, &lastBuildReadPath, &sameBuildReadPathCount); err != nil {
+				if err := r.enforceRepeatedReadFileGuard(agentCall.Name, agentCall.Input, &lastBuildReadKey, &sameBuildReadCount); err != nil {
 					events <- Event{Type: EventError, Error: err}
 					events <- Event{Type: EventDone}
 					return
@@ -1554,7 +1554,7 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 			step--
 		}
 
-		if err := r.enforceRepeatedReadFileGuard(parsed.Call.Name, parsed.Call.Input, &lastBuildReadPath, &sameBuildReadPathCount); err != nil {
+		if err := r.enforceRepeatedReadFileGuard(parsed.Call.Name, parsed.Call.Input, &lastBuildReadKey, &sameBuildReadCount); err != nil {
 			events <- Event{Type: EventError, Error: err}
 			events <- Event{Type: EventDone}
 			return
@@ -1723,36 +1723,51 @@ func (r *Runtime) enforceToolProgressGuard(name string, consecutiveReadOnly, noP
 	return nil
 }
 
-func (r *Runtime) enforceRepeatedReadFileGuard(name string, input json.RawMessage, lastBuildReadPath *string, sameBuildReadPathCount *int) error {
+// repeatedReadFileGuardThreshold is the number of identical read_file
+// calls (same path AND same offset/limit) tolerated before the guard
+// fires. Tuned higher than the original 3 because Qwen-class models
+// frequently re-issue the same call mid-reasoning ("let me re-check
+// what's in here") and the read cache already serves repeats with an
+// inline annotation telling the model it just looped — the cap is the
+// safety net for when the model also ignores that signal.
+const repeatedReadFileGuardThreshold = 5
+
+func (r *Runtime) enforceRepeatedReadFileGuard(name string, input json.RawMessage, lastBuildReadKey *string, sameBuildReadCount *int) error {
 	if r.Mode != "build" {
-		*lastBuildReadPath = ""
-		*sameBuildReadPathCount = 0
+		*lastBuildReadKey = ""
+		*sameBuildReadCount = 0
 		return nil
 	}
 	if isMutatingToolCall(name) || name == "execute_task" {
-		*lastBuildReadPath = ""
-		*sameBuildReadPathCount = 0
+		*lastBuildReadKey = ""
+		*sameBuildReadCount = 0
 		return nil
 	}
 	if name != "read_file" {
-		*lastBuildReadPath = ""
-		*sameBuildReadPathCount = 0
+		*lastBuildReadKey = ""
+		*sameBuildReadCount = 0
 		return nil
 	}
-	path := readFilePathFromInput(input)
-	if path == "" {
-		*lastBuildReadPath = ""
-		*sameBuildReadPathCount = 0
+	// Use the FULL input shape (path + offset + limit) as the key so a
+	// legitimate paginated walk through a large file ("offset=1,
+	// offset=151, offset=301") counts each page as progress, not as a
+	// repeat. Re-reading the same window is what we want to catch —
+	// reading new windows is what offset/limit was added for.
+	key := readFileFingerprintFromInput(input)
+	if key == "" {
+		*lastBuildReadKey = ""
+		*sameBuildReadCount = 0
 		return nil
 	}
-	if strings.EqualFold(path, *lastBuildReadPath) {
-		*sameBuildReadPathCount++
+	if strings.EqualFold(key, *lastBuildReadKey) {
+		*sameBuildReadCount++
 	} else {
-		*lastBuildReadPath = path
-		*sameBuildReadPathCount = 1
+		*lastBuildReadKey = key
+		*sameBuildReadCount = 1
 	}
-	if *sameBuildReadPathCount >= 3 {
-		return fmt.Errorf("stopped: repeated read_file on %s in build mode (%d times) with no edits yet — stop chunking the same file and either edit it or ask for refinement", path, *sameBuildReadPathCount)
+	if *sameBuildReadCount >= repeatedReadFileGuardThreshold {
+		path := readFilePathFromInput(input)
+		return fmt.Errorf("stopped: repeated read_file on %s with the same offset/limit in build mode (%d times) with no edits yet — stop re-reading the same window and either edit something, paginate to a different range, or ask for refinement", path, *sameBuildReadCount)
 	}
 	return nil
 }
@@ -1765,6 +1780,28 @@ func readFilePathFromInput(input json.RawMessage) string {
 		return ""
 	}
 	return strings.TrimSpace(req.Path)
+}
+
+// readFileFingerprintFromInput returns a canonical "path|offset|limit"
+// string for a read_file payload. Two reads collide on this
+// fingerprint only when they would return identical bytes (modulo
+// disk mutations); paginated reads of the same path with different
+// offsets/limits produce distinct fingerprints and don't count toward
+// the repeat guard.
+func readFileFingerprintFromInput(input json.RawMessage) string {
+	var req struct {
+		Path   string `json:"path"`
+		Offset int    `json:"offset"`
+		Limit  int    `json:"limit"`
+	}
+	if err := json.Unmarshal(input, &req); err != nil {
+		return ""
+	}
+	path := strings.TrimSpace(req.Path)
+	if path == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s|%d|%d", path, req.Offset, req.Limit)
 }
 
 func (r *Runtime) hasActiveChecklistTasks() bool {
@@ -2081,6 +2118,12 @@ func (r *Runtime) streamResponseWithInput(ctx context.Context, provider llm.Prov
 				for range stream {
 				}
 				r.lastNarrationCancel = line
+				// Drop the half-streamed reasoning from the TUI so the
+				// next turn's stream doesn't accumulate on top of it —
+				// otherwise the user sees the cancelled monologue plus
+				// the recovered turn's output side by side, which reads
+				// as duplicated lines after the dust settles.
+				events <- Event{Type: EventClearStreaming}
 				events <- Event{Type: EventError, Error: fmt.Errorf("narration loop detected in reasoning (line %q repeated %d times); cancelled stream and re-prompting for a tool_call", line, count)}
 				return text.String(), toolCalls, usage, nil
 			}
@@ -2115,6 +2158,7 @@ func (r *Runtime) streamResponseWithInput(ctx context.Context, provider llm.Prov
 					for range stream {
 					}
 					r.lastNarrationCancel = line
+					events <- Event{Type: EventClearStreaming}
 					events <- Event{Type: EventError, Error: fmt.Errorf("narration loop detected (line %q repeated %d times); cancelled stream and re-prompting for a tool_call", line, count)}
 					return text.String(), toolCalls, usage, nil
 				}
