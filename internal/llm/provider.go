@@ -45,6 +45,16 @@ type ChatRequest struct {
 	Messages    []Message `json:"messages"`
 	Tools       []ToolDef `json:"tools,omitempty"`
 	Temperature *float64  `json:"temperature,omitempty"`
+	// Sampling overrides for the llama.cpp / LM Studio extension fields
+	// (top_p / top_k / min_p / presence_penalty / repeat_penalty).
+	// Pointer-typed so "leave nil" means "let the provider use its
+	// default" — matching the existing Temperature contract. Cloud
+	// providers (OpenAI proper) ignore the non-standard fields.
+	TopP            *float64 `json:"-"`
+	TopK            *int     `json:"-"`
+	MinP            *float64 `json:"-"`
+	PresencePenalty *float64 `json:"-"`
+	RepeatPenalty   *float64 `json:"-"`
 	// ToolChoice is the OpenAI-shaped tool_choice override. Accepts
 	// "none" / "auto" / "required" (as a string) or a specific function
 	// pin like {"type":"function","function":{"name":"whatsapp_send"}}.

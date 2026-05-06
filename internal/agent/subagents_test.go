@@ -307,8 +307,15 @@ func TestExecuteTaskPassesPlanDigestToBuilder(t *testing.T) {
 	if len(provider.requests) == 0 {
 		t.Fatal("expected subagent to have invoked the provider")
 	}
-	if provider.requests[0].Temperature != nil {
-		t.Fatalf("expected builder request to omit temperature override, got %#v", *provider.requests[0].Temperature)
+	// applySamplingDefaults pins the configured sampling on every request
+	// (including subagents) — see runtime_guardrails.go. Builder no longer
+	// "omits" temperature; verify it carries the configured default.
+	got := provider.requests[0].Temperature
+	if got == nil {
+		t.Fatal("expected builder request to carry the configured temperature default")
+	}
+	if want := runtime.Config.Sampling.Temperature; *got != want {
+		t.Fatalf("builder temperature = %v, want %v (configured default)", *got, want)
 	}
 	userMsg := provider.requests[0].Messages[1].Content
 	if !strings.Contains(userMsg, "BUILDER_TASK_TITLE") {

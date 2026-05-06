@@ -276,10 +276,12 @@ func (r *Runtime) RunSubagent(ctx context.Context, request SubagentRequest) (too
 		// work where prefill on long sequences hurts the most.
 		compactOldToolResults(messages, 2)
 		reqCtx, reqCancel := withOptionalTimeout(subCtx, r.requestTimeout())
-		accumulated, toolCalls, err := r.streamSubagentResponse(reqCtx, provider, llm.ChatRequest{
+		subReq := llm.ChatRequest{
 			Model:    model,
 			Messages: messages,
-		})
+		}
+		r.applySamplingDefaults(&subReq)
+		accumulated, toolCalls, err := r.streamSubagentResponse(reqCtx, provider, subReq)
 		reqCancel()
 		if err != nil {
 			return tools.Result{}, &subagentRunError{

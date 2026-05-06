@@ -515,6 +515,27 @@ func buildChatPayload(req ChatRequest, stream bool) map[string]any {
 	if req.Temperature != nil {
 		payload["temperature"] = *req.Temperature
 	}
+	// LM Studio / llama-server extensions to the OpenAI chat completions
+	// schema. Field names match llama.cpp's CLI flags (--top-p / --top-k /
+	// --min-p / --presence-penalty / --repeat-penalty). Cloud providers
+	// either accept (presence_penalty is standard OpenAI) or silently
+	// ignore the non-standard ones. Only sent when the caller pinned a
+	// value — nil means "use the server default".
+	if req.TopP != nil {
+		payload["top_p"] = *req.TopP
+	}
+	if req.TopK != nil {
+		payload["top_k"] = *req.TopK
+	}
+	if req.MinP != nil {
+		payload["min_p"] = *req.MinP
+	}
+	if req.PresencePenalty != nil {
+		payload["presence_penalty"] = *req.PresencePenalty
+	}
+	if req.RepeatPenalty != nil {
+		payload["repeat_penalty"] = *req.RepeatPenalty
+	}
 	return payload
 }
 

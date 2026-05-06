@@ -38,6 +38,29 @@ type Config struct {
 	Plan         PlanConfig         `toml:"plan"`
 	TUI          TUIConfig          `toml:"tui"`
 	Update       UpdateConfig       `toml:"update"`
+	Sampling     SamplingConfig     `toml:"sampling"`
+}
+
+// SamplingConfig pins the per-request sampling parameters Forge sends to the
+// chat completion endpoint. When unset (or zeroed), LM Studio and
+// llama-server fall back to the model's defaults — which vary across
+// presets in LM Studio's UI and produce inconsistent behavior between
+// workspaces. Setting them here makes the agent's output reproducible.
+//
+// The values default to the llama.cpp recommended baseline for Qwen-style
+// models: temperature 0.6, top_p 0.95, top_k 20. Override per workspace in
+// .forge/config.toml [sampling] or globally in ~/.codex/forge/global.toml.
+//
+// Field names map directly to llama.cpp's --temp / --top-p / --top-k /
+// --min-p / --presence-penalty / --repeat-penalty CLI flags (and to
+// LM Studio's REST extensions of the OpenAI chat completions schema).
+type SamplingConfig struct {
+	Temperature     float64 `toml:"temperature"`
+	TopP            float64 `toml:"top_p"`
+	TopK            int     `toml:"top_k"`
+	MinP            float64 `toml:"min_p"`
+	PresencePenalty float64 `toml:"presence_penalty"`
+	RepeatPenalty   float64 `toml:"repeat_penalty"`
 }
 
 // UpdateConfig governs the in-app update checker. The check only runs when
@@ -751,6 +774,14 @@ func Defaults() Config {
 				MaxFileBytes:  8000,
 				HistoryEvents: 4,
 			},
+		},
+		Sampling: SamplingConfig{
+			Temperature:     0.6,
+			TopP:            0.95,
+			TopK:            20,
+			MinP:            0.0,
+			PresencePenalty: 0.0,
+			RepeatPenalty:   1.0,
 		},
 		Runtime: RuntimeConfig{
 			RequestTimeoutSeconds:     45,

@@ -63,6 +63,7 @@ func (r *Runtime) runBtw(ctx context.Context, question string, events chan<- Eve
 			{Role: "user", Content: user},
 		},
 	}
+	r.applySamplingDefaults(&req)
 
 	stream, err := r.streamProvider(ctx, provider, req)
 	if err != nil {

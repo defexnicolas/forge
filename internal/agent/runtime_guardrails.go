@@ -90,6 +90,41 @@ func (r *Runtime) requestTimeout() time.Duration {
 	return time.Duration(secs) * time.Second
 }
 
+// applySamplingDefaults populates a ChatRequest's sampling fields from the
+// active config. Pinning these explicitly per-request is the only way to
+// get reproducible output across LM Studio sessions: the UI preset
+// (Default / Deterministic / Creative / Balanced) silently rewires the
+// server-side defaults between mounts, so a model that was deterministic
+// before a UI preset change suddenly drifts. Forge sends temperature /
+// top_p / top_k / min_p / presence_penalty / repeat_penalty on every
+// chat completion, overriding whatever preset is active.
+//
+// If the caller already pinned Temperature (e.g. Claw subroutines that
+// want a deliberately-different value), the existing override is kept.
+// The other five fields are overridden unconditionally — no current
+// caller sets them, so there's no collision risk, and adding a "let
+// caller win" branch per field would balloon the call sites.
+func (r *Runtime) applySamplingDefaults(req *llm.ChatRequest) {
+	if r == nil || req == nil {
+		return
+	}
+	s := r.Config.Sampling
+	temp := s.Temperature
+	topP := s.TopP
+	topK := s.TopK
+	minP := s.MinP
+	presence := s.PresencePenalty
+	repeat := s.RepeatPenalty
+	if req.Temperature == nil {
+		req.Temperature = &temp
+	}
+	req.TopP = &topP
+	req.TopK = &topK
+	req.MinP = &minP
+	req.PresencePenalty = &presence
+	req.RepeatPenalty = &repeat
+}
+
 // isLocalBackend reports whether the active provider talks to a local model
 // server (LM Studio or llama-server). The check uses BackendNamer so it
 // stays accurate even when the registry slot is named "lmstudio" but the

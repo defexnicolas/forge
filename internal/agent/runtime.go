@@ -1367,6 +1367,7 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 			Messages: messages,
 			Tools:    toolDefs,
 		}
+		r.applySamplingDefaults(&req)
 
 		// Update context token count from current message history. Reuse the
 		// precomputed toolsChars so we don't re-marshal the tool definitions
