@@ -200,20 +200,30 @@ func (m *model) handleFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 			if !m.modelMultiForm.canceled && m.modelMultiForm.errMsg == "" {
 				m.options.Config = m.modelMultiForm.cfg
 				m.syncRuntimeConfig()
+				// Wipe stale loaded-model marks BEFORE the for loop so
+				// MarkModelLoaded below re-populates with the new
+				// selections. probeProviderStateForRoles further down
+				// is the no-reset variant that runs after the loop.
+				m.agentRuntime.ResetLoadedModels()
 				activeRole := m.activeModelRole()
 				strategy := strings.ToLower(strings.TrimSpace(m.options.Config.ModelLoading.Strategy))
-				// Reset + reprobe before MarkModelLoaded re-populates the
-				// per-role state so the goroutine sees the new model ids.
-				// Refresh updates LastProviderUsed and DetectedContext so
-				// the status bar repaints with the right backend + ctx
-				// without waiting for the first turn.
-				m.refreshProviderState()
 				for _, selection := range m.modelMultiForm.selections {
 					m.agentRuntime.SetRoleModel(selection.role, selection.modelID)
 					if strategy == "parallel" || selection.role == activeRole {
 						m.agentRuntime.MarkModelLoaded(selection.modelID)
 					}
 				}
+				// Reprobe each unique selected model and write the
+				// detected ctx to every role using it. With detection
+				// stored per-role, the active role for whichever mode
+				// the user lands in (BUILD→editor, PLAN→planner, ...)
+				// gets a real denominator instead of falling back to
+				// the workspace's stale model_context_tokens override.
+				roleModels := map[string]string{}
+				for _, selection := range m.modelMultiForm.selections {
+					roleModels[selection.role] = selection.modelID
+				}
+				m.probeProviderStateForRoles(roleModels)
 				result := m.modelMultiForm.Result()
 				if result != "" {
 					for _, selection := range m.modelMultiForm.selections {

@@ -90,6 +90,12 @@ func (p *OpenAICompatible) BackendName() string {
 // returns rows with neither. Caches the result on success; leaves Unknown on
 // failure so the next call can retry. Safe to call concurrently — at most one
 // extra probe will race, and they'll converge on the same answer.
+//
+// LM Studio is detected in two passes because older builds don't expose
+// state / loaded_context_length on /v1/models — only on the native
+// /api/v0/models endpoint. Without the second pass an LM Studio install
+// gets misclassified as llama-server, which then makes /model reload
+// refuse to run because SupportsExplicitLoad returns false.
 func (p *OpenAICompatible) resolveBackend(ctx context.Context) Backend {
 	if kind := p.BackendKind(); kind != BackendUnknown {
 		return kind
@@ -98,7 +104,22 @@ func (p *OpenAICompatible) resolveBackend(ctx context.Context) Backend {
 	if err != nil || len(models) == 0 {
 		return BackendUnknown
 	}
-	return p.classifyAndCache(models)
+	if kind := p.classifyAndCache(models); kind == BackendLMStudio {
+		return kind
+	}
+	// Pass 2: the rows from /v1/models look generic. Try LM Studio's
+	// extended /api/v0/models — if it answers 200, the BaseURL is
+	// definitely LM Studio (older build that hides those fields on /v1).
+	if enhanced, eerr := p.listModelsEnhanced(ctx); eerr == nil && len(enhanced) > 0 {
+		p.backend.Store(int32(BackendLMStudio))
+		return BackendLMStudio
+	}
+	// Confirmed not LM Studio. Cache as llama-server (the most common
+	// alternative; downstream code only branches on "is LM Studio or
+	// not", so OpenAI-compatible non-LM-Studio endpoints are handled
+	// the same way as llama-server).
+	p.backend.Store(int32(BackendLlamaServer))
+	return BackendLlamaServer
 }
 
 // RefreshBackend invalidates the cached backend kind and re-classifies by
@@ -114,23 +135,24 @@ func (p *OpenAICompatible) RefreshBackend(ctx context.Context) {
 }
 
 // classifyAndCache classifies the backend from an already-fetched models slice
-// and stores the result. Lets ProbeModel reuse the rows it just retrieved
-// instead of forcing a second /v1/models roundtrip via resolveBackend, and
-// lets it skip the LMStudio-only /api/v0/models 404 when the rows already
-// reveal the backend is something else.
+// and stores the result IF the rows clearly identify LM Studio (state field
+// or context-length fields populated). When the rows are generic the
+// function returns BackendUnknown without caching — the caller is expected
+// to call resolveBackend (which falls back to /api/v0/models) before
+// committing to "this is llama-server". Premature classification was
+// misclassifying older LM Studio builds whose /v1/models response doesn't
+// carry the extended fields.
 func (p *OpenAICompatible) classifyAndCache(models []ModelInfo) Backend {
 	if len(models) == 0 {
 		return BackendUnknown
 	}
-	kind := BackendLlamaServer
 	for _, m := range models {
 		if strings.TrimSpace(m.State) != "" || m.LoadedContextLength > 0 || m.MaxContextLength > 0 {
-			kind = BackendLMStudio
-			break
+			p.backend.Store(int32(BackendLMStudio))
+			return BackendLMStudio
 		}
 	}
-	p.backend.Store(int32(kind))
-	return kind
+	return BackendUnknown
 }
 
 // LoadedModels returns the models currently resident on the backend. For LM
@@ -547,18 +569,25 @@ func (p *OpenAICompatible) ProbeModel(ctx context.Context, modelID string) (*Mod
 	if err != nil {
 		return nil, err
 	}
-	// Classify the backend from the rows we already fetched so the next
-	// step can skip the LMStudio-only /api/v0/models call when it's
-	// guaranteed to 404 (llama-server, generic OpenAI). The first probe
-	// previously left the cache Unknown until probeLlamaServerCtx ran,
-	// which meant every fresh process logged a one-time 404 in the
-	// llama-server console.
+	// Two-pass backend detection. classifyAndCache only commits to
+	// BackendLMStudio when /v1/models clearly says so (state or context
+	// fields populated). When the rows look generic we still try
+	// /api/v0/models — older LM Studio builds hide the metadata there.
+	// If neither pass reveals LM Studio, settle on BackendLlamaServer so
+	// SupportsExplicitLoad returns false and downstream behaves correctly.
 	if p.BackendKind() == BackendUnknown {
-		p.classifyAndCache(models)
-	}
-	if !modelsHaveContextMetadata(models) && p.BackendKind() == BackendLMStudio {
-		// Older LM Studio builds only expose the enhanced fields on the
-		// native /api/v0/models endpoint.
+		if classified := p.classifyAndCache(models); classified == BackendUnknown {
+			if enhanced, eerr := p.listModelsEnhanced(ctx); eerr == nil && len(enhanced) > 0 {
+				models = enhanced
+				p.backend.Store(int32(BackendLMStudio))
+			} else {
+				p.backend.Store(int32(BackendLlamaServer))
+			}
+		}
+	} else if !modelsHaveContextMetadata(models) && p.BackendKind() == BackendLMStudio {
+		// Cached as LM Studio but this particular response is missing
+		// the extended fields. Try /api/v0/models so the picked
+		// ModelInfo carries loaded_context_length.
 		if enhanced, eerr := p.listModelsEnhanced(ctx); eerr == nil && len(enhanced) > 0 {
 			models = enhanced
 		}

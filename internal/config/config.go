@@ -1087,9 +1087,17 @@ func minPositive(a, b int) int {
 }
 
 func DetectedForRole(cfg Config, role, modelID string) *DetectedContext {
+	// Per-role detection wins, but only when the recorded ModelID matches
+	// the one currently configured for the role. Without this guard a
+	// stale entry (e.g. chat:262144 detected under llama-server) keeps
+	// polluting Context.Detected after the user assigns a different
+	// model — the status bar denominator and EffectiveBudgets would then
+	// scale against the wrong window forever.
 	if cfg.Context.DetectedByRole != nil {
 		if detected, ok := cfg.Context.DetectedByRole[role]; ok && detected.LoadedContextLength > 0 {
-			return &detected
+			if modelID == "" || detected.ModelID == "" || detected.ModelID == modelID {
+				return &detected
+			}
 		}
 	}
 	if cfg.Context.Detected != nil && cfg.Context.Detected.LoadedContextLength > 0 {

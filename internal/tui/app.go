@@ -887,24 +887,63 @@ func (m model) activeRoleConfig() config.Config {
 
 // refreshProviderState wipes the runtime's "currently loaded" tracking and
 // kicks off a 5s background ProbeModel against the configured provider for
-// the active role's model. The probe writes the detected loaded-context
-// length into Config.Context.DetectedByRole and updates LastProviderUsed so
-// the status bar shows the real backend name and ctx denominator without
-// waiting for the first user turn.
-//
-// Call this from any form Apply path that mutates Providers.* or Models.*
-// (provider form, model form, model-multi form). The hub side mirrors this
-// inside applyHubChatConfig. Without it, switching from llama-server back to
-// LM Studio (or vice-versa) leaves the bar showing the previous backend
-// name and a stale ctx fallback because the cached metadata never refreshes.
+// the active role's model. Convenience wrapper around
+// refreshProviderStateForRoles for callers that only need the active role.
 func (m *model) refreshProviderState() {
+	if m == nil || m.agentRuntime == nil {
+		return
+	}
+	role := m.agentRuntime.ModelRoleForActiveMode()
+	modelID := strings.TrimSpace(m.options.Config.Models[role])
+	if modelID == "" {
+		modelID = strings.TrimSpace(m.options.Config.Models["chat"])
+	}
+	if modelID == "" {
+		return
+	}
+	m.refreshProviderStateForRoles(map[string]string{role: modelID})
+}
+
+// refreshProviderStateForRoles re-classifies the backend, then probes each
+// unique modelID across the given role→modelID mapping and writes
+// DetectedContext for every role using a successfully-probed model. Used by
+// /provider and /model where the loaded-models cache must be wiped because
+// the underlying provider or chat model just changed.
+func (m *model) refreshProviderStateForRoles(roleModels map[string]string) {
+	if m == nil || m.agentRuntime == nil {
+		return
+	}
+	m.agentRuntime.ResetLoadedModels()
+	m.probeProviderStateForRoles(roleModels)
+}
+
+// probeProviderStateForRoles probes each unique modelID and writes
+// DetectedContext + LastProviderUsed without touching the loaded-models
+// cache. Used by /model-multi after its own SetRoleModel / MarkModelLoaded
+// loop has already populated the cache for the new selections — calling
+// the wrapper would wipe those marks and force a redundant LoadModel on
+// the next turn.
+//
+// Backend classification + LastProviderUsed update fires regardless of
+// whether the probes return ctx info, so switching providers always
+// repaints the status bar's backend label.
+func (m *model) probeProviderStateForRoles(roleModels map[string]string) {
 	if m == nil || m.agentRuntime == nil || m.options.Providers == nil {
 		return
 	}
 	rt := m.agentRuntime
-	rt.ResetLoadedModels()
 	cfg := m.options.Config
 	providers := m.options.Providers
+	// Snapshot the role-models so the goroutine isn't reading a map the
+	// caller may keep mutating after we return.
+	pairs := make([][2]string, 0, len(roleModels))
+	for role, modelID := range roleModels {
+		modelID = strings.TrimSpace(modelID)
+		if role == "" || modelID == "" {
+			continue
+		}
+		pairs = append(pairs, [2]string{role, modelID})
+	}
 	go func() {
 		name := strings.TrimSpace(cfg.Providers.Default.Name)
 		if name == "" {
@@ -914,24 +953,39 @@ func (m *model) refreshProviderState() {
 		if !ok {
 			return
 		}
-		role := rt.ModelRoleForActiveMode()
-		modelID := strings.TrimSpace(cfg.Models[role])
-		if modelID == "" {
-			modelID = strings.TrimSpace(cfg.Models["chat"])
+		// Force backend re-classification. The runtime's cached
+		// BackendKind survives across config swaps when the same
+		// provider instance stays in the registry, so explicit refresh
+		// is the only way to recover from a hot-swap of the underlying
+		// server.
+		if refresher, ok := provider.(llm.BackendRefresher); ok {
+			rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Second)
+			refresher.RefreshBackend(rctx)
+			rcancel()
 		}
-		if modelID == "" {
-			return
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		info, err := provider.ProbeModel(ctx, modelID)
-		if err == nil && info != nil && info.LoadedContextLength > 0 {
-			rt.SetDetectedContext(role, &config.DetectedContext{
-				ModelID:             info.ID,
-				LoadedContextLength: info.LoadedContextLength,
-				MaxContextLength:    info.MaxContextLength,
-				ProbedAt:            time.Now().UTC(),
-			})
+		// Probe each unique modelID once; reuse the result across roles
+		// that share the model.
+		probed := map[string]*llm.ModelInfo{}
+		for _, pair := range pairs {
+			role, modelID := pair[0], pair[1]
+			info, cached := probed[modelID]
+			if !cached {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				probeInfo, err := provider.ProbeModel(ctx, modelID)
+				cancel()
+				if err == nil && probeInfo != nil {
+					info = probeInfo
+				}
+				probed[modelID] = info
+			}
+			if info != nil && info.LoadedContextLength > 0 {
+				rt.SetDetectedContext(role, &config.DetectedContext{
+					ModelID:             info.ID,
+					LoadedContextLength: info.LoadedContextLength,
+					MaxContextLength:    info.MaxContextLength,
+					ProbedAt:            time.Now().UTC(),
+				})
+			}
 		}
 		if bn, ok := provider.(llm.BackendNamer); ok {
 			rt.SetLastProviderUsed(bn.BackendName())
