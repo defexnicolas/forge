@@ -716,46 +716,31 @@ func (p *OpenAICompatible) LoadModel(ctx context.Context, modelID string, loadCf
 
 func (p *OpenAICompatible) loadModelHTTP(ctx context.Context, base, modelID string, loadCfg LoadConfig) error {
 	// LM Studio's documented native load endpoint is /api/v1/models/load.
-	// We try it first, then fall back to /api/v0/models/load for older builds.
+	// Try it first, fall back to /api/v0/models/load for older builds.
 	stripped := strings.TrimSuffix(base, "/v1")
 	paths := []string{"/api/v1/models/load", "/api/v0/models/load"}
-	// LM Studio 0.3+ moved the load-time options under a nested "config"
-	// object; older builds accepted them at the top level. Mirror the same
-	// fields in both places so either version picks them up. Unknown fields
-	// are ignored by the server.
-	nested := map[string]any{}
-	if loadCfg.ContextLength > 0 {
-		nested["context_length"] = loadCfg.ContextLength
-		nested["contextLength"] = loadCfg.ContextLength
-	}
-	if loadCfg.FlashAttention {
-		nested["flash_attention"] = true
-		nested["flashAttention"] = true
-	}
-	if loadCfg.ParallelSlots > 0 {
-		// Field names have shifted across LM Studio versions (and inside
-		// llama.cpp vs mlx backends). Send every known spelling so at
-		// least one is honored. If the user still sees 1 GEN slot after
-		// this reload, the field name changed again and we need to log
-		// the echoed response to find the new one.
-		nested["max_parallel_sequences"] = loadCfg.ParallelSlots
-		nested["maxParallelSequences"] = loadCfg.ParallelSlots
-		nested["parallel_requests"] = loadCfg.ParallelSlots
-		nested["parallelRequests"] = loadCfg.ParallelSlots
-		nested["n_parallel"] = loadCfg.ParallelSlots
-		nested["nParallel"] = loadCfg.ParallelSlots
-		nested["num_parallel"] = loadCfg.ParallelSlots
-		nested["numParallel"] = loadCfg.ParallelSlots
-	}
+	// Recent LM Studio versions reject any unknown key with HTTP 400
+	// "unrecognized_keys" — including camelCase aliases, "config",
+	// "load_config", "identifier", and every parallel-slots variant we
+	// used to fan out. The earlier shotgun approach worked when LM Studio
+	// silently ignored extras; now it fails the load entirely.
+	//
+	// Send the minimal, snake_case-only payload that's documented and
+	// accepted across versions. ParallelSlots is intentionally not sent
+	// over REST: every spelling in our previous fan-out is now rejected,
+	// and there's no documented v1 field for it. Configure parallel
+	// generation slots inside LM Studio's UI / lms CLI — Forge's chat
+	// completions still benefit from whatever slot count the server has
+	// resident.
 	body := map[string]any{
 		"model":            modelID,
-		"identifier":       modelID,
 		"echo_load_config": true,
-		"config":           nested,
-		"load_config":      nested,
 	}
-	for k, v := range nested {
-		body[k] = v
+	if loadCfg.ContextLength > 0 {
+		body["context_length"] = loadCfg.ContextLength
+	}
+	if loadCfg.FlashAttention {
+		body["flash_attention"] = true
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -781,8 +766,12 @@ func (p *OpenAICompatible) loadModelHTTP(ctx context.Context, base, modelID stri
 		}
 		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if resp.StatusCode == 404 {
-			lastErr = fmt.Errorf("%s: 404", path)
+		// Treat any 4xx as path-recoverable so a 400 from /api/v1 (newer
+		// LM Studio with strict schema) falls through to /api/v0 instead
+		// of aborting the whole load. 5xx still aborts because retrying
+		// the same payload against the older endpoint won't help.
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			lastErr = fmt.Errorf("%s %s: %s", path, resp.Status, strings.TrimSpace(string(respBody)))
 			continue
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -801,14 +790,6 @@ func (p *OpenAICompatible) loadModelHTTP(ctx context.Context, base, modelID stri
 						echo.LoadConfig.ContextLength, loadCfg.ContextLength)
 				}
 			}
-		}
-		// Surface the full echoed config to stderr when ParallelSlots was
-		// requested. LM Studio's actual slot field has moved between
-		// versions and spellings — logging the echo lets the user (and
-		// future code) see exactly which field LM Studio accepted and
-		// whether it matches the requested value.
-		if loadCfg.ParallelSlots > 0 && len(respBody) > 0 {
-			fmt.Fprintf(os.Stderr, "lm-studio load echo [%s]: %s\n", path, strings.TrimSpace(string(respBody)))
 		}
 		return nil
 	}
