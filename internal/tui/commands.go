@@ -30,11 +30,22 @@ func (m *model) handleModelCommand(fields []string) string {
 		case "reload":
 			ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 			defer cancel()
-			modelID, err := m.agentRuntime.ReloadCurrentModel(ctx)
-			if err != nil {
+			result, err := m.agentRuntime.ReloadCurrentModel(ctx)
+			// Three outcomes: full reload, metadata-only refresh (backend
+			// can't load programmatically), or hard failure.
+			if err != nil && !result.Refreshed {
 				return t.ErrorStyle.Render("Model reload failed: " + err.Error())
 			}
-			return t.Success.Render(fmt.Sprintf("Model reloaded: %s", modelID)) +
+			if err != nil {
+				// Backend doesn't support reload but we still re-classified
+				// the backend and refreshed DetectedContext / LastProviderUsed.
+				// Render as a notice, not an error, so the user sees the
+				// actionable instruction without a red banner suggesting
+				// nothing happened.
+				return t.Warning.Render(fmt.Sprintf("Metadata refreshed for %s (%s)", result.ModelID, result.Backend)) +
+					"\n" + t.Muted.Render(err.Error())
+			}
+			return t.Success.Render(fmt.Sprintf("Model reloaded: %s (%s)", result.ModelID, result.Backend)) +
 				t.Muted.Render(fmt.Sprintf(" (parallel_slots=%d)", m.agentRuntime.Config.ModelLoading.ParallelSlots))
 		case "set":
 			if len(fields) < 3 {

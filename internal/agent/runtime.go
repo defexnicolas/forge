@@ -619,32 +619,75 @@ func (r *Runtime) EnsureRoleModelLoaded(ctx context.Context, provider llm.Provid
 	return nil
 }
 
-// ReloadCurrentModel forces a provider-side load of the model for the current
-// mode, applying the configured context length and parallel generation slots
-// even if the runtime already marked that model as loaded.
-func (r *Runtime) ReloadCurrentModel(ctx context.Context) (string, error) {
+// ReloadResult describes the outcome of a /model reload. Loaded is false when
+// the backend doesn't support programmatic reload (llama-server, generic
+// OpenAI) — but Refreshed is still true because we always re-classify the
+// backend, re-probe the model, and update LastProviderUsed +
+// DetectedContext. The caller renders different messages for each combo.
+type ReloadResult struct {
+	ModelID   string
+	Backend   string // resolved backend name (lmstudio / llama-server / openai)
+	Refreshed bool   // metadata caches were updated (always true on success)
+	Loaded    bool   // server-side LoadModel actually ran
+}
+
+// ReloadCurrentModel re-detects the active provider's backend, re-probes the
+// model for fresh metadata, and (when supported) forces a server-side reload
+// applying the configured context length and parallel slots. It is the
+// user's "refresh everything about the current model" hammer — invoking it
+// after hot-swapping the listening server (llama-server ↔ LM Studio at the
+// same URL) recovers from a stale BackendKind cache that the ordinary
+// per-turn flow can't invalidate.
+func (r *Runtime) ReloadCurrentModel(ctx context.Context) (ReloadResult, error) {
 	if r == nil {
-		return "", fmt.Errorf("runtime unavailable")
+		return ReloadResult{}, fmt.Errorf("runtime unavailable")
 	}
 	provider, _, err := r.resolveProvider()
 	if err != nil {
-		return "", err
+		return ReloadResult{}, err
 	}
 	role := r.modelRoleForMode()
 	modelID := r.roleModel(role)
 	if modelID == "" {
-		return "", fmt.Errorf("model id is required")
+		return ReloadResult{}, fmt.Errorf("model id is required")
 	}
-	// llama-server and friends can't reload programmatically — context size is
-	// fixed at server launch (--ctx-size). Surface an actionable message
-	// instead of letting LoadModel fall through to a "404 / lms not found"
-	// stack that hides the real fix.
+	// Force backend re-classification before any capability checks. Catches
+	// the case where the user swapped the server listening at BaseURL
+	// (llama-server ↔ LM Studio) without going through Forge's provider
+	// form — the cached BackendKind would otherwise stay stuck on the
+	// previous answer.
+	if refresher, ok := provider.(llm.BackendRefresher); ok {
+		rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		refresher.RefreshBackend(rctx)
+		cancel()
+	}
+	// Refresh the per-role detected context too. Probe is cheap (one HTTP
+	// call) and gives us LoadedContextLength for the status bar denominator
+	// without waiting for the next user turn. Also covers /props for
+	// llama-server, where /v1/models doesn't carry the field.
+	pctx, pcancel := context.WithTimeout(ctx, 5*time.Second)
+	if info, perr := provider.ProbeModel(pctx, modelID); perr == nil && info != nil && info.LoadedContextLength > 0 {
+		r.SetDetectedContext(role, &config.DetectedContext{
+			ModelID:             info.ID,
+			LoadedContextLength: info.LoadedContextLength,
+			MaxContextLength:    info.MaxContextLength,
+			ProbedAt:            time.Now().UTC(),
+		})
+	}
+	pcancel()
+	backend := provider.Name()
+	if bn, ok := provider.(llm.BackendNamer); ok {
+		backend = bn.BackendName()
+	}
+	r.SetLastProviderUsed(backend)
+	result := ReloadResult{ModelID: modelID, Backend: backend, Refreshed: true}
+	// Backends that can't honor a programmatic load (llama-server, generic
+	// OpenAI): the metadata refresh is the most useful work we can do. The
+	// caller decides whether to surface this as informational or as a
+	// soft-error — an error is returned so existing UIs don't silently
+	// pretend the actual load happened.
 	if loader, ok := provider.(llm.ExplicitLoader); ok && !loader.SupportsExplicitLoad() {
-		backend := provider.Name()
-		if bn, ok := provider.(llm.BackendNamer); ok {
-			backend = bn.BackendName()
-		}
-		return modelID, fmt.Errorf("provider %q (%s) does not support programmatic model reload — restart the server with the desired --ctx-size to change the window", provider.Name(), backend)
+		return result, fmt.Errorf("provider %q (%s) does not support programmatic model reload — restart the server with the desired --ctx-size to change the window", provider.Name(), backend)
 	}
 	contextLength := r.Config.Context.ModelContextTokens
 	if detected := config.DetectedForRole(r.Config, role, modelID); detected != nil && detected.LoadedContextLength > 0 {
@@ -662,13 +705,14 @@ func (r *Runtime) ReloadCurrentModel(ctx context.Context) (string, error) {
 		FlashAttention: true,
 		ParallelSlots:  r.Config.ModelLoading.ParallelSlots,
 	}); err != nil {
-		return modelID, err
+		return result, err
 	}
 	r.mu.Lock()
 	r.startupReloadDone = true
 	r.mu.Unlock()
 	r.MarkModelLoaded(modelID)
-	return modelID, nil
+	result.Loaded = true
+	return result, nil
 }
 
 // Close releases resources owned by the runtime (currently the tasks DB).

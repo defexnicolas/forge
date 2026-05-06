@@ -101,6 +101,18 @@ func (p *OpenAICompatible) resolveBackend(ctx context.Context) Backend {
 	return p.classifyAndCache(models)
 }
 
+// RefreshBackend invalidates the cached backend kind and re-classifies by
+// probing /v1/models. Useful after the user changes which server is listening
+// at the configured BaseURL — e.g. they stopped llama-server and started LM
+// Studio at the same port without going through Forge's provider form. The
+// cached BackendKind would otherwise stay stuck on the previous value, and
+// SupportsExplicitLoad / BackendName would lie. /model reload uses this to
+// force a fresh detection before deciding what to do.
+func (p *OpenAICompatible) RefreshBackend(ctx context.Context) {
+	p.backend.Store(int32(BackendUnknown))
+	p.resolveBackend(ctx)
+}
+
 // classifyAndCache classifies the backend from an already-fetched models slice
 // and stores the result. Lets ProbeModel reuse the rows it just retrieved
 // instead of forcing a second /v1/models roundtrip via resolveBackend, and

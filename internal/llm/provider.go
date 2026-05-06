@@ -133,6 +133,15 @@ type BackendNamer interface {
 	BackendName() string
 }
 
+// BackendRefresher is implemented by providers that cache an auto-detected
+// backend kind and want to expose a way to invalidate the cache. /model
+// reload calls this to recover from a stale classification when the user
+// hot-swapped the listening server (e.g. stopped llama-server and started
+// LM Studio at the same port) without going through the provider form.
+type BackendRefresher interface {
+	RefreshBackend(ctx context.Context)
+}
+
 type Registry struct {
 	mu        sync.RWMutex
 	providers map[string]Provider

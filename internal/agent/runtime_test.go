@@ -1019,12 +1019,15 @@ func TestReloadCurrentModelAppliesParallelSlots(t *testing.T) {
 	providers.Register(provider)
 	runtime := newTestRuntime(t, cwd, cfg, registry, providers)
 
-	modelID, err := runtime.ReloadCurrentModel(context.Background())
+	result, err := runtime.ReloadCurrentModel(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if modelID != "planner-model" {
-		t.Fatalf("modelID = %q, want planner-model", modelID)
+	if result.ModelID != "planner-model" {
+		t.Fatalf("ModelID = %q, want planner-model", result.ModelID)
+	}
+	if !result.Loaded {
+		t.Fatalf("expected Loaded=true for fake provider, got %#v", result)
 	}
 	if len(provider.loadConfigs) != 1 {
 		t.Fatalf("expected one load config, got %#v", provider.loadConfigs)
