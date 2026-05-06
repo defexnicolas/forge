@@ -1,6 +1,7 @@
 package session
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -19,6 +20,17 @@ type Store struct {
 	id     string
 	dir    string
 	events string
+	// currentTurnID holds the TurnID of the in-flight agent turn so every
+	// LogAgentEvent can stamp its record with that ID. Set when an
+	// EventTurnStart arrives, cleared when EventTurnEnd is processed.
+	// Empty between turns — events outside a turn (commands, side calls)
+	// land with TurnID="" and are never filtered as part of a turn.
+	currentTurnID string
+	// turnEventBuffer accumulates the events of the in-flight turn so we
+	// can classify the outcome at EventTurnEnd time without re-reading
+	// the JSONL log. Cleared on EventTurnEnd. Capped indirectly by the
+	// max-step cap of the runtime.
+	turnEventBuffer []agent.Event
 }
 
 type Info struct {
@@ -38,7 +50,41 @@ type Event struct {
 	Summary  string          `json:"summary,omitempty"`
 	Diff     string          `json:"diff,omitempty"`
 	Error    string          `json:"error,omitempty"`
+	// TurnID groups events that belong to the same agent turn so the
+	// context renderer can drop everything from an aborted turn at once.
+	// Empty string is treated as "ungrouped" (legacy events from before
+	// turn tracking — never filtered).
+	TurnID string `json:"turn_id,omitempty"`
+	// Outcome is set only on EventTurnEnd records. Values: "completed"
+	// (turn produced a final answer or finished a checklist), "aborted"
+	// (narration loop, parse-failures-exhausted, max-steps cap — model
+	// didn't actually fail at the user task), "failed" (real error like
+	// repeated tool failure or policy denial). Used by contextEvents to
+	// decide whether the turn's contents reach the next prompt.
+	Outcome string `json:"outcome,omitempty"`
+	// Transient marks events that the runtime knows are recovery noise:
+	// parse retries, narration-loop cancels, soft-nudge stops. Filtered
+	// out of context rendering even when their parent turn's outcome is
+	// completed (the turn recovered, but the failed attempts shouldn't
+	// pollute the next turn's prompt).
+	Transient bool `json:"transient,omitempty"`
 }
+
+// Turn outcomes. Mirrored as constants so callers don't typo the string.
+const (
+	OutcomeCompleted = "completed"
+	OutcomeAborted   = "aborted"
+	OutcomeFailed    = "failed"
+)
+
+// Turn lifecycle event types. These are session-store-only sentinels —
+// they do not have agent.Event* counterparts because the runtime
+// constructs them directly via Store.LogTurnStart / LogTurnEnd.
+const (
+	EventTurnStart         = "turn_start"
+	EventTurnEnd           = "turn_end"
+	EventCompactedHistory  = "compacted_history"
+)
 
 func New(cwd string) (*Store, error) {
 	id := time.Now().UTC().Format("20060102T150405Z")
@@ -213,12 +259,48 @@ func (s *Store) LogAgentEvent(event agent.Event) error {
 	if event.Type == agent.EventModelProgress {
 		return nil
 	}
+	// Turn lifecycle: stamp every event between EventTurnStart and
+	// EventTurnEnd with the same TurnID so the next prompt can drop a
+	// whole aborted turn at once. EventTurnEnd's outcome is classified
+	// here from the buffered events of the turn — keeping the logic in
+	// the session store means the runtime stays oblivious to context
+	// hygiene and only emits start/end markers.
+	switch event.Type {
+	case agent.EventTurnStart:
+		s.mu.Lock()
+		s.currentTurnID = event.TurnID
+		s.turnEventBuffer = nil
+		s.mu.Unlock()
+	case agent.EventTurnEnd:
+		s.mu.Lock()
+		buf := s.turnEventBuffer
+		s.turnEventBuffer = nil
+		// Classify outcome from the buffered events. Override the
+		// caller-provided TurnOutcome only when the runtime didn't set
+		// one (the default path).
+		if event.TurnOutcome == "" {
+			event.TurnOutcome = classifyTurnOutcome(buf)
+		}
+		s.currentTurnID = ""
+		s.mu.Unlock()
+	}
 	record := Event{
-		Time:     time.Now().UTC(),
-		Type:     event.Type,
-		Text:     event.Text,
-		ToolName: event.ToolName,
-		Input:    event.Input,
+		Time:        time.Now().UTC(),
+		Type:        event.Type,
+		Text:        event.Text,
+		ToolName:    event.ToolName,
+		Input:       event.Input,
+		TurnID:      event.TurnID,
+		Outcome:     event.TurnOutcome,
+		Transient:   event.Transient,
+	}
+	// Stamp TurnID from the running counter when the runtime didn't set
+	// one explicitly. This catches subagent emissions that come through
+	// the events channel without thinking about turn IDs.
+	if record.TurnID == "" {
+		s.mu.Lock()
+		record.TurnID = s.currentTurnID
+		s.mu.Unlock()
 	}
 	if event.Result != nil {
 		record.Summary = event.Result.Summary
@@ -230,12 +312,60 @@ func (s *Store) LogAgentEvent(event agent.Event) error {
 	if event.Error != nil {
 		record.Error = event.Error.Error()
 	}
+	// Buffer non-marker events so the EventTurnEnd handler above can
+	// inspect them when classifying outcome. Bounded implicitly by the
+	// runtime's max-step cap; explicit cap as a safety net.
+	if event.Type != agent.EventTurnStart && event.Type != agent.EventTurnEnd {
+		s.mu.Lock()
+		if s.currentTurnID != "" && len(s.turnEventBuffer) < 1000 {
+			s.turnEventBuffer = append(s.turnEventBuffer, event)
+		}
+		s.mu.Unlock()
+	}
 	liveErr := s.appendLiveLogForAgentEvent(event)
 	err := s.append(record)
 	if err != nil {
 		return err
 	}
 	return liveErr
+}
+
+// classifyTurnOutcome inspects the events of a completed turn and decides
+// whether it counts as completed, aborted, or failed. The classification
+// is conservative: anything that didn't ALSO trip a real failure and
+// reached a clean EventDone is "completed". Only the runtime's own
+// "stopped: ..." / "narration loop detected" / "parse error (attempt
+// N/N)" / "agent stopped after N steps" patterns mark a turn aborted.
+// "tool X failed N times" patterns mark it failed.
+func classifyTurnOutcome(buf []agent.Event) string {
+	var lastError string
+	for _, e := range buf {
+		if e.Type == agent.EventError && e.Error != nil {
+			lastError = e.Error.Error()
+		}
+	}
+	if lastError == "" {
+		return OutcomeCompleted
+	}
+	low := strings.ToLower(lastError)
+	switch {
+	case strings.Contains(low, "narration loop detected"),
+		strings.Contains(low, "parse error (attempt "),
+		strings.Contains(low, "consecutive read-only tool calls"),
+		strings.Contains(low, "agent stopped after"),
+		strings.Contains(low, "build response(s) in prose"),
+		strings.Contains(low, "planner step(s) with no actionable progress"):
+		return OutcomeAborted
+	case strings.Contains(low, "failed") && strings.Contains(low, "times in a row"),
+		strings.Contains(low, "denied by"),
+		strings.Contains(low, "task ") && strings.Contains(low, "already failed"):
+		return OutcomeFailed
+	}
+	// Default: an EventError happened but didn't match a known pattern.
+	// Treat as completed since the turn may have recovered after the
+	// error and produced useful work — better to keep the turn visible
+	// than to silently hide it on a pattern miss.
+	return OutcomeCompleted
 }
 
 func (s *Store) appendLiveLogForAgentEvent(event agent.Event) error {
@@ -424,12 +554,184 @@ func FormatTail(events []Event) string {
 	return strings.TrimSpace(b.String())
 }
 
+// contextEvents returns the events that should be rendered to the next
+// turn's prompt. Two filters apply:
+//
+//  1. Drop the entire contents of any turn whose EventTurnEnd has
+//     Outcome="aborted" — narration loops, parse-failures-exhausted, and
+//     max-step caps are recovery noise that confuses the next turn into
+//     "I was just stuck, better tread carefully" loops.
+//  2. Drop individual Transient events even from completed turns —
+//     parse retries and soft-nudge stops happen, the model recovers,
+//     but their messages would still pollute the prompt if rendered.
+//
+// Events outside any turn (TurnID == "") are always preserved — those
+// are commands and side calls that have no concept of being aborted.
+// The on-disk JSONL log keeps everything for /sessions and /resume.
 func contextEvents(events []Event) []Event {
+	// Auto-compact replay: if there's an EventCompactedHistory marker,
+	// drop everything before it (it's already absorbed into the
+	// summary) and keep only the marker + everything after. The marker
+	// itself renders into the timeline as a single "compacted history"
+	// summary block — see FormatTail.
+	lastCompactIdx := -1
+	for i, e := range events {
+		if e.Type == EventCompactedHistory {
+			lastCompactIdx = i
+		}
+	}
+	if lastCompactIdx >= 0 {
+		events = events[lastCompactIdx:]
+	}
+	// First pass: build TurnID -> Outcome map.
+	outcomes := map[string]string{}
+	for _, e := range events {
+		if e.Type == agent.EventTurnEnd && e.TurnID != "" {
+			outcomes[e.TurnID] = e.Outcome
+		}
+	}
 	out := make([]Event, 0, len(events))
 	for _, event := range events {
+		if event.TurnID != "" && outcomes[event.TurnID] == OutcomeAborted {
+			continue
+		}
+		if event.Transient {
+			continue
+		}
+		// Skip the marker events themselves — they're internal
+		// bookkeeping, not useful in the rendered timeline.
+		if event.Type == agent.EventTurnStart || event.Type == agent.EventTurnEnd {
+			continue
+		}
 		out = append(out, compactPlanningEvent(event))
 	}
 	return out
+}
+
+// AutoCompact implements agent.AutoCompactor. Called by the runtime at
+// the top of each turn before building the next prompt. Decides whether
+// to compact based on the previous turn's token usage and the count of
+// non-compacted events; if so, dispatches the summarizer subagent and
+// records a synthetic EventCompactedHistory marker that future
+// contextEvents() calls render in place of the absorbed events.
+//
+// Non-fatal: any failure returns an error to the caller (which logs it
+// and proceeds with the un-compacted history). The session log on disk
+// is never destructively rewritten — the marker only changes what the
+// renderer shows; older events stay queryable via /sessions.
+func (s *Store) AutoCompact(ctx context.Context, opts agent.AutoCompactOptions) error {
+	if s == nil {
+		return nil
+	}
+	// Decide whether to compact. Two triggers (any one fires it):
+	//  - Token usage on the LAST turn was >= threshold * budget.
+	//  - More than MaxEvents non-compacted events have accumulated.
+	events, err := s.Tail(0)
+	if err != nil {
+		return fmt.Errorf("auto_compact: read tail: %w", err)
+	}
+	// Count events emitted AFTER the last EventCompactedHistory (if any).
+	tailStart := 0
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Type == EventCompactedHistory {
+			tailStart = i + 1
+			break
+		}
+	}
+	pending := events[tailStart:]
+	tokenTrigger := false
+	if opts.TokensBudget > 0 && opts.TokensUsed > 0 {
+		tokenTrigger = float64(opts.TokensUsed) >= opts.Threshold*float64(opts.TokensBudget)
+	}
+	eventTrigger := opts.MaxEvents > 0 && len(pending) >= opts.MaxEvents
+	if !tokenTrigger && !eventTrigger {
+		return nil
+	}
+	if opts.Runner == nil {
+		return fmt.Errorf("auto_compact: no SubagentRunner provided")
+	}
+	// Build the summarizer prompt from the pending events. We render
+	// them through contextEvents first so aborted turns don't poison
+	// the summary itself with their own noise — the summarizer should
+	// only ever see "real" history.
+	filtered := contextEvents(pending)
+	if len(filtered) == 0 {
+		return nil // nothing worth summarizing after filtering
+	}
+	transcript := FormatTail(filtered)
+	if strings.TrimSpace(transcript) == "" {
+		return nil
+	}
+	prompt := "Summarize the following session transcript into bullet points covering:\n" +
+		"- What was actually done (files edited, tools succeeded, decisions made)\n" +
+		"- What the user asked for (intent, constraints)\n" +
+		"- Any open questions or pending tasks\n" +
+		"Exclude: aborted attempts, parse retries, model self-talk, redundant tool re-reads.\n" +
+		"Aim for ≤ 60 lines, ≤ 1500 characters. Pure factual recap, no narration.\n\n" +
+		"=== TRANSCRIPT ===\n" + transcript
+	result, err := opts.Runner(ctx, agent.SubagentRequest{
+		Agent:  "summarizer",
+		Prompt: prompt,
+	})
+	if err != nil {
+		return fmt.Errorf("auto_compact: summarizer failed: %w", err)
+	}
+	summary := strings.TrimSpace(result.Summary)
+	if summary == "" {
+		// Fallback to content blocks if the result returned text but no
+		// summary line.
+		var b strings.Builder
+		for _, c := range result.Content {
+			if strings.TrimSpace(c.Text) != "" {
+				if b.Len() > 0 {
+					b.WriteByte('\n')
+				}
+				b.WriteString(strings.TrimSpace(c.Text))
+			}
+		}
+		summary = b.String()
+	}
+	if summary == "" {
+		return fmt.Errorf("auto_compact: summarizer produced empty output")
+	}
+	// Append the marker. This event has no TurnID — it's session-scoped,
+	// not turn-scoped. contextEvents passes EventCompactedHistory
+	// through verbatim (it's not an aborted-turn event and not
+	// transient). The summary lives in Text (FormatTail's primary
+	// rendering field) so it shows up directly in the next prompt; the
+	// raw count metadata goes in Summary for /sessions debug views.
+	marker := Event{
+		Time:    time.Now().UTC(),
+		Type:    EventCompactedHistory,
+		Text:    summary,
+		Summary: fmt.Sprintf("compacted %d events into %d-char summary", len(pending), len(summary)),
+	}
+	if err := s.append(marker); err != nil {
+		return fmt.Errorf("auto_compact: persist marker: %w", err)
+	}
+	return nil
+}
+
+// IsTransientErrorMessage reports whether a runtime error message
+// represents recovery noise (parse retries, narration cancels, soft-nudge
+// stops, max-step caps) rather than a real failure. Exposed so the
+// runtime can mark events transient when emitting them, instead of
+// relying on string matching here.
+func IsTransientErrorMessage(msg string) bool {
+	if msg == "" {
+		return false
+	}
+	low := strings.ToLower(msg)
+	switch {
+	case strings.Contains(low, "narration loop detected"),
+		strings.Contains(low, "parse error (attempt "),
+		strings.Contains(low, "consecutive read-only tool calls"),
+		strings.Contains(low, "agent stopped after"),
+		strings.Contains(low, "build response(s) in prose"),
+		strings.Contains(low, "planner step(s) with no actionable progress"):
+		return true
+	}
+	return false
 }
 
 func compactPlanningEvent(event Event) Event {

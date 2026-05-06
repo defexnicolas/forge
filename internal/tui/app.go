@@ -231,6 +231,13 @@ func newModel(options Options) model {
 	runtime.Builder.History = options.Session
 	runtime.Builder.Skills = options.Skills
 	runtime.Builder.ProjectState = options.ProjectState
+	// Wire the session store as the AutoCompactor so the runtime can
+	// trigger cross-turn history compression when the budget is
+	// approaching exhaustion. *session.Store implements
+	// agent.AutoCompactor; nil-safe (a non-nil session is required).
+	if options.Session != nil {
+		runtime.AutoCompactor = options.Session
+	}
 	if options.LSP != nil {
 		runtime.Builder.LSP = options.LSP
 	}

@@ -35,6 +35,50 @@ const (
 	EventReadBudget       = "read_budget"
 	EventError            = "error"
 	EventDone             = "done"
+	// EventTurnStart and EventTurnEnd bracket each agent turn so the
+	// session store can attribute every emitted event to the turn that
+	// produced it and the next turn's prompt can drop whole aborted
+	// turns. EventTurnEnd carries TurnOutcome ("completed" / "aborted" /
+	// "failed") in the Event struct.
+	EventTurnStart = "turn_start"
+	EventTurnEnd   = "turn_end"
+)
+
+// SubagentRunner is the function signature of Runtime.RunSubagent —
+// extracted so AutoCompactor implementations can dispatch the
+// summarizer subagent without needing a *Runtime reference.
+type SubagentRunner func(context.Context, SubagentRequest) (tools.Result, error)
+
+// AutoCompactOptions carries the per-turn parameters needed to decide
+// whether to compact and how. The runtime fills these from its own
+// state and config; the AutoCompactor decides whether the thresholds
+// are met and runs the summarizer if so.
+type AutoCompactOptions struct {
+	Runner       SubagentRunner
+	TokensUsed   int     // Last turn's prompt token count
+	TokensBudget int     // Configured context budget
+	Threshold    float64 // Fraction of budget that triggers compaction
+	MaxEvents    int     // Secondary trigger by event count
+}
+
+// AutoCompactor compresses older session history into a single summary
+// when the budget is approaching exhaustion. Implemented by
+// *session.Store; the runtime invokes it at the top of run() before
+// building the next prompt.
+type AutoCompactor interface {
+	AutoCompact(ctx context.Context, opts AutoCompactOptions) error
+}
+
+// Turn outcome values for EventTurnEnd.TurnOutcome. Mirrored as the
+// session.Outcome* constants so callers don't typo the string. "aborted"
+// covers narration loops, parse-failures-exhausted, and max-step caps —
+// the model didn't actually fail at the user task, so the work shouldn't
+// pollute the next turn. "failed" is for real errors (repeated tool
+// failures, policy denial). "completed" is the happy path.
+const (
+	TurnOutcomeCompleted = "completed"
+	TurnOutcomeAborted   = "aborted"
+	TurnOutcomeFailed    = "failed"
 )
 
 // ReadBudgetState reports the running count of consecutive read-only tool
@@ -77,6 +121,20 @@ type Event struct {
 	SubagentProgress *SubagentProgress
 	ReadBudget       *ReadBudgetState
 	Error            error
+	// TurnID groups events belonging to the same agent turn so the
+	// session store can drop a whole aborted turn from the next prompt
+	// while keeping it on disk for /resume. Set by run() at the top of
+	// the turn and copied onto every emitted event. Empty for events
+	// outside an active turn (e.g. /commands, /btw side calls).
+	TurnID string
+	// Transient marks recovery-noise events (parse retries, narration
+	// cancels, soft-nudge stops) that should be excluded from future
+	// prompt rendering even when the parent turn completed normally.
+	Transient bool
+	// TurnOutcome is set only on EventTurnEnd events. Values: "completed"
+	// / "aborted" / "failed". The session store uses it to filter whole
+	// aborted turns out of the next prompt's recent timeline.
+	TurnOutcome string
 	// Side marks events emitted by a parallel `/btw` call. TUI renders these
 	// muted with a [btw] prefix and they do not participate in the tool loop.
 	Side bool
@@ -238,6 +296,15 @@ type Runtime struct {
 	// (e.g. the builder via execute_task) read it so they can raise approval
 	// prompts for their own mutating tool calls. Nil when no turn is active.
 	activeEvents chan<- Event
+	// activeTurnID groups every event emitted during the current turn so
+	// the session store can drop a whole aborted turn from the next
+	// prompt while keeping it on disk. Empty between turns.
+	activeTurnID string
+	// AutoCompactor, when set, is invoked at the top of each turn to
+	// compress older session history into a summary if the configured
+	// threshold has been crossed. The TUI wires this to *session.Store.
+	// nil disables auto-compact entirely.
+	AutoCompactor AutoCompactor
 	// activeBuilderTask carries the currently executing builder task metadata
 	// so mutation approval can enforce per-task file strategies.
 	activeBuilderTask *builderTaskGuard
@@ -1196,20 +1263,69 @@ func minInt(a, b int) int {
 
 func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Event) {
 	turnStart := time.Now()
+	// Stable per-turn ID emitted on EventTurnStart so the session store
+	// can group every subsequent event under it and the next turn's
+	// prompt builder can drop whole aborted turns. UnixNano + a counter
+	// would be overkill — run() is single-threaded per Runtime, so the
+	// nanosecond timestamp is unique enough.
+	turnID := fmt.Sprintf("t-%d", turnStart.UnixNano())
 	r.mu.Lock()
 	r.activeEvents = events
+	r.activeTurnID = turnID
 	r.mu.Unlock()
 	r.turnStepsUsed.Store(0)
 	r.turnReadOnlySteps.Store(0)
 	r.turnMutatingSteps.Store(0)
+	// Mark the start of this turn for the session store. Carries the
+	// user message preview so /sessions can render the turn header
+	// without having to look up the first user event.
+	preview := strings.TrimSpace(userMessage)
+	if len(preview) > 200 {
+		preview = preview[:200] + "..."
+	}
+	events <- Event{Type: EventTurnStart, TurnID: turnID, Text: preview}
+	// Auto-compact: if the session history is approaching the budget,
+	// dispatch the summarizer subagent to replace older events with a
+	// single bullet-list summary BEFORE we build the next prompt. Runs
+	// non-fatally — if the summarizer fails or the threshold isn't met,
+	// the turn proceeds with the unmodified history. config.toml's
+	// auto_compact = true is the master switch.
+	if r.Config.Context.AutoCompact && r.AutoCompactor != nil {
+		threshold := r.Config.Context.AutoCompactThreshold
+		if threshold <= 0 {
+			threshold = 0.7
+		}
+		maxEvents := r.Config.Context.AutoCompactMaxEvents
+		if maxEvents <= 0 {
+			maxEvents = 30
+		}
+		if err := r.AutoCompactor.AutoCompact(ctx, AutoCompactOptions{
+			Runner:       r.RunSubagent,
+			TokensUsed:   r.LastTokensUsed,
+			TokensBudget: r.LastTokensBudget,
+			Threshold:    threshold,
+			MaxEvents:    maxEvents,
+		}); err != nil {
+			// Non-fatal: log and proceed with un-compacted history.
+			// Better a long prompt than a turn that dies on a
+			// summarizer hiccup.
+			fmt.Fprintf(os.Stderr, "[forge] auto_compact skipped: %v\n", err)
+		}
+	}
 	// Note: read cache is intentionally NOT reset here. It's session-scoped
 	// so that build mode reuses reads explore/plan already pulled, instead
 	// of re-fetching the same files from disk and re-prefilling them into
 	// the prompt. lookupReadCache stats the file's mtime before serving so
 	// external edits (user saves in VS Code between turns) are detected.
 	defer func() {
+		// Emit the turn-end marker BEFORE clearing activeEvents/turnID so
+		// the session-store consumer still sees a coherent state. Outcome
+		// classification is delegated to the session store, which has the
+		// full event log for the turn — keeping the logic in one place.
+		events <- Event{Type: EventTurnEnd, TurnID: turnID}
 		r.mu.Lock()
 		r.activeEvents = nil
+		r.activeTurnID = ""
 		r.LastTurnStepsUsed = int(r.turnStepsUsed.Load())
 		r.LastTurnReadOnlySteps = int(r.turnReadOnlySteps.Load())
 		r.LastTurnMutatingSteps = int(r.turnMutatingSteps.Load())

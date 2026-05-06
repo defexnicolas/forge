@@ -142,15 +142,29 @@ type ProviderConfig struct {
 }
 
 type ContextConfig struct {
-	Engine              string                     `toml:"engine"`
-	BudgetTokens        int                        `toml:"budget_tokens"`
-	AutoCompact         bool                       `toml:"auto_compact"`
-	ModelContextTokens  int                        `toml:"model_context_tokens"`
-	ReserveOutputTokens int                        `toml:"reserve_output_tokens"`
-	Yarn                YarnConfig                 `toml:"yarn"`
-	Task                TaskContextConfig          `toml:"task"`
-	Detected            *DetectedContext           `toml:"detected,omitempty"`
-	DetectedByRole      map[string]DetectedContext `toml:"detected_by_role,omitempty"`
+	Engine       string `toml:"engine"`
+	BudgetTokens int    `toml:"budget_tokens"`
+	// AutoCompact enables the cross-turn history compactor: when the
+	// previous turn used more than AutoCompactThreshold of the budget,
+	// the next turn dispatches the summarizer subagent to replace older
+	// events with a compact bullet summary before building the prompt.
+	// Without this, a long session grows linearly until the user hits
+	// /compact manually.
+	AutoCompact bool `toml:"auto_compact"`
+	// AutoCompactThreshold is the fraction of BudgetTokens that triggers
+	// auto-compact. Default 0.7 (70%). Range (0, 1]; values <=0 use the
+	// default. Lower = compact more aggressively.
+	AutoCompactThreshold float64 `toml:"auto_compact_threshold"`
+	// AutoCompactMaxEvents is the secondary trigger — if more than this
+	// many session events have accumulated since the last compaction
+	// (regardless of token usage), compact. Default 30.
+	AutoCompactMaxEvents int                        `toml:"auto_compact_max_events"`
+	ModelContextTokens   int                        `toml:"model_context_tokens"`
+	ReserveOutputTokens  int                        `toml:"reserve_output_tokens"`
+	Yarn                 YarnConfig                 `toml:"yarn"`
+	Task                 TaskContextConfig          `toml:"task"`
+	Detected             *DetectedContext           `toml:"detected,omitempty"`
+	DetectedByRole       map[string]DetectedContext `toml:"detected_by_role,omitempty"`
 }
 
 type RuntimeConfig struct {

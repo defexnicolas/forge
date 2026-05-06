@@ -1,6 +1,9 @@
 package session
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -169,5 +172,165 @@ func TestContextTextCompactsPlanningArtifacts(t *testing.T) {
 	}
 	if !strings.Contains(text, "go test ./... passed") {
 		t.Fatalf("expected non-planning event preserved, got:\n%s", text)
+	}
+}
+
+// TestContextDropsAbortedTurns pins the core promise of Fix 3 + Fix 1:
+// when a turn ends with TurnOutcome=aborted (narration loop, parse retry
+// exhausted, etc.) NO event from that turn is rendered to the next
+// prompt. The model should not see its own cancelled monologue and start
+// apologizing about being stuck.
+func TestContextDropsAbortedTurns(t *testing.T) {
+	cwd := t.TempDir()
+	store, err := New(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Turn 1: aborted. Has user input + a cancelled assistant reply.
+	turn1 := "t-1"
+	if err := store.LogAgentEvent(agent.Event{Type: agent.EventTurnStart, TurnID: turn1, Text: "investigá la combat log"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LogAgentEvent(agent.Event{Type: agent.EventAssistantText, TurnID: turn1, Text: "I keep saying the same thing over and over"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LogAgentEvent(agent.Event{Type: agent.EventError, TurnID: turn1, Error: errors.New(`narration loop detected (line "let me think" repeated 3 times); cancelled stream`)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LogAgentEvent(agent.Event{Type: agent.EventTurnEnd, TurnID: turn1}); err != nil {
+		t.Fatal(err)
+	}
+	// Turn 2: completed cleanly. Has a real assistant answer.
+	turn2 := "t-2"
+	if err := store.LogAgentEvent(agent.Event{Type: agent.EventTurnStart, TurnID: turn2, Text: "ok now answer me"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LogAgentEvent(agent.Event{Type: agent.EventAssistantText, TurnID: turn2, Text: "Combat log lives in src/Game.tsx:142"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LogAgentEvent(agent.Event{Type: agent.EventTurnEnd, TurnID: turn2}); err != nil {
+		t.Fatal(err)
+	}
+
+	text := store.ContextText(20)
+	if strings.Contains(text, "I keep saying the same thing") {
+		t.Errorf("aborted-turn assistant text leaked into context:\n%s", text)
+	}
+	if strings.Contains(text, "narration loop detected") {
+		t.Errorf("aborted-turn error leaked into context:\n%s", text)
+	}
+	if !strings.Contains(text, "Combat log lives in src/Game.tsx") {
+		t.Errorf("completed-turn answer was filtered (should be preserved):\n%s", text)
+	}
+}
+
+// TestClassifyTurnOutcomeRecognizesPatterns pins the heuristics that
+// decide whether a turn was aborted vs failed vs completed. If any of
+// these patterns drift in the runtime's error messages, this test fails
+// loudly so we update the classifier in lockstep.
+func TestClassifyTurnOutcomeRecognizesPatterns(t *testing.T) {
+	cases := []struct {
+		name string
+		err  string
+		want string
+	}{
+		{"narration loop", `narration loop detected (line "x" repeated 3 times)`, OutcomeAborted},
+		{"parse exhausted", `parse error (attempt 3/3) [parser=qwen model=gpt-oss-20b]: invalid JSON`, OutcomeAborted},
+		{"max steps", `agent stopped after 40 steps in build mode`, OutcomeAborted},
+		{"soft-nudge stop", `stopped: 15 consecutive read-only tool calls — you ignored the soft nudge`, OutcomeAborted},
+		{"build prose stuck", `stopped: 3 build response(s) in prose with checklist tasks still active`, OutcomeAborted},
+		{"plan no progress", `stopped: 2 planner step(s) with no actionable progress`, OutcomeAborted},
+		{"tool failed", `tool edit_file failed 3 times in a row — stopping to avoid infinite loop`, OutcomeFailed},
+		{"policy denial", `denied by command policy: rm -rf /`, OutcomeFailed},
+		{"task already failed", `task plan-3 already failed in this turn; refusing repeated execute_task retry`, OutcomeFailed},
+		{"unknown error", `something weird happened`, OutcomeCompleted},
+		{"no error", "", OutcomeCompleted},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := []agent.Event{}
+			if tc.err != "" {
+				buf = append(buf, agent.Event{Type: agent.EventError, Error: errors.New(tc.err)})
+			}
+			got := classifyTurnOutcome(buf)
+			if got != tc.want {
+				t.Errorf("classifyTurnOutcome(%q) = %q, want %q", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAutoCompactSkipsBelowThreshold confirms the compaction is a no-op
+// when neither token usage nor event count crosses the trigger.
+func TestAutoCompactSkipsBelowThreshold(t *testing.T) {
+	cwd := t.TempDir()
+	store, err := New(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LogUser("first"); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	runner := func(ctx context.Context, req agent.SubagentRequest) (tools.Result, error) {
+		called = true
+		return tools.Result{}, nil
+	}
+	err = store.AutoCompact(context.Background(), agent.AutoCompactOptions{
+		Runner:       runner,
+		TokensUsed:   100,
+		TokensBudget: 10000, // 1% — way under any reasonable threshold
+		Threshold:    0.7,
+		MaxEvents:    100,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if called {
+		t.Error("summarizer should not have been invoked when below threshold")
+	}
+}
+
+// TestAutoCompactInvokesSummarizerAndRecordsMarker drives the happy path:
+// threshold crossed → summarizer called → marker appended → next
+// ContextText renders the summary in place of the absorbed events.
+func TestAutoCompactInvokesSummarizerAndRecordsMarker(t *testing.T) {
+	cwd := t.TempDir()
+	store, err := New(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		if err := store.LogUser(fmt.Sprintf("turn %d input", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gotPrompt := ""
+	runner := func(ctx context.Context, req agent.SubagentRequest) (tools.Result, error) {
+		gotPrompt = req.Prompt
+		return tools.Result{
+			Title:   "summarizer",
+			Summary: "User explored the combat log; touched src/Game.tsx.",
+		}, nil
+	}
+	err = store.AutoCompact(context.Background(), agent.AutoCompactOptions{
+		Runner:       runner,
+		TokensUsed:   8000,
+		TokensBudget: 10000,
+		Threshold:    0.7,
+		MaxEvents:    1000,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(gotPrompt, "TRANSCRIPT") {
+		t.Errorf("summarizer prompt missing transcript section, got: %s", gotPrompt)
+	}
+	// The next context render must include the summary, not the
+	// individual user events that were absorbed.
+	text := store.ContextText(20)
+	if !strings.Contains(text, "combat log") {
+		t.Errorf("ContextText should render the summary, got:\n%s", text)
 	}
 }
