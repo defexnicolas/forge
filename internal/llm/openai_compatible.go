@@ -538,22 +538,87 @@ func (p *OpenAICompatible) ProbeModel(ctx context.Context, modelID string) (*Mod
 		return nil, fmt.Errorf("provider %s returned no models", p.name)
 	}
 	generic := modelID == "" || modelID == "local-model"
-	// First pass: exact ID match.
+	// Pick the right ModelInfo to return (exact ID match, first loaded, then
+	// first entry). Then enrich it with backend-specific context metadata
+	// before returning.
+	var picked *ModelInfo
 	if !generic {
 		for i := range models {
 			if models[i].ID == modelID {
-				return &models[i], nil
+				picked = &models[i]
+				break
 			}
 		}
 	}
-	// Second pass: first loaded model.
-	for i := range models {
-		if models[i].State == "loaded" {
-			return &models[i], nil
+	if picked == nil {
+		for i := range models {
+			if models[i].State == "loaded" {
+				picked = &models[i]
+				break
+			}
 		}
 	}
-	// Fallback: first entry.
-	return &models[0], nil
+	if picked == nil {
+		picked = &models[0]
+	}
+	// llama-server doesn't populate loaded_context_length on /v1/models — it
+	// only exists in LM Studio's enhanced response. To make the status bar's
+	// ctx:N/Mk denominator meaningful, query /props (llama-server's native
+	// status endpoint) and pull n_ctx from default_generation_settings. With
+	// --parallel K this is the per-slot window, which is exactly what each
+	// request gets, so it's the right number to display.
+	if picked.LoadedContextLength == 0 && p.resolveBackend(ctx) == BackendLlamaServer {
+		if n := p.probeLlamaServerCtx(ctx); n > 0 {
+			picked.LoadedContextLength = n
+			if picked.MaxContextLength == 0 {
+				picked.MaxContextLength = n
+			}
+		}
+	}
+	return picked, nil
+}
+
+// probeLlamaServerCtx fetches /props from llama-server and returns the
+// per-slot context window in tokens. Returns 0 on any failure — the caller
+// must treat this as best-effort enrichment, not a hard requirement.
+//
+// Response shape (as of llama.cpp 2024+):
+//
+//	{ "default_generation_settings": { "n_ctx": 32768 }, ... }
+//
+// Older builds put n_ctx at the top level; we accept both spellings.
+func (p *OpenAICompatible) probeLlamaServerCtx(ctx context.Context) int {
+	base := strings.TrimRight(p.cfg.BaseURL, "/")
+	stripped := strings.TrimSuffix(base, "/v1")
+	url := stripped + "/props"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0
+	}
+	if apiKey := p.apiKey(); apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return 0
+	}
+	var decoded struct {
+		DefaultGenerationSettings struct {
+			NCtx int `json:"n_ctx"`
+		} `json:"default_generation_settings"`
+		NCtx int `json:"n_ctx"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		return 0
+	}
+	if decoded.DefaultGenerationSettings.NCtx > 0 {
+		return decoded.DefaultGenerationSettings.NCtx
+	}
+	return decoded.NCtx
 }
 
 // LoadModel asks LM Studio to load the given model with custom context length
