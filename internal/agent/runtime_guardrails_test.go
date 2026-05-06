@@ -118,6 +118,50 @@ func TestActiveReadBudget(t *testing.T) {
 	}
 }
 
+func TestIsLikelyCodeLine(t *testing.T) {
+	// The narration-loop guard skips code-shaped lines so a real file with
+	// repeated code (3 useEffect blocks, identical struct field tags, etc.)
+	// does not trigger a false-positive cancel. These cases pin the
+	// heuristic to the exact failure the user reported and the obvious
+	// adjacent shapes.
+	cases := []struct {
+		name string
+		line string
+		want bool
+	}{
+		// User's reported false-positive — a React component with 3 useEffects.
+		{"useeffect open brace arrow", "useeffect(() => {", true},
+		{"useeffect close brace", "}, []);", true},
+		{"react jsx-ish closing", "});", true},
+
+		// Adjacent code shapes that should also be exempt.
+		{"function decl", "function handleClick() {", true},
+		{"const arrow", "const handler = () => {", true},
+		{"import statement", "import react from 'react';", true},
+		{"export default", "export default function home() {", true},
+		{"go func decl", "func (r *runtime) run() {", true},
+		{"return stmt", "return null;", true},
+		{"closing brace longer", "}     // close component", true},
+		{"go struct tag", "name string //json field", false /* no code shape */},
+		{"semicolon end", "dosomething();", true},
+
+		// Legit narration — must NOT be exempt, otherwise the guard is useless.
+		{"narration plain", "let me think about this for a second", false},
+		{"narration plain 2", "ok i will read the file now and then edit", false},
+		{"narration with mention of code", "i need to update the useeffect call", false},
+		{"narration ending punct", "alright moving on to the next task.", false},
+		{"narration colon end", "my plan now is the following:", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := isLikelyCodeLine(tc.line)
+			if got != tc.want {
+				t.Errorf("isLikelyCodeLine(%q) = %v, want %v", tc.line, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestExtendReadBudget(t *testing.T) {
 	// /reads extend N starts from the active config value when there's no
 	// override yet, then accumulates across calls.

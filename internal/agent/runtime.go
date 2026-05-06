@@ -1867,6 +1867,60 @@ func shouldRefundToolStep(name string) bool {
 	return false
 }
 
+// isLikelyCodeLine reports whether a normalized (lowercased + trimmed) line
+// looks like source code rather than prose narration. Used by the
+// narration-loop guard to avoid false positives when the model reads or
+// quotes a file that legitimately repeats the same code shape — a React
+// component with three useEffect blocks emits "useeffect(() => {" three
+// times and was tripping the guard ("repeated 3 times; cancelled stream").
+//
+// Heuristic: prose almost never combines parentheses with arrows or braces,
+// almost never ends in a semicolon, and almost never starts with an
+// import/export/function/const/return keyword. Any one of these matches is
+// enough — a line with both `(` and `=>` is code, even if it's the entire
+// repeated narration ("let me => think") because narration loops in
+// practice are short prose statements ("I'll edit this now."), not code-
+// shaped strings.
+func isLikelyCodeLine(norm string) bool {
+	if norm == "" {
+		return false
+	}
+	if strings.Contains(norm, "=>") {
+		return true
+	}
+	if strings.ContainsAny(norm, "{}") {
+		return true
+	}
+	if strings.HasSuffix(norm, ";") || strings.HasSuffix(norm, "),") || strings.HasSuffix(norm, "})") || strings.HasSuffix(norm, "});") {
+		return true
+	}
+	// Common code-line starters. Cheap prefix check beats a regex.
+	// Notably absent: `let `, `var `, `use ` — these are common English /
+	// Spanish narration starters ("let me think", "use this approach", etc.)
+	// and the actual code form almost always ends with `;` or contains
+	// `=>` / `{` / `}`, so the heuristic above already catches it. Keeping
+	// them here would mark "let me think for a second" as code and let real
+	// narration loops slip through.
+	switch {
+	case strings.HasPrefix(norm, "import "),
+		strings.HasPrefix(norm, "export "),
+		strings.HasPrefix(norm, "function "),
+		strings.HasPrefix(norm, "const "),
+		strings.HasPrefix(norm, "class "),
+		strings.HasPrefix(norm, "interface "),
+		strings.HasPrefix(norm, "await "),
+		strings.HasPrefix(norm, "async "),
+		strings.HasPrefix(norm, "def "),
+		strings.HasPrefix(norm, "func "),
+		strings.HasPrefix(norm, "package "),
+		strings.HasPrefix(norm, "//"),
+		strings.HasPrefix(norm, "/*"),
+		strings.HasPrefix(norm, "#include"):
+		return true
+	}
+	return false
+}
+
 // isReadOnlyExploration returns true for tools that merely inspect state
 // without changing it. Long runs of these with no mutation in between signal
 // an aimless-exploration stall.
@@ -2269,7 +2323,14 @@ func (r *Runtime) streamResponseWithInput(ctx context.Context, provider llm.Prov
 	loopReasoningLineStart := 0
 	const loopMinLineLen = 15
 	const loopThreshold = 3
-	checkLoopGuard := func(buf string, lineStart *int) (string, int, bool) {
+	// Track whether we're inside a fenced code block. Lines inside ``` are
+	// definitionally code (the model is quoting or showing source) and a
+	// component with 3 useEffect blocks legitimately repeats the same line
+	// 3 times. Toggle is per-buffer (text vs reasoning) — a fence opened in
+	// one channel does not extend into the other.
+	loopTextInFence := false
+	loopReasoningInFence := false
+	checkLoopGuard := func(buf string, lineStart *int, inFence *bool) (string, int, bool) {
 		for {
 			rest := buf[*lineStart:]
 			nl := strings.IndexByte(rest, '\n')
@@ -2278,12 +2339,31 @@ func (r *Runtime) streamResponseWithInput(ctx context.Context, provider llm.Prov
 			}
 			line := rest[:nl]
 			*lineStart += nl + 1
-			norm := strings.ToLower(strings.TrimSpace(line))
+			trimmed := strings.TrimSpace(line)
+			// Fence toggle. ``` (with optional language tag) opens or closes a
+			// block. Don't count the fence line itself either way.
+			if strings.HasPrefix(trimmed, "```") {
+				*inFence = !*inFence
+				continue
+			}
+			if *inFence {
+				continue
+			}
+			norm := strings.ToLower(trimmed)
 			if len(norm) < loopMinLineLen {
 				continue
 			}
 			if len(norm) > 100 {
 				norm = norm[:100]
+			}
+			// Code-shaped lines legitimately repeat in real files (3 useEffect
+			// blocks, multiple identical struct field tags, repeated `};` /
+			// `})`, etc.). Counting them as narration produces false positives
+			// the moment the model reads or quotes a file with duplicates. The
+			// no_progress / repeated-tool-call guards still catch genuine
+			// code-loop pathologies; this guard's job is prose-narration only.
+			if isLikelyCodeLine(norm) {
+				continue
 			}
 			loopSeen[norm]++
 			if loopSeen[norm] >= loopThreshold {
@@ -2327,7 +2407,7 @@ func (r *Runtime) streamResponseWithInput(ctx context.Context, provider llm.Prov
 			events <- Event{Type: EventAssistantDelta, Text: event.Text}
 			emitProgress("streaming", false)
 			loopReasoningBuf.WriteString(event.Text)
-			if line, count, hit := checkLoopGuard(loopReasoningBuf.String(), &loopReasoningLineStart); hit {
+			if line, count, hit := checkLoopGuard(loopReasoningBuf.String(), &loopReasoningLineStart, &loopReasoningInFence); hit {
 				cancel()
 				for range stream {
 				}
@@ -2367,7 +2447,7 @@ func (r *Runtime) streamResponseWithInput(ctx context.Context, provider llm.Prov
 				// cancel the SSE, drain the channel, emit a visible
 				// warning, and return without error so the outer
 				// runtime's existing "no tool call" branch reprompts.
-				if line, count, hit := checkLoopGuard(accumulated, &loopTextLineStart); hit {
+				if line, count, hit := checkLoopGuard(accumulated, &loopTextLineStart, &loopTextInFence); hit {
 					cancel()
 					for range stream {
 					}
