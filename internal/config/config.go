@@ -202,6 +202,21 @@ type RuntimeConfig struct {
 	MaxConsecutiveReadOnly  int  `toml:"max_consecutive_read_only"`
 	MaxPlannerSummarySteps int  `toml:"max_planner_summary_steps"`
 	MaxBuilderReadLoops    int  `toml:"max_builder_read_loops"`
+	// MaxDebugReadLoops caps consecutive read-only tool calls in debug
+	// mode. Default 25 (vs 12 for build, 10 for plan/chat) because the
+	// hypothesis-test loop legitimately interleaves read → instrument
+	// → run → read across many cycles. Set to a negative value to
+	// disable the guard entirely in debug mode (rely on max_steps).
+	MaxDebugReadLoops int `toml:"max_debug_read_loops"`
+	// MaxReasoningTokens caps the reasoning_content output a model can
+	// emit inside a single response BEFORE producing any text or tool
+	// call. When exceeded, the runtime cancels the stream and reprompts
+	// the model with a "stop thinking, take an action" instruction.
+	// Targets the overthinking failure mode where reasoning models
+	// flip-flop ('actually... wait, the real issue is...') and burn
+	// 100k+ tokens without ever calling a tool. Default 6000 (~4500
+	// words). Set to a negative value to disable the guard.
+	MaxReasoningTokens int `toml:"max_reasoning_tokens"`
 	// ReadBudgetGracePastNudge is the number of additional read-only steps
 	// the model gets after the soft nudge fires before the hard stop kicks
 	// in. The first cross of MaxBuilderReadLoops / MaxConsecutiveReadOnly

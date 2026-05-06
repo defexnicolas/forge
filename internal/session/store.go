@@ -354,7 +354,8 @@ func classifyTurnOutcome(buf []agent.Event) string {
 		strings.Contains(low, "consecutive read-only tool calls"),
 		strings.Contains(low, "agent stopped after"),
 		strings.Contains(low, "build response(s) in prose"),
-		strings.Contains(low, "planner step(s) with no actionable progress"):
+		strings.Contains(low, "planner step(s) with no actionable progress"),
+		strings.Contains(low, "thinking budget exhausted"):
 		return OutcomeAborted
 	case strings.Contains(low, "failed") && strings.Contains(low, "times in a row"),
 		strings.Contains(low, "denied by"),
@@ -728,7 +729,8 @@ func IsTransientErrorMessage(msg string) bool {
 		strings.Contains(low, "consecutive read-only tool calls"),
 		strings.Contains(low, "agent stopped after"),
 		strings.Contains(low, "build response(s) in prose"),
-		strings.Contains(low, "planner step(s) with no actionable progress"):
+		strings.Contains(low, "planner step(s) with no actionable progress"),
+		strings.Contains(low, "thinking budget exhausted"):
 		return true
 	}
 	return false

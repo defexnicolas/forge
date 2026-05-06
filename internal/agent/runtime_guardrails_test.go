@@ -99,7 +99,10 @@ func TestActiveReadBudget(t *testing.T) {
 		{name: "build default", mode: "build", want: 12},
 		{name: "chat default", mode: "chat", want: 6},
 		{name: "plan default", mode: "plan", want: 6},
+		{name: "debug default (higher than build)", mode: "debug", want: 25},
 		{name: "build config override", mode: "build", cfg: config.RuntimeConfig{MaxBuilderReadLoops: 20}, want: 20},
+		{name: "debug config override", mode: "debug", cfg: config.RuntimeConfig{MaxDebugReadLoops: 50}, want: 50},
+		{name: "debug override below floor 12 raises to 12", mode: "debug", cfg: config.RuntimeConfig{MaxDebugReadLoops: 4}, want: 12},
 		{name: "session override beats config", mode: "build", override: 30, cfg: config.RuntimeConfig{MaxBuilderReadLoops: 20}, want: 30},
 		{name: "session override negative disables", mode: "build", override: -1, want: 0},
 	}
@@ -113,6 +116,29 @@ func TestActiveReadBudget(t *testing.T) {
 			if got := r.activeReadBudget(); got != tc.want {
 				t.Errorf("activeReadBudget(mode=%s, override=%d, cfg=%+v) = %d, want %d",
 					tc.mode, tc.override, tc.cfg, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMaxReasoningTokens(t *testing.T) {
+	// The thinking-budget guard caps reasoning_content tokens before any
+	// text or tool_call is emitted. Default 6000 (≈4500 words). Negative
+	// = disabled. Positive overrides.
+	cases := []struct {
+		name string
+		cfg  config.RuntimeConfig
+		want int
+	}{
+		{name: "default", want: 6000},
+		{name: "positive override", cfg: config.RuntimeConfig{MaxReasoningTokens: 10000}, want: 10000},
+		{name: "negative disables (returns 0)", cfg: config.RuntimeConfig{MaxReasoningTokens: -1}, want: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &Runtime{Config: config.Config{Runtime: tc.cfg}}
+			if got := r.maxReasoningTokens(); got != tc.want {
+				t.Errorf("maxReasoningTokens(cfg=%+v) = %d, want %d", tc.cfg, got, tc.want)
 			}
 		})
 	}

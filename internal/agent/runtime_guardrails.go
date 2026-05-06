@@ -251,11 +251,16 @@ func (r *Runtime) maxBuilderReadLoops() int {
 }
 
 // activeReadBudget returns the threshold of consecutive read-only tool calls
-// that fires the soft-nudge / hard-stop guard for the CURRENT mode. Build
-// mode uses maxBuilderReadLoops (default 12); plan / chat / others use
-// maxConsecutiveReadOnly (default 6, config 10). Explore mode is exempt and
-// the caller short-circuits before reaching here. Returns 0 to mean "guard
-// disabled" — used when the per-session override is negative.
+// that fires the soft-nudge / hard-stop guard for the CURRENT mode.
+//   - build:  maxBuilderReadLoops (default 12) — multi-task workflow
+//   - debug:  maxDebugReadLoops (default 25) — hypothesis-test cycles are
+//             read-heavy by design (read → instrument → read → run);
+//             the regular 10 cap was tripping mid-investigation
+//   - plan / chat / others: maxConsecutiveReadOnly (default 6, config 10)
+//   - explore: exempt — caller short-circuits before reaching here
+//
+// Returns 0 to mean "guard disabled" — used when the per-session
+// override is negative.
 func (r *Runtime) activeReadBudget() int {
 	if r == nil {
 		return 0
@@ -266,10 +271,59 @@ func (r *Runtime) activeReadBudget() int {
 	if r.readBudgetOverride > 0 {
 		return r.readBudgetOverride
 	}
-	if r.Mode == "build" {
+	switch r.Mode {
+	case "build":
 		return r.maxBuilderReadLoops()
+	case "debug":
+		return r.maxDebugReadLoops()
 	}
 	return r.maxConsecutiveReadOnly()
+}
+
+// maxReasoningTokens caps the reasoning_content tokens a model can
+// emit BEFORE producing text or a tool call. When exceeded, the
+// streaming guard cancels and reprompts. Targets the "100k tokens of
+// flip-flop reasoning, no tool call" failure mode common with
+// reasoning-heavy local models on debug-style tasks.
+//
+// Returns 0 to mean "guard disabled" — used when the config value is
+// negative. Default 6000 ≈ 4500 words ≈ 6 dense paragraphs of thought,
+// enough for one focused chain but not for endless speculation.
+func (r *Runtime) maxReasoningTokens() int {
+	v := r.Config.Runtime.MaxReasoningTokens
+	if v < 0 {
+		return 0
+	}
+	if v > 0 {
+		return v
+	}
+	return 6000
+}
+
+// maxDebugReadLoops is the cap on consecutive read-only tool calls in
+// debug mode before the soft-nudge fires. Higher than build/plan
+// because hypothesis-test loops legitimately read (file → run → file
+// → log → file) without "making progress" by the original guard's
+// definition. 25 covers ~3 hypothesis cycles before the model is
+// nudged to instrument or run instead of reading more.
+//
+// Config knob: runtime.max_debug_read_loops. 0 = use default 25.
+// Negative = disable the guard for debug mode entirely (rely on
+// max_steps as the only cap).
+func (r *Runtime) maxDebugReadLoops() int {
+	v := r.Config.Runtime.MaxDebugReadLoops
+	if v < 0 {
+		return math.MaxInt32
+	}
+	if v > 0 {
+		// Floor at 12 — anything below the build cap defeats the
+		// purpose of having a separate knob.
+		if v < 12 {
+			return 12
+		}
+		return v
+	}
+	return 25
 }
 
 // SetReadBudgetOverride installs a per-session override for the read-only

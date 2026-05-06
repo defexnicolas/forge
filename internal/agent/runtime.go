@@ -2669,6 +2669,27 @@ func (r *Runtime) streamResponseWithInput(ctx context.Context, provider llm.Prov
 			events <- Event{Type: EventAssistantDelta, Text: event.Text}
 			emitProgress("streaming", false)
 			loopReasoningBuf.WriteString(event.Text)
+			// Thinking-budget guard: when the model emits >N tokens of
+			// reasoning_content WITHOUT producing any text or tool
+			// call, it's stuck in a flip-flop ("actually, the real
+			// issue is..." → "wait, maybe..."). Cancel + reprompt with
+			// a force-action instruction. Skip when the budget is
+			// disabled (negative config) or once any text/tool_call has
+			// arrived (the model already moved past pure speculation).
+			if maxThink := r.maxReasoningTokens(); maxThink > 0 && text.Len() == 0 && len(toolCalls) == 0 {
+				// Approximate tokens via chars/4. Cheap and good
+				// enough for a soft budget — exact tokenization would
+				// require the provider-specific tokenizer for marginal
+				// benefit.
+				if loopReasoningBuf.Len()/4 >= maxThink {
+					cancel()
+					for range stream {
+					}
+					events <- Event{Type: EventClearStreaming}
+					events <- Event{Type: EventError, Error: fmt.Errorf("thinking budget exhausted: model emitted %d chars of reasoning without taking an action; cancelled stream and re-prompting for a tool_call", loopReasoningBuf.Len()), Transient: true}
+					return text.String(), toolCalls, usage, nil
+				}
+			}
 			if line, count, hit := checkLoopGuard(loopReasoningBuf.String(), &loopReasoningLineStart, &loopReasoningInFence); hit {
 				cancel()
 				for range stream {
