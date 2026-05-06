@@ -398,8 +398,24 @@ build_forge() {
   log "descargando modulos de Go"
   "$GO_BIN" mod download
 
-  log "compilando Forge"
-  "$GO_BIN" build -o "$FORGE_OUTPUT" ./cmd/forge
+  # Embed the same build metadata as scripts/build.{sh,ps1} so the in-app
+  # /update flow knows where the source clone lives and can run git pull +
+  # rebuild without leaving Forge. Without these ldflags the binary reports
+  # "source: (not embedded — update checks disabled)" and the hub's
+  # "N commits behind" banner never appears.
+  local sha branch dirty version build_time ldflags
+  sha="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+  dirty=""
+  if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+    dirty="-dirty"
+  fi
+  version="${branch}${dirty}"
+  build_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  ldflags="-X 'main.Version=${version}' -X 'main.BuildSHA=${sha}' -X 'main.BuildTime=${build_time}' -X 'main.SourceRepo=${REPO_DIR}'"
+
+  log "compilando Forge (version=${version} sha=${sha} source=${REPO_DIR})"
+  "$GO_BIN" build -ldflags "${ldflags}" -o "$FORGE_OUTPUT" ./cmd/forge
 }
 
 print_summary() {

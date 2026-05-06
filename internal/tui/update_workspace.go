@@ -12,7 +12,7 @@ import (
 // and the eventual outcome message inline with chat history.
 func (m *model) handleUpdateCommand() string {
 	if !buildinfo.HasSourceRepo() {
-		return m.theme.Muted.Render("update is disabled: this binary was not built with scripts/build.{ps1,sh}.")
+		return m.theme.Muted.Render("update is disabled: rebuild with scripts/build.sh, scripts/build.ps1, or bash forgetui.sh to embed the source-repo path.")
 	}
 	if m.updateRunning {
 		return m.theme.Muted.Render("update already in progress.")

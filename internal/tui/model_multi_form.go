@@ -215,6 +215,7 @@ func (f *modelMultiForm) buildReuseOptions() []modelReuseOption {
 		f.loadedModels = f.queryLoadedModels()
 		f.loadedModelsKnown = true
 	}
+	loadedSource := f.loadedSourceLabel()
 	for _, info := range f.loadedModels {
 		if info.ID == "" || seen[info.ID] {
 			continue
@@ -230,7 +231,7 @@ func (f *modelMultiForm) buildReuseOptions() []modelReuseOption {
 		opts = append(opts, modelReuseOption{
 			modelID:  info.ID,
 			detected: detected,
-			source:   "loaded in LM Studio",
+			source:   loadedSource,
 			ctxLabel: formatCtxLabel(detected),
 		})
 		seen[info.ID] = true
@@ -238,10 +239,36 @@ func (f *modelMultiForm) buildReuseOptions() []modelReuseOption {
 	return opts
 }
 
-func (f *modelMultiForm) queryLoadedModels() []llm.ModelInfo {
-	providerName := f.cfg.Providers.Default.Name
+// loadedSourceLabel returns a human-friendly label for the "currently resident
+// model" reuse rows. We probe BackendName so the label tells the truth even
+// when the registry slot is named "lmstudio" but the configured base_url
+// points at llama-server.
+func (f *modelMultiForm) loadedSourceLabel() string {
+	providerName := strings.TrimSpace(f.cfg.Providers.Default.Name)
 	if providerName == "" {
-		providerName = "lmstudio"
+		return "loaded in provider"
+	}
+	provider, ok := f.providers.Get(providerName)
+	if !ok {
+		return "loaded in " + providerName
+	}
+	if bn, ok := provider.(llm.BackendNamer); ok {
+		switch bn.BackendName() {
+		case "lmstudio":
+			return "loaded in LM Studio"
+		case "llama-server":
+			return "loaded in llama-server"
+		case "openai":
+			return "loaded in OpenAI"
+		}
+	}
+	return "loaded in " + provider.Name()
+}
+
+func (f *modelMultiForm) queryLoadedModels() []llm.ModelInfo {
+	providerName := strings.TrimSpace(f.cfg.Providers.Default.Name)
+	if providerName == "" {
+		return nil
 	}
 	provider, ok := f.providers.Get(providerName)
 	if !ok {
@@ -249,19 +276,18 @@ func (f *modelMultiForm) queryLoadedModels() []llm.ModelInfo {
 	}
 	ctx, cancel := contextWithShortTimeout()
 	defer cancel()
-	models, err := provider.ListModels(ctx)
-	if err != nil {
+	// Provider-aware capability: LM Studio filters by State="loaded";
+	// llama-server returns every row in /v1/models (which is exactly the
+	// resident model). Providers that don't implement the capability (test
+	// fakes, future providers) return nil — we don't second-guess by
+	// listing every model, that would offer reuse for unloaded ones.
+	lister, ok := provider.(llm.LoadedLister)
+	if !ok {
 		return nil
 	}
-	var loaded []llm.ModelInfo
-	for _, m := range models {
-		// Only trust an explicit State="loaded" here. LoadedContextLength
-		// alone is unreliable — some builds of LM Studio surface it for
-		// previously-loaded-but-unloaded models too, which would offer
-		// reuse for models that aren't actually resident right now.
-		if m.State == "loaded" {
-			loaded = append(loaded, m)
-		}
+	loaded, err := lister.LoadedModels(ctx)
+	if err != nil {
+		return nil
 	}
 	return loaded
 }

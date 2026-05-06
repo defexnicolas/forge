@@ -1091,6 +1091,58 @@ func (m *shellModel) applyHubChatConfig(cfg config.Config) {
 		m.hubChat.agentRuntime.SetRoleModel(role, modelID)
 	}
 	m.hubChat.agentRuntime.SetChatModel(strings.TrimSpace(cfg.Models["chat"]))
+
+	// The hub-side mount path used to leave the runtime believing the previous
+	// model was still resident — `loadedModels` and `currentLoadedModel` were
+	// never cleared. With llama-server (where LoadModel is a no-op) this kept
+	// the status bar showing stale ctx values and re-tried a doomed mount on
+	// the next user turn. Reset the cache and re-probe the active role's model
+	// so the bar repaints with fresh detection without waiting for a turn.
+	rt := m.hubChat.agentRuntime
+	rt.ResetLoadedModels()
+	go func(rt runtimeForReprobe, providers *llm.Registry, cfg config.Config) {
+		name := strings.TrimSpace(cfg.Providers.Default.Name)
+		if name == "" {
+			return
+		}
+		provider, ok := providers.Get(name)
+		if !ok {
+			return
+		}
+		role := rt.ModelRoleForActiveMode()
+		modelID := strings.TrimSpace(cfg.Models[role])
+		if modelID == "" {
+			modelID = strings.TrimSpace(cfg.Models["chat"])
+		}
+		if modelID == "" {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		info, err := provider.ProbeModel(ctx, modelID)
+		if err == nil && info != nil && info.LoadedContextLength > 0 {
+			rt.SetDetectedContext(role, &config.DetectedContext{
+				ModelID:             info.ID,
+				LoadedContextLength: info.LoadedContextLength,
+				MaxContextLength:    info.MaxContextLength,
+				ProbedAt:            time.Now().UTC(),
+			})
+		}
+		if bn, ok := provider.(llm.BackendNamer); ok {
+			rt.SetLastProviderUsed(bn.BackendName())
+		} else {
+			rt.SetLastProviderUsed(provider.Name())
+		}
+	}(rt, providers, cfg)
+}
+
+// runtimeForReprobe is the subset of *agent.Runtime that applyHubChatConfig's
+// reprobe goroutine needs. Defined as a local interface so shell.go does not
+// need to import the agent package — keeps the existing layering intact.
+type runtimeForReprobe interface {
+	ModelRoleForActiveMode() string
+	SetDetectedContext(role string, detected *config.DetectedContext)
+	SetLastProviderUsed(name string)
 }
 
 func (m *shellModel) hubChatHasModal() bool {

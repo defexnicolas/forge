@@ -18,10 +18,26 @@ import (
 	"forge/internal/config"
 )
 
+// Backend identifies which OpenAI-compatible server shape OpenAICompatible is
+// talking to. The configured provider name in the registry is unreliable —
+// users frequently reuse the "lmstudio" slot with a base_url pointing at
+// llama-server. We auto-detect by probing /v1/models response shape.
+type Backend int32
+
+const (
+	BackendUnknown       Backend = 0
+	BackendLMStudio      Backend = 1
+	BackendLlamaServer   Backend = 2
+	BackendGenericOpenAI Backend = 3
+)
+
 type OpenAICompatible struct {
 	name   string
 	cfg    config.ProviderConfig
 	client *http.Client
+	// backend caches the detected server kind. Resolved lazily on the first
+	// LoadModel/ProbeModel/LoadedModels call. Stored as int32 for atomic CAS.
+	backend atomic.Int32
 }
 
 func NewOpenAICompatible(name string, cfg config.ProviderConfig) *OpenAICompatible {
@@ -34,6 +50,85 @@ func NewOpenAICompatible(name string, cfg config.ProviderConfig) *OpenAICompatib
 		// configuration.
 		client: &http.Client{},
 	}
+}
+
+// BackendKind returns the cached backend kind, or BackendUnknown if not yet
+// resolved. Does not perform I/O.
+func (p *OpenAICompatible) BackendKind() Backend {
+	return Backend(p.backend.Load())
+}
+
+// SupportsExplicitLoad reports whether this provider can honor a programmatic
+// LoadModel call. True only for LM Studio. llama-server and generic OpenAI
+// compatible endpoints don't expose load endpoints, so attempts would fail
+// (and currently get logged as "proceeding anyway"). Callers can pre-check
+// this and skip the LoadModel call entirely.
+func (p *OpenAICompatible) SupportsExplicitLoad() bool {
+	return p.BackendKind() == BackendLMStudio
+}
+
+// BackendName returns a stable string identifying the resolved backend shape:
+// "lmstudio", "llama-server", "openai", or the configured provider name when
+// unresolved. Used by status-bar and label rendering so the UI shows the real
+// backend even when the registry slot was reused.
+func (p *OpenAICompatible) BackendName() string {
+	switch p.BackendKind() {
+	case BackendLMStudio:
+		return "lmstudio"
+	case BackendLlamaServer:
+		return "llama-server"
+	case BackendGenericOpenAI:
+		return "openai"
+	default:
+		return p.name
+	}
+}
+
+// resolveBackend probes /v1/models to classify the backend. Cheap because
+// every caller is about to need that data anyway. LM Studio populates
+// state="loaded" and loaded_context_length on at least one row; llama-server
+// returns rows with neither. Caches the result on success; leaves Unknown on
+// failure so the next call can retry. Safe to call concurrently — at most one
+// extra probe will race, and they'll converge on the same answer.
+func (p *OpenAICompatible) resolveBackend(ctx context.Context) Backend {
+	if kind := p.BackendKind(); kind != BackendUnknown {
+		return kind
+	}
+	models, err := p.ListModels(ctx)
+	if err != nil || len(models) == 0 {
+		return BackendUnknown
+	}
+	kind := BackendLlamaServer
+	for _, m := range models {
+		if strings.TrimSpace(m.State) != "" || m.LoadedContextLength > 0 || m.MaxContextLength > 0 {
+			kind = BackendLMStudio
+			break
+		}
+	}
+	p.backend.Store(int32(kind))
+	return kind
+}
+
+// LoadedModels returns the models currently resident on the backend. For LM
+// Studio that's the rows with State="loaded"; for llama-server every row in
+// /v1/models is by definition the loaded model. Drives the model-multi reuse
+// picker without baking LM Studio assumptions into the form.
+func (p *OpenAICompatible) LoadedModels(ctx context.Context) ([]ModelInfo, error) {
+	models, err := p.ListModels(ctx)
+	if err != nil {
+		return nil, err
+	}
+	kind := p.resolveBackend(ctx)
+	if kind == BackendLMStudio {
+		var loaded []ModelInfo
+		for _, m := range models {
+			if m.State == "loaded" {
+				loaded = append(loaded, m)
+			}
+		}
+		return loaded, nil
+	}
+	return models, nil
 }
 
 func (p *OpenAICompatible) Name() string {
@@ -430,9 +525,13 @@ func (p *OpenAICompatible) ProbeModel(ctx context.Context, modelID string) (*Mod
 	}
 	if !modelsHaveContextMetadata(models) {
 		// Older LM Studio builds only expose the enhanced fields on the
-		// native /api/v0/models endpoint. Try it opportunistically.
-		if enhanced, eerr := p.listModelsEnhanced(ctx); eerr == nil && len(enhanced) > 0 {
-			models = enhanced
+		// native /api/v0/models endpoint. Skip the call when the backend is
+		// known to be llama-server / generic OpenAI — the request is a
+		// guaranteed 404 and the cached backend already classified it.
+		if kind := p.BackendKind(); kind == BackendUnknown || kind == BackendLMStudio {
+			if enhanced, eerr := p.listModelsEnhanced(ctx); eerr == nil && len(enhanced) > 0 {
+				models = enhanced
+			}
 		}
 	}
 	if len(models) == 0 {
@@ -461,13 +560,20 @@ func (p *OpenAICompatible) ProbeModel(ctx context.Context, modelID string) (*Mod
 // (and flash attention). Tries the REST endpoint first, falls back to the
 // `lms` CLI when REST isn't available (older LM Studio builds or builds that
 // don't expose the load endpoint). Returns ErrNotSupported for providers that
-// don't look like LM Studio (no /api/v0 prefix derivable).
+// don't look like LM Studio.
 func (p *OpenAICompatible) LoadModel(ctx context.Context, modelID string, loadCfg LoadConfig) error {
 	if p.cfg.BaseURL == "" {
 		return ErrProviderNotConfigured
 	}
 	if modelID == "" {
 		return fmt.Errorf("model id is required")
+	}
+	// Resolve the backend before deciding to issue load endpoints. llama-server
+	// and generic OpenAI-compatible providers don't have programmatic load —
+	// trying anyway produces noise (HTTP 404 → lms CLI not found) without
+	// changing anything observable.
+	if p.resolveBackend(ctx) != BackendLMStudio {
+		return ErrNotSupported
 	}
 	base := strings.TrimRight(p.cfg.BaseURL, "/")
 	if !strings.HasSuffix(base, "/v1") {

@@ -147,6 +147,12 @@ type Runtime struct {
 	LastTokensUsed          int
 	LastTokensBudget        int
 	LastModelUsed           string
+	// LastProviderUsed is the resolved backend name (lmstudio / llama-server /
+	// openai) of the provider that handled the last turn. Set alongside
+	// LastModelUsed at the top of run(). The status bar reads this so it shows
+	// the real backend even when the registry slot is named "lmstudio" but
+	// points at a different server (a common config for llama-server users).
+	LastProviderUsed        string
 	LastParserUsed          string
 	// lastNarrationCancel carries the offending repeated line when the
 	// streaming narration-loop guard cancels a request. Set by the
@@ -342,6 +348,73 @@ func (r *Runtime) MarkModelLoaded(modelID string) {
 	r.startupReloadDone = true
 }
 
+// ResetLoadedModels clears all "currently loaded" tracking. Called when the
+// active provider or its model selection changes mid-session (hub > model-multi,
+// /provider) so the next turn re-evaluates against the new backend instead of
+// trusting stale LM Studio bookkeeping.
+func (r *Runtime) ResetLoadedModels() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.loadedModels = nil
+	r.currentLoadedModel = ""
+	r.startupReloadDone = false
+}
+
+// SetDetectedContext writes a fresh probe result into the runtime's config
+// under the given role. Used by the hub-side model-multi flow to push the new
+// model's loaded context length into the status bar without waiting for the
+// first user turn.
+func (r *Runtime) SetDetectedContext(role string, detected *config.DetectedContext) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	config.SetDetectedForRole(&r.Config, role, detected)
+}
+
+// SetLastProviderUsed updates the cached backend label used by the status bar.
+// Provider-form / model-form / model-multi-form flows call this so the bar
+// reflects the new backend immediately, without waiting for the first turn to
+// resolve it via run().
+func (r *Runtime) SetLastProviderUsed(name string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.LastProviderUsed = strings.TrimSpace(name)
+}
+
+// ModelRoleForActiveMode is the public form of modelRoleForMode. UI code uses
+// this to decide which model id ("chat" vs "planner" vs "explorer" vs "editor")
+// is active for the current mode without reaching into runtime internals.
+func (r *Runtime) ModelRoleForActiveMode() string {
+	if r == nil {
+		return "chat"
+	}
+	return r.modelRoleForMode()
+}
+
+// ResolveProvider returns the active provider from the registry. Public form
+// of resolveProvider. UI code (e.g. status bar) uses this to read backend
+// metadata without duplicating the lookup logic. Returns a non-nil error
+// (instead of panicking) when called before the runtime is fully wired —
+// status-bar layout tests construct a runtime without a Providers registry,
+// and we want a clean fallback rather than a nil-deref during render.
+func (r *Runtime) ResolveProvider() (llm.Provider, bool, error) {
+	if r == nil {
+		return nil, false, fmt.Errorf("runtime unavailable")
+	}
+	if r.Providers == nil {
+		return nil, false, fmt.Errorf("provider registry not initialized")
+	}
+	return r.resolveProvider()
+}
+
 func (r *Runtime) roleModel(role string) string {
 	if r == nil {
 		return ""
@@ -437,6 +510,18 @@ func (r *Runtime) PreviewPrompt(userMessage string) (PromptPreview, error) {
 
 func (r *Runtime) EnsureRoleModelLoaded(ctx context.Context, provider llm.Provider, role string) error {
 	if r == nil || provider == nil {
+		return nil
+	}
+	// Backends that can't honor a programmatic load (llama-server, generic
+	// OpenAI-compatible) skip the entire dance. Trying anyway used to issue
+	// LM Studio-only endpoints, fail, and log "proceeding anyway" once per
+	// turn. Marking the model as loaded here also satisfies the
+	// startupReloadDone short-circuit so subsequent turns stay quiet.
+	if loader, ok := provider.(llm.ExplicitLoader); ok && !loader.SupportsExplicitLoad() {
+		modelID := r.roleModel(role)
+		if modelID != "" {
+			r.MarkModelLoaded(modelID)
+		}
 		return nil
 	}
 	// Two independent concerns converge on LoadModel:
@@ -549,6 +634,17 @@ func (r *Runtime) ReloadCurrentModel(ctx context.Context) (string, error) {
 	modelID := r.roleModel(role)
 	if modelID == "" {
 		return "", fmt.Errorf("model id is required")
+	}
+	// llama-server and friends can't reload programmatically — context size is
+	// fixed at server launch (--ctx-size). Surface an actionable message
+	// instead of letting LoadModel fall through to a "404 / lms not found"
+	// stack that hides the real fix.
+	if loader, ok := provider.(llm.ExplicitLoader); ok && !loader.SupportsExplicitLoad() {
+		backend := provider.Name()
+		if bn, ok := provider.(llm.BackendNamer); ok {
+			backend = bn.BackendName()
+		}
+		return modelID, fmt.Errorf("provider %q (%s) does not support programmatic model reload — restart the server with the desired --ctx-size to change the window", provider.Name(), backend)
 	}
 	contextLength := r.Config.Context.ModelContextTokens
 	if detected := config.DetectedForRole(r.Config, role, modelID); detected != nil && detected.LoadedContextLength > 0 {
@@ -1172,6 +1268,11 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 		maxSteps = r.Config.Runtime.MaxStepsBuild
 	}
 	r.LastModelUsed = model
+	if bn, ok := provider.(llm.BackendNamer); ok {
+		r.LastProviderUsed = bn.BackendName()
+	} else {
+		r.LastProviderUsed = provider.Name()
+	}
 
 	// Build tool definitions for native mode.
 	var toolDefs []llm.ToolDef

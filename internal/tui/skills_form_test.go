@@ -93,6 +93,11 @@ func TestSkillsFormScrollsVisibleWindow(t *testing.T) {
 }
 
 func TestSkillsFormInstalledTabRemoveFlow(t *testing.T) {
+	// Manager.ScanLocal walks ~/.codex/skills and ~/.claude/skills in addition
+	// to the workspace's .agents/skills. Without isolating HOME, any Claude
+	// Code skill the developer has installed (gstack, etc.) leaks into
+	// installedResults and breaks the "exactly one item" assertion.
+	withFakeHome(t)
 	cwd := t.TempDir()
 	skillDir := filepath.Join(cwd, ".agents", "skills", "installed-skill")
 	if err := os.MkdirAll(skillDir, 0o755); err != nil {

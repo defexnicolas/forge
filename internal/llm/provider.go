@@ -104,6 +104,35 @@ type Provider interface {
 	LoadModel(ctx context.Context, modelID string, cfg LoadConfig) error
 }
 
+// ExplicitLoader is implemented by providers that may or may not support a
+// programmatic model-load step. LM Studio supports it (REST + lms CLI);
+// llama-server and plain OpenAI-compatible endpoints don't. Callers that
+// would otherwise force a LoadModel call use this to skip the attempt
+// (and the noisy "proceeding anyway" fallback) when the backend can't
+// honor it. Side interface — not part of Provider so test fakes don't grow.
+type ExplicitLoader interface {
+	SupportsExplicitLoad() bool
+}
+
+// LoadedLister is implemented by providers that can answer "which models are
+// currently resident" with stronger semantics than ListModels alone. LM Studio
+// returns a state="loaded" flag per model; llama-server only ever exposes the
+// model it was launched with, so every row in /v1/models is "loaded". The
+// model-multi reuse picker uses this to populate the "loaded in <backend>"
+// section without baking LM Studio assumptions into the form.
+type LoadedLister interface {
+	LoadedModels(ctx context.Context) ([]ModelInfo, error)
+}
+
+// BackendNamer is implemented by providers that can identify which backend
+// shape they are talking to (lmstudio / llama-server / openai). The configured
+// provider name in the registry may not match — users routinely reuse the
+// "lmstudio" slot with a base_url pointing at llama-server. Status-bar and
+// label rendering consult this so the UI shows the real backend.
+type BackendNamer interface {
+	BackendName() string
+}
+
 type Registry struct {
 	mu        sync.RWMutex
 	providers map[string]Provider

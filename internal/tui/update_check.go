@@ -115,7 +115,7 @@ func (m shellModel) updateBannerLine() string {
 // build, then re-check the status.
 func (m *shellModel) triggerUpdate() tea.Cmd {
 	if !buildinfo.HasSourceRepo() {
-		m.statusMessage = "update is disabled: this binary was not built with scripts/build.{ps1,sh}"
+		m.statusMessage = "update is disabled: rebuild with scripts/build.sh, scripts/build.ps1, or bash forgetui.sh to embed the source-repo path"
 		return nil
 	}
 	if m.updateRunning {

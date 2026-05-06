@@ -734,7 +734,28 @@ func (m model) statusLineView() string {
 		modelName = "default"
 	}
 	cwd := compactDisplayPath(m.options.CWD)
-	provider := m.options.Config.Providers.Default.Name
+	// Provider label: prefer the runtime's resolved backend name (set after
+	// the first turn or by hub/workspace mount flows). Fall back to the live
+	// provider's BackendName, then to the configured default name. The
+	// fallback chain matters because users routinely register llama-server
+	// under the "lmstudio" config slot — we want to display "llama-server"
+	// regardless of the registry key.
+	provider := strings.TrimSpace(m.agentRuntime.LastProviderUsed)
+	if provider == "" {
+		if p, _, err := m.agentRuntime.ResolveProvider(); err == nil && p != nil {
+			if bn, ok := p.(llm.BackendNamer); ok {
+				provider = bn.BackendName()
+			} else {
+				provider = p.Name()
+			}
+		}
+	}
+	if provider == "" {
+		provider = strings.TrimSpace(m.options.Config.Providers.Default.Name)
+	}
+	if provider == "" {
+		provider = "(none)"
+	}
 	status := t.Muted.Render("idle")
 	if m.pendingAskUser != nil {
 		status = t.ApprovalStyle.Render("? type your answer")

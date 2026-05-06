@@ -194,6 +194,12 @@ func (m *model) handleFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 			if !m.modelMultiForm.canceled && m.modelMultiForm.errMsg == "" {
 				m.options.Config = m.modelMultiForm.cfg
 				m.syncRuntimeConfig()
+				// Wipe stale "currently loaded" tracking before re-marking. If
+				// the user changed provider or strategy inside the form, the
+				// old currentLoadedModel / loadedModels entries refer to the
+				// previous backend and would prevent the next turn from
+				// reflecting the new selection.
+				m.agentRuntime.ResetLoadedModels()
 				activeRole := m.activeModelRole()
 				strategy := strings.ToLower(strings.TrimSpace(m.options.Config.ModelLoading.Strategy))
 				for _, selection := range m.modelMultiForm.selections {
