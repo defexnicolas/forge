@@ -1511,15 +1511,21 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 					events <- Event{Type: EventDone}
 					return
 				}
-				// Cache-served reads did no real work — skip the read-only
-				// progress guard so the cache helps the agent rather than
-				// using up its exploration budget twice as fast.
-				if !cacheHit {
-					if err := r.enforceToolProgressGuard(agentCall.Name, &consecutiveReadOnly, &noProgressSteps); err != nil {
-						events <- Event{Type: EventError, Error: err}
-						events <- Event{Type: EventDone}
-						return
-					}
+				// Read-budget guard with soft-nudge / explore-opt-out / hard-stop.
+				// Cache-served reads did no real work — applyReadBudgetGuard
+				// short-circuits on cacheHit so the cache helps the agent
+				// rather than using up its exploration budget twice as fast.
+				nudge, budget, hardStop := r.applyReadBudgetGuard(agentCall.Name, cacheHit, &consecutiveReadOnly, &noProgressSteps, &readBudgetNudged)
+				if budget != nil {
+					events <- Event{Type: EventReadBudget, ReadBudget: budget}
+				}
+				if hardStop != nil {
+					events <- Event{Type: EventError, Error: hardStop}
+					events <- Event{Type: EventDone}
+					return
+				}
+				if nudge != "" {
+					observation = observation + "\n\n[system] " + nudge
 				}
 
 				// Track consecutive failures.
@@ -1737,53 +1743,21 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 		// those signals an aimless loop; stop so the cap isn't burned.
 		// A cache-served read did no real work — exempt it so the cache
 		// doesn't help latency at the cost of burning the read budget.
-		if isMutatingToolCall(parsed.Call.Name) || parsed.Call.Name == "execute_task" {
-			consecutiveReadOnly = 0
-			readBudgetNudged = false
-			noProgressSteps = 0
-		} else if isReadOnlyExploration(parsed.Call.Name) && !cacheHit {
-			consecutiveReadOnly++
-			// Explore mode is read-only by design — there is no edit tool the
-			// model could call to "make progress". The repeated-same-file
-			// guard (above) and max_steps still cap genuine loops; this
-			// budget would only fire spuriously mid-investigation.
-			if r.Mode != "explore" {
-				threshold := r.activeReadBudget()
-				r.recordReadBudgetSnapshot(consecutiveReadOnly, threshold)
-				events <- Event{Type: EventReadBudget, ReadBudget: &ReadBudgetState{
-					Consumed:  consecutiveReadOnly,
-					Threshold: threshold,
-					Mode:      r.Mode,
-					Nudged:    readBudgetNudged,
-				}}
-				if threshold > 0 && consecutiveReadOnly >= threshold {
-					if !readBudgetNudged {
-						// Soft nudge: tell the model it's burning the read
-						// budget. The nudge is appended to the next user
-						// observation below (after the standard messages
-						// append) so the model sees it before choosing the
-						// next tool call. Don't hard-stop yet — give it a
-						// few steps to self-correct.
-						readBudgetNudged = true
-						observation = observation + "\n\n[system] " + readBudgetNudgeForMode(r.Mode, consecutiveReadOnly, threshold)
-					} else if consecutiveReadOnly >= threshold+r.readBudgetGracePastNudge() {
-						events <- Event{Type: EventError, Error: fmt.Errorf("stopped: %d consecutive read-only tool calls — %s", consecutiveReadOnly, readBudgetHardStopForMode(r.Mode))}
-						events <- Event{Type: EventDone}
-						return
-					}
-				}
-			} else {
-				// Still emit a budget event for the TUI so it can render the
-				// "exploration in progress" indicator, even though there is
-				// no enforced threshold in explore mode.
-				r.recordReadBudgetSnapshot(consecutiveReadOnly, 0)
-				events <- Event{Type: EventReadBudget, ReadBudget: &ReadBudgetState{
-					Consumed:  consecutiveReadOnly,
-					Threshold: 0,
-					Mode:      r.Mode,
-					Nudged:    false,
-				}}
-			}
+		// Read-budget guard with soft-nudge / explore-opt-out / hard-stop.
+		// Shared with the native tool-call path above via applyReadBudgetGuard
+		// so both paths stop with the same mode-aware messaging instead of
+		// the legacy "dispatch execute_task" string in non-build modes.
+		nudge, budget, hardStop := r.applyReadBudgetGuard(parsed.Call.Name, cacheHit, &consecutiveReadOnly, &noProgressSteps, &readBudgetNudged)
+		if budget != nil {
+			events <- Event{Type: EventReadBudget, ReadBudget: budget}
+		}
+		if hardStop != nil {
+			events <- Event{Type: EventError, Error: hardStop}
+			events <- Event{Type: EventDone}
+			return
+		}
+		if nudge != "" {
+			observation = observation + "\n\n[system] " + nudge
 		}
 
 		if parsed.Call.Name == "execute_task" && result != nil {
@@ -1904,26 +1878,63 @@ func isReadOnlyExploration(name string) bool {
 	return false
 }
 
-func (r *Runtime) enforceToolProgressGuard(name string, consecutiveReadOnly, noProgressSteps *int) error {
+// applyReadBudgetGuard implements the consecutive-read-only budget state
+// machine used by BOTH the native tool-call path and the text-based fallback.
+// It centralizes (a) explore-mode opt-out, (b) the soft-nudge on first
+// crossing of the threshold, (c) the hard-stop after the post-nudge grace
+// window, and (d) the per-call EventReadBudget snapshot for the TUI.
+//
+// Returns:
+//   - nudge: a system message the caller should append to the next user
+//     observation when the model first crosses the threshold. "" otherwise.
+//   - budget: a snapshot for the caller to emit as EventReadBudget. nil when
+//     nothing changed (mutating tool / cache hit / non-exploration tool).
+//   - hardStop: a terminal error when the model exhausted the grace window.
+//     The caller emits EventError + EventDone and returns.
+//
+// All three may be zero values for a single call. The caller is expected to
+// check them in order (budget event → hardStop → nudge) and act accordingly.
+func (r *Runtime) applyReadBudgetGuard(name string, cacheHit bool, consecutiveReadOnly, noProgressSteps *int, readBudgetNudged *bool) (nudge string, budget *ReadBudgetState, hardStop error) {
 	if isMutatingToolCall(name) || name == "execute_task" {
 		*consecutiveReadOnly = 0
 		*noProgressSteps = 0
-		return nil
+		*readBudgetNudged = false
+		return "", nil, nil
 	}
-	if !isReadOnlyExploration(name) {
-		return nil
+	if !isReadOnlyExploration(name) || cacheHit {
+		return "", nil, nil
 	}
 	*consecutiveReadOnly++
-	if r.Mode == "build" && *consecutiveReadOnly >= r.maxBuilderReadLoops() {
-		return fmt.Errorf("stopped: %d consecutive read-only tool calls in build mode with no edits yet — choose the next task action or ask for refinement instead of continuing to read", *consecutiveReadOnly)
+	// Explore mode is read-only by design — the repeated-same-file guard and
+	// max_steps still cap genuine loops, but a "consecutive reads" budget
+	// would only fire spuriously mid-investigation.
+	if r.Mode == "explore" {
+		r.recordReadBudgetSnapshot(*consecutiveReadOnly, 0)
+		return "", &ReadBudgetState{
+			Consumed:  *consecutiveReadOnly,
+			Threshold: 0,
+			Mode:      r.Mode,
+			Nudged:    false,
+		}, nil
 	}
-	if r.Mode == "build" {
-		return nil
+	threshold := r.activeReadBudget()
+	r.recordReadBudgetSnapshot(*consecutiveReadOnly, threshold)
+	snap := &ReadBudgetState{
+		Consumed:  *consecutiveReadOnly,
+		Threshold: threshold,
+		Mode:      r.Mode,
+		Nudged:    *readBudgetNudged,
 	}
-	if *consecutiveReadOnly >= r.maxConsecutiveReadOnly() {
-		return fmt.Errorf("stopped: %d consecutive read-only tool calls with no edits — dispatch execute_task, call plan_write / todo_write, or answer the user directly", *consecutiveReadOnly)
+	if threshold > 0 && *consecutiveReadOnly >= threshold {
+		if !*readBudgetNudged {
+			*readBudgetNudged = true
+			return readBudgetNudgeForMode(r.Mode, *consecutiveReadOnly, threshold), snap, nil
+		}
+		if *consecutiveReadOnly >= threshold+r.readBudgetGracePastNudge() {
+			return "", snap, fmt.Errorf("stopped: %d consecutive read-only tool calls — %s", *consecutiveReadOnly, readBudgetHardStopForMode(r.Mode))
+		}
 	}
-	return nil
+	return "", snap, nil
 }
 
 // repeatedReadFileGuardThreshold is the number of identical read_file
