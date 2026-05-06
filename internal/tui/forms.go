@@ -91,6 +91,11 @@ func (m *model) handleFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 				m.activeForm = formNone
 				result := m.providerForm.Apply(&m.options.Config, m.options.Providers)
 				m.syncRuntimeConfig()
+				// Provider URL/key change re-registers a fresh
+				// OpenAICompatible in the registry. Wipe runtime caches
+				// and reprobe so LastProviderUsed and the detected ctx
+				// reflect the new backend without waiting for a turn.
+				m.refreshProviderState()
 				m.history = append(m.history, result)
 				m.refresh()
 			}
@@ -173,6 +178,7 @@ func (m *model) handleFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 				result := m.modelForm.Apply(&m.options.Config)
 				m.syncRuntimeConfig()
 				m.agentRuntime.SetChatModel(m.options.Config.Models["chat"])
+				m.refreshProviderState()
 				if result != "" && m.agentRuntime.ActiveParserName != "" {
 					result += "\n" + m.theme.Muted.Render(fmt.Sprintf("family=%s parser=%s", m.agentRuntime.ActiveModelFamily, m.agentRuntime.ActiveParserName))
 				}
@@ -194,14 +200,14 @@ func (m *model) handleFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 			if !m.modelMultiForm.canceled && m.modelMultiForm.errMsg == "" {
 				m.options.Config = m.modelMultiForm.cfg
 				m.syncRuntimeConfig()
-				// Wipe stale "currently loaded" tracking before re-marking. If
-				// the user changed provider or strategy inside the form, the
-				// old currentLoadedModel / loadedModels entries refer to the
-				// previous backend and would prevent the next turn from
-				// reflecting the new selection.
-				m.agentRuntime.ResetLoadedModels()
 				activeRole := m.activeModelRole()
 				strategy := strings.ToLower(strings.TrimSpace(m.options.Config.ModelLoading.Strategy))
+				// Reset + reprobe before MarkModelLoaded re-populates the
+				// per-role state so the goroutine sees the new model ids.
+				// Refresh updates LastProviderUsed and DetectedContext so
+				// the status bar repaints with the right backend + ctx
+				// without waiting for the first turn.
+				m.refreshProviderState()
 				for _, selection := range m.modelMultiForm.selections {
 					m.agentRuntime.SetRoleModel(selection.role, selection.modelID)
 					if strategy == "parallel" || selection.role == activeRole {

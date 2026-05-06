@@ -885,6 +885,62 @@ func (m model) activeRoleConfig() config.Config {
 	return config.ConfigForModelRole(m.options.Config, role, m.activeRoleModelID())
 }
 
+// refreshProviderState wipes the runtime's "currently loaded" tracking and
+// kicks off a 5s background ProbeModel against the configured provider for
+// the active role's model. The probe writes the detected loaded-context
+// length into Config.Context.DetectedByRole and updates LastProviderUsed so
+// the status bar shows the real backend name and ctx denominator without
+// waiting for the first user turn.
+//
+// Call this from any form Apply path that mutates Providers.* or Models.*
+// (provider form, model form, model-multi form). The hub side mirrors this
+// inside applyHubChatConfig. Without it, switching from llama-server back to
+// LM Studio (or vice-versa) leaves the bar showing the previous backend
+// name and a stale ctx fallback because the cached metadata never refreshes.
+func (m *model) refreshProviderState() {
+	if m == nil || m.agentRuntime == nil || m.options.Providers == nil {
+		return
+	}
+	rt := m.agentRuntime
+	rt.ResetLoadedModels()
+	cfg := m.options.Config
+	providers := m.options.Providers
+	go func() {
+		name := strings.TrimSpace(cfg.Providers.Default.Name)
+		if name == "" {
+			return
+		}
+		provider, ok := providers.Get(name)
+		if !ok {
+			return
+		}
+		role := rt.ModelRoleForActiveMode()
+		modelID := strings.TrimSpace(cfg.Models[role])
+		if modelID == "" {
+			modelID = strings.TrimSpace(cfg.Models["chat"])
+		}
+		if modelID == "" {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		info, err := provider.ProbeModel(ctx, modelID)
+		if err == nil && info != nil && info.LoadedContextLength > 0 {
+			rt.SetDetectedContext(role, &config.DetectedContext{
+				ModelID:             info.ID,
+				LoadedContextLength: info.LoadedContextLength,
+				MaxContextLength:    info.MaxContextLength,
+				ProbedAt:            time.Now().UTC(),
+			})
+		}
+		if bn, ok := provider.(llm.BackendNamer); ok {
+			rt.SetLastProviderUsed(bn.BackendName())
+		} else {
+			rt.SetLastProviderUsed(provider.Name())
+		}
+	}()
+}
+
 func (m model) suggestionView() string {
 	maxLineWidth := m.safeWidth() - 4
 	if maxLineWidth < 20 {
