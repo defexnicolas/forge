@@ -572,46 +572,46 @@ func (m model) View() string {
 		return m.approvalForm.View() + "\n\n" + statusLine
 	}
 	if m.activeForm == formAskUser {
-		return m.viewport.View() + "\n" + m.askUserForm.View() + "\n\n" + statusLine
+		return m.viewportView() + "\n" + m.askUserForm.View() + "\n\n" + statusLine
 	}
 
 	// Form overlays.
 	if m.activeForm == formProvider {
-		return m.viewport.View() + "\n" + m.providerForm.View() + "\n\n" + statusLine
+		return m.viewportView() + "\n" + m.providerForm.View() + "\n\n" + statusLine
 	}
 	if m.activeForm == formSkills {
-		return m.viewport.View() + "\n" + m.skillsForm.View() + "\n\n" + statusLine
+		return m.viewportView() + "\n" + m.skillsForm.View() + "\n\n" + statusLine
 	}
 	if m.activeForm == formTheme {
-		return m.viewport.View() + "\n" + m.themeForm.View() + "\n\n" + statusLine
+		return m.viewportView() + "\n" + m.themeForm.View() + "\n\n" + statusLine
 	}
 	if m.activeForm == formProfile {
-		return m.viewport.View() + "\n" + m.profileForm.View() + "\n\n" + statusLine
+		return m.viewportView() + "\n" + m.profileForm.View() + "\n\n" + statusLine
 	}
 	if m.activeForm == formModel {
-		return m.viewport.View() + "\n" + m.modelForm.View() + "\n\n" + statusLine
+		return m.viewportView() + "\n" + m.modelForm.View() + "\n\n" + statusLine
 	}
 	if m.activeForm == formModelMulti {
-		return m.viewport.View() + "\n" + m.modelMultiForm.View() + "\n\n" + statusLine
+		return m.viewportView() + "\n" + m.modelMultiForm.View() + "\n\n" + statusLine
 	}
 	if m.activeForm == formConfirmExecute {
-		return m.viewport.View() + "\n" + m.confirmExecute.View() + "\n\n" + statusLine
+		return m.viewportView() + "\n" + m.confirmExecute.View() + "\n\n" + statusLine
 	}
 	if m.activeForm == formConfirmPlanReset {
-		return m.viewport.View() + "\n" + m.confirmPlanReset.View() + "\n\n" + statusLine
+		return m.viewportView() + "\n" + m.confirmPlanReset.View() + "\n\n" + statusLine
 	}
 	if m.activeForm == formConfirmExplorerPlan {
-		return m.viewport.View() + "\n" + m.confirmExplorerPlan.View() + "\n\n" + statusLine
+		return m.viewportView() + "\n" + m.confirmExplorerPlan.View() + "\n\n" + statusLine
 	}
 	if m.activeForm == formYarnSettings {
-		return m.viewport.View() + "\n" + m.yarnSettingsForm.View() + "\n\n" + statusLine
+		return m.viewportView() + "\n" + m.yarnSettingsForm.View() + "\n\n" + statusLine
 	}
 	if m.activeForm == formYarnMenu {
-		return m.viewport.View() + "\n" + m.yarnMenuForm.View() + "\n\n" + statusLine
+		return m.viewportView() + "\n" + m.yarnMenuForm.View() + "\n\n" + statusLine
 	}
 
 	// Plan panel on the right side.
-	chatArea := m.viewport.View()
+	chatArea := m.viewportView()
 	if m.showPlan && m.agentRuntime.Tasks != nil {
 		list, err := m.agentRuntime.Tasks.List()
 		hasPlan := false
@@ -894,6 +894,58 @@ func (m model) renderReadBudgetIndicator() string {
 	default:
 		return ""
 	}
+}
+
+// viewportView returns the chat viewport's rendered output with a 1-column
+// scrollbar overlaid on the right edge. The scrollbar is independent of
+// the host terminal's scrollback — it lives inside the rendered TUI frame
+// and tracks YOffset against TotalLineCount() so the user always sees
+// where they are relative to the full chat history without having to
+// scroll up in the terminal emulator.
+//
+// Hidden when the content fits in the visible area (TotalLineCount <=
+// Height): no thumb to render, nothing to indicate. Plain viewport view
+// is returned in that case so an empty session does not show a useless
+// vertical line.
+func (m model) viewportView() string {
+	base := m.viewport.View()
+	total := m.viewport.TotalLineCount()
+	height := m.viewport.Height
+	if total <= height || height <= 0 {
+		return base
+	}
+	// Thumb size is proportional to (visible / total), floor 1, ceil
+	// height. Position derives from ScrollPercent so AtTop / AtBottom
+	// snap correctly to the extremes.
+	thumbSize := height * height / total
+	if thumbSize < 1 {
+		thumbSize = 1
+	}
+	if thumbSize > height {
+		thumbSize = height
+	}
+	thumbStart := int(float64(height-thumbSize) * m.viewport.ScrollPercent())
+	if thumbStart < 0 {
+		thumbStart = 0
+	}
+	if thumbStart > height-thumbSize {
+		thumbStart = height - thumbSize
+	}
+	t := m.theme
+	track := t.Muted.Render("▏")
+	thumb := t.Accent.Render("▐")
+	var sb strings.Builder
+	for i := 0; i < height; i++ {
+		if i >= thumbStart && i < thumbStart+thumbSize {
+			sb.WriteString(thumb)
+		} else {
+			sb.WriteString(track)
+		}
+		if i < height-1 {
+			sb.WriteByte('\n')
+		}
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Top, base, sb.String())
 }
 
 func (m model) activeModelRole() string {
@@ -1805,9 +1857,13 @@ func (m *model) recalcLayout() {
 	if m.input.Height() != desired {
 		m.input.SetHeight(desired)
 	}
-	vpWidth := max(20, w-2)
+	// -3 instead of -2 to reserve a column for viewportView's scrollbar
+	// overlay. The viewport's content wraps to vpWidth; viewportView() adds
+	// a 1-column scrollbar to its right via JoinHorizontal, landing inside
+	// the same -2 outer margin the layout already used.
+	vpWidth := max(20, w-3)
 	if m.showPlan {
-		vpWidth = max(20, w-planPanelWidth-4)
+		vpWidth = max(20, w-planPanelWidth-5)
 	}
 	m.viewport.Width = vpWidth
 

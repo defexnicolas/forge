@@ -99,7 +99,7 @@ func TestAppLayoutKeepsBlankLineAboveInput(t *testing.T) {
 	m.refresh()
 
 	view := stripAnsi(m.View())
-	want := stripAnsi(m.viewport.View()) + "\n\n" + stripAnsi(m.inputBoxView())
+	want := stripAnsi(m.viewportView()) + "\n\n" + stripAnsi(m.inputBoxView())
 	if !strings.Contains(view, want) {
 		t.Fatalf("view does not keep a blank line above input\nwant fragment:\n%s\n\nview:\n%s", want, view)
 	}
@@ -121,7 +121,7 @@ func TestAppLayoutShowsModelProgressAboveInput(t *testing.T) {
 	m.refresh()
 
 	view := stripAnsi(m.View())
-	want := stripAnsi(m.viewport.View()) + "\n  * streaming | step:1 | in:12.0k out:128 total:12.1k | 24.5 tk/s | 1.5s\n" + stripAnsi(m.inputBoxView())
+	want := stripAnsi(m.viewportView()) + "\n  * streaming | step:1 | in:12.0k out:128 total:12.1k | 24.5 tk/s | 1.5s\n" + stripAnsi(m.inputBoxView())
 	if !strings.Contains(view, want) {
 		t.Fatalf("view does not place model progress above input\nwant fragment:\n%s\n\nview:\n%s", want, view)
 	}
