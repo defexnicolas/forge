@@ -194,14 +194,28 @@ func (r *Runtime) executeExecuteTask(ctx context.Context, input json.RawMessage)
 		prompt += "\n\nAdditional guidance:\n" + strings.TrimSpace(req.Notes)
 	}
 	guard := deriveBuilderTaskGuard(task, req)
-	contextPayload := map[string]any{
-		"task": map[string]string{
-			"id":     task.ID,
-			"title":  task.Title,
-			"status": task.Status,
-			"notes":  task.Notes,
-		},
+	// Granular task fields go alongside the legacy title/status/notes so
+	// the builder sees BOTH the brief identity (id, status) AND the
+	// structured contract (target_files = exactly what to touch,
+	// acceptance_criteria = how to verify, depends_on = ordering).
+	// Empty fields are omitted via the nil/zero check below so older
+	// tasks (pre-v4 schema) still produce a clean payload.
+	taskCtxMap := map[string]any{
+		"id":     task.ID,
+		"title":  task.Title,
+		"status": task.Status,
+		"notes":  task.Notes,
 	}
+	if len(task.TargetFiles) > 0 {
+		taskCtxMap["target_files"] = task.TargetFiles
+	}
+	if strings.TrimSpace(task.AcceptanceCriteria) != "" {
+		taskCtxMap["acceptance_criteria"] = task.AcceptanceCriteria
+	}
+	if len(task.DependsOn) > 0 {
+		taskCtxMap["depends_on"] = task.DependsOn
+	}
+	contextPayload := map[string]any{"task": taskCtxMap}
 	if gitFact := strings.TrimSpace(r.GitSessionState().PromptFact()); gitFact != "" {
 		contextPayload["git_state"] = gitFact
 	}
@@ -219,9 +233,60 @@ func (r *Runtime) executeExecuteTask(ctx context.Context, input json.RawMessage)
 	}
 	if r.Plans != nil && r.Tasks != nil {
 		if planDoc, ok, err := r.Plans.Current(); err == nil && ok {
+			// Pass the full plan structure — approach, stubs, risks,
+			// validation — alongside the digest. The digest is a
+			// 400-char summary that strips so much detail the builder
+			// can't tell which stub maps to which task; the full
+			// structure preserves the design rationale and the
+			// validation hints so the builder doesn't re-read files
+			// just to rediscover what the planner already wrote down.
+			plan := map[string]any{}
+			if s := strings.TrimSpace(planDoc.Summary); s != "" {
+				plan["summary"] = s
+			}
+			if s := strings.TrimSpace(planDoc.Context); s != "" {
+				plan["context"] = s
+			}
+			if len(planDoc.Assumptions) > 0 {
+				plan["assumptions"] = planDoc.Assumptions
+			}
+			if s := strings.TrimSpace(planDoc.Approach); s != "" {
+				plan["approach"] = s
+			}
+			if len(planDoc.Stubs) > 0 {
+				plan["stubs"] = planDoc.Stubs
+			}
+			if len(planDoc.Risks) > 0 {
+				plan["risks"] = planDoc.Risks
+			}
+			if len(planDoc.Validation) > 0 {
+				plan["validation"] = planDoc.Validation
+			}
+			if len(plan) > 0 {
+				contextPayload["plan"] = plan
+			}
 			taskList, _ := r.Tasks.List()
 			if digest := compactPlanDigest(planDoc, taskList); digest != "" {
+				// Keep digest as a fallback for older subagent system
+				// prompts that already know how to render it. Tiny
+				// overhead (~400 chars) next to the structured plan.
 				contextPayload["approved_plan_digest"] = digest
+			}
+			// Surface remaining checklist titles so the builder has a
+			// hint for what's still pending across the multi-task run
+			// — useful for tasks whose acceptance check overlaps
+			// adjacent work.
+			var pendingTitles []string
+			for _, t := range taskList {
+				if t.ID == task.ID {
+					continue
+				}
+				if strings.EqualFold(t.Status, "pending") {
+					pendingTitles = append(pendingTitles, t.Title)
+				}
+			}
+			if len(pendingTitles) > 0 {
+				contextPayload["checklist_remaining"] = pendingTitles
 			}
 		}
 	}
@@ -256,13 +321,13 @@ func (r *Runtime) executeExecuteTask(ctx context.Context, input json.RawMessage)
 }
 
 func (r *Runtime) executeTodoWrite(input json.RawMessage) (*tools.Result, string) {
-	items, content, err := parseTodoWriteInput(input)
+	rich, items, content, err := parseTodoWriteInput(input)
 	if err != nil {
 		result := tools.Result{Title: "todo_write", Summary: err.Error()}
 		return &result, "Tool result for todo_write: error: " + err.Error()
 	}
 	// If no items but content string is provided, split content into items.
-	if len(items) == 0 && content != "" {
+	if len(rich) == 0 && len(items) == 0 && content != "" {
 		for _, line := range strings.Split(content, "\n") {
 			line = strings.TrimSpace(line)
 			line = strings.TrimLeft(line, "-*•0123456789. ")
@@ -276,8 +341,31 @@ func (r *Runtime) executeTodoWrite(input json.RawMessage) (*tools.Result, string
 			}
 		}
 	}
-	items = normalizeChecklistItems(items)
-	plan, err := r.Tasks.ReplacePlan(items)
+	// Plain-string items go through normalizeChecklistItems first — that
+	// path expands seed prompts like "create snake game in html" into 5+
+	// concrete tasks (snake-game.html scaffold, etc.) before storage.
+	// Validate AFTER expansion so the seed isn't rejected on its way in;
+	// the expansion itself produces path-shaped titles that pass the gate.
+	if len(rich) == 0 {
+		items = normalizeChecklistItems(items)
+	}
+	// Granularity validation: every task MUST either declare target_files
+	// explicitly OR mention a path-shaped substring in its title. Without
+	// this gate, the planner emits "Fix auth" / "Update tests" and the
+	// builder has no idea which files to touch — it re-reads everything.
+	// Tasks that fail the check are returned to the model as a tool error
+	// so it has to re-emit the batch. Same pattern as
+	// enforceRepeatedReadFileGuard.
+	if rejection := validateTaskItems(rich, items); rejection != "" {
+		result := tools.Result{Title: "todo_write", Summary: rejection}
+		return &result, "Tool result for todo_write: error: " + rejection
+	}
+	var plan []tasks.Task
+	if len(rich) > 0 {
+		plan, err = r.Tasks.ReplacePlanRich(rich)
+	} else {
+		plan, err = r.Tasks.ReplacePlan(items)
+	}
 	if err != nil {
 		result := tools.Result{Title: "todo_write", Summary: err.Error()}
 		return &result, "Tool result for todo_write: error: " + err.Error()
@@ -290,35 +378,143 @@ func (r *Runtime) executeTodoWrite(input json.RawMessage) (*tools.Result, string
 	return &result, "Tool result for todo_write:\n" + summarizeResult(result)
 }
 
-// parseTodoWriteInput accepts both `items:["a","b"]` and the object form
-// `items:[{"title":"a","status":"completed"}]` that small models often emit
-// after seeing task_list output. Object items get converted to strings with
-// the right status prefix (e.g. "[x] title") so parsePlanStatus normalizes
-// them through the existing path.
-func parseTodoWriteInput(input json.RawMessage) (items []string, content string, err error) {
+// validateTaskItems returns a human-readable rejection message when the
+// batch fails the granularity gate. Validation is asymmetric on purpose:
+//
+//   - Rich form (the model emitted structured items with target_files /
+//     acceptance_criteria / depends_on populated): STRICT. Every item
+//     must declare target_files OR have a path-shaped title. The model
+//     was deliberately structured — hold it to the contract.
+//   - Plain string form (legacy fallback OR text-recovery path that
+//     extracts items from prose): LENIENT — accept all. The model
+//     already failed to emit structure; rejecting the recovery output
+//     makes the user's situation strictly worse, and the recovery flow
+//     is rare enough that a vague task slipping through is the lesser
+//     evil.
+//
+// Empty string means "all good — proceed".
+func validateTaskItems(rich []tasks.RichItem, _ []string) string {
+	if len(rich) == 0 {
+		return "" // plain-string path is lenient — see comment above.
+	}
+	var bad []string
+	for _, it := range rich {
+		if len(it.TargetFiles) > 0 {
+			continue
+		}
+		if titleHasPathLikeShape(it.Title) {
+			continue
+		}
+		title := strings.TrimSpace(it.Title)
+		if title == "" {
+			continue
+		}
+		bad = append(bad, title)
+	}
+	if len(bad) == 0 {
+		return ""
+	}
+	preview := strings.Join(bad, " | ")
+	if len(preview) > 240 {
+		preview = preview[:240] + "..."
+	}
+	return "todo_write rejected: " + fmt.Sprintf("%d task(s) have no target_files and no path-shaped substring in the title", len(bad)) +
+		". Each task MUST declare which files it will touch — either via the `target_files` array on the task object, or by naming a path like `src/Game.tsx` or `internal/foo/bar.go` in the title itself. Bad titles: " + preview +
+		". Re-emit the whole batch with paths included. Good example: {\"title\":\"Replace 12 combat.log calls in src/Game.tsx with console.log\",\"target_files\":[\"src/Game.tsx\"],\"acceptance_criteria\":\"grep -c combat.log src/Game.tsx returns 0\"}."
+}
+
+// titleHasPathLikeShape returns true when the title contains a substring
+// that looks like a relative or absolute path. We accept any of:
+//   - a token containing a path separator (`/` or `\`) followed by an extension
+//   - a token ending in a common code/asset extension (.go .ts .tsx .js
+//     .jsx .py .rs .java .rb .css .scss .html .md .json .yaml .yml .toml
+//     .sql .sh)
+//
+// The check is intentionally permissive — a title with "src/foo" or
+// "package.json" passes. Pure prose ("Fix the auth flow") does not.
+func titleHasPathLikeShape(title string) bool {
+	lower := strings.ToLower(title)
+	exts := []string{".go", ".ts", ".tsx", ".js", ".jsx", ".py", ".rs", ".java",
+		".rb", ".css", ".scss", ".html", ".md", ".json", ".yaml", ".yml",
+		".toml", ".sql", ".sh", ".c", ".h", ".cpp", ".hpp", ".swift", ".kt"}
+	for _, ext := range exts {
+		if strings.Contains(lower, ext) {
+			return true
+		}
+	}
+	for _, sep := range []string{"/", "\\"} {
+		if strings.Contains(title, sep) {
+			return true
+		}
+	}
+	return false
+}
+
+// parseTodoWriteInput accepts three forms:
+//  1. items:["a","b"] — legacy plain-string form. Returned via `items`.
+//  2. items:[{"title":"a","status":"completed"}] — object form WITHOUT
+//     granular fields. Promoted to plain strings (the legacy fallback) so
+//     the existing string-based pipeline keeps working.
+//  3. items:[{"title":"a","target_files":["..."],"acceptance_criteria":"...","depends_on":["plan-1"]}] —
+//     rich form. Returned via `rich` and routed through ReplacePlanRich.
+//
+// The two return paths (rich vs items) are mutually exclusive: if any
+// object has at least one of the granular fields populated, we return the
+// whole batch as rich so the plan persists with the structure intact.
+func parseTodoWriteInput(input json.RawMessage) (rich []tasks.RichItem, items []string, content string, err error) {
 	var raw struct {
 		Items   json.RawMessage `json:"items"`
 		Content string          `json:"content"`
 	}
 	if uerr := json.Unmarshal(input, &raw); uerr != nil {
-		return nil, "", fmt.Errorf("todo_write: invalid JSON payload: %v", uerr)
+		return nil, nil, "", fmt.Errorf("todo_write: invalid JSON payload: %v", uerr)
 	}
 	content = raw.Content
 	if len(raw.Items) == 0 || string(raw.Items) == "null" {
-		return nil, content, nil
+		return nil, nil, content, nil
 	}
 	// Fast path: array of strings.
 	var asStrings []string
 	if jerr := json.Unmarshal(raw.Items, &asStrings); jerr == nil {
-		return asStrings, content, nil
+		return nil, asStrings, content, nil
 	}
-	// Object form.
+	// Object form. Try the rich shape first — if any item has granular
+	// fields, we route the whole batch through ReplacePlanRich so the
+	// extra context survives persistence.
 	var objs []struct {
-		Title  string `json:"title"`
-		Status string `json:"status"`
-		Notes  string `json:"notes"`
+		Title              string   `json:"title"`
+		Status             string   `json:"status"`
+		Notes              string   `json:"notes"`
+		TargetFiles        []string `json:"target_files"`
+		AcceptanceCriteria string   `json:"acceptance_criteria"`
+		DependsOn          []string `json:"depends_on"`
 	}
 	if jerr := json.Unmarshal(raw.Items, &objs); jerr == nil {
+		anyRich := false
+		for _, o := range objs {
+			if len(o.TargetFiles) > 0 || strings.TrimSpace(o.AcceptanceCriteria) != "" || len(o.DependsOn) > 0 {
+				anyRich = true
+				break
+			}
+		}
+		if anyRich {
+			for _, o := range objs {
+				if strings.TrimSpace(o.Title) == "" {
+					continue
+				}
+				rich = append(rich, tasks.RichItem{
+					Title:              o.Title,
+					Notes:              o.Notes,
+					Status:             o.Status,
+					TargetFiles:        o.TargetFiles,
+					AcceptanceCriteria: o.AcceptanceCriteria,
+					DependsOn:          o.DependsOn,
+				})
+			}
+			return rich, nil, content, nil
+		}
+		// Legacy object form (title + status + notes only). Promote to
+		// the plain-string pipeline by encoding status into a prefix.
 		for _, o := range objs {
 			title := strings.TrimSpace(o.Title)
 			if title == "" {
@@ -335,13 +531,13 @@ func parseTodoWriteInput(input json.RawMessage) (items []string, content string,
 			}
 			items = append(items, title)
 		}
-		return items, content, nil
+		return nil, items, content, nil
 	}
 	preview := string(raw.Items)
 	if len(preview) > 200 {
 		preview = preview[:200] + "..."
 	}
-	return nil, content, fmt.Errorf("todo_write: 'items' must be an array of strings (e.g. [\"step 1\",\"step 2\"]) OR an array of {title, status?, notes?} objects. Got: %s", preview)
+	return nil, nil, content, fmt.Errorf("todo_write: 'items' must be an array of strings (e.g. [\"step 1\",\"step 2\"]) OR an array of {title, status?, notes?, target_files?, acceptance_criteria?, depends_on?} objects. Got: %s", preview)
 }
 
 // formatPlanForDisplay renders the plan as a multi-line summary with status icons
@@ -466,8 +662,11 @@ func (r *Runtime) runTaskTool(toolName string, input json.RawMessage) (tools.Res
 	switch toolName {
 	case "task_create":
 		var req struct {
-			Title string `json:"title"`
-			Notes string `json:"notes"`
+			Title              string   `json:"title"`
+			Notes              string   `json:"notes"`
+			TargetFiles        []string `json:"target_files"`
+			AcceptanceCriteria string   `json:"acceptance_criteria"`
+			DependsOn          []string `json:"depends_on"`
 		}
 		if err := json.Unmarshal(input, &req); err != nil {
 			return tools.Result{}, err
@@ -478,7 +677,20 @@ func (r *Runtime) runTaskTool(toolName string, input json.RawMessage) (tools.Res
 		// structure since they're shown in expanded views, not the
 		// dense checklist row.
 		req.Title = strings.Join(strings.Fields(req.Title), " ")
-		task, err := r.Tasks.Create(req.Title, req.Notes)
+		// Same granularity gate as todo_write — every task must declare
+		// either explicit target_files or a path-shaped substring in
+		// the title. Otherwise the builder has no idea which files to
+		// touch and re-reads everything.
+		if len(req.TargetFiles) == 0 && !titleHasPathLikeShape(req.Title) {
+			return tools.Result{}, fmt.Errorf("task_create rejected: task has no target_files and no path-shaped substring in the title. Re-emit with `target_files` set OR mention a path like `src/Game.tsx` directly in the title. Bad: %q", req.Title)
+		}
+		task, err := r.Tasks.CreateWith(tasks.CreateInput{
+			Title:              req.Title,
+			Notes:              req.Notes,
+			TargetFiles:        req.TargetFiles,
+			AcceptanceCriteria: req.AcceptanceCriteria,
+			DependsOn:          req.DependsOn,
+		})
 		if err != nil {
 			return tools.Result{}, err
 		}
@@ -1203,4 +1415,75 @@ func userPrompt(snapshot contextbuilder.Snapshot, userMessage, planBlock, mode, 
 	b.WriteString("\n=== USER REQUEST ===\n")
 	b.WriteString(userMessage)
 	return b.String()
+}
+
+// promoteExplorePlanToHandoff is called at the end of an explore-mode turn
+// when the model used plan_write. It renders the just-saved plan to a text
+// block and stashes it in PendingExplorerContext so the next plan-mode turn
+// picks it up automatically (the existing handoff plumbing in run() consumes
+// PendingExplorerContext into the EXPLORER FINDINGS prompt block). This
+// removes the manual copy-paste step the user complained about ("explore
+// pasa a plan no hizo nada").
+//
+// Returns true when a non-empty handoff was promoted — caller uses this to
+// decide whether to emit "Findings saved" vs "Exploration ended without
+// plan_write".
+func (r *Runtime) promoteExplorePlanToHandoff() bool {
+	if r == nil || r.Plans == nil {
+		return false
+	}
+	doc, ok, err := r.Plans.Current()
+	if err != nil || !ok {
+		return false
+	}
+	rendered := renderPlanForHandoff(doc)
+	if rendered == "" {
+		return false
+	}
+	r.PendingExplorerContext = rendered
+	return true
+}
+
+// renderPlanForHandoff turns a plans.Document into the readable text block
+// that explore mode hands off to plan mode via PendingExplorerContext. Plan
+// mode renders this block under "EXPLORER FINDINGS:" in the next user
+// prompt; the textual form is preferred over forcing plan mode to call
+// plan_get because the handoff context survives even if plan mode chooses
+// to clobber the persisted plan with a refined version.
+func renderPlanForHandoff(doc plans.Document) string {
+	var b strings.Builder
+	if s := strings.TrimSpace(doc.Summary); s != "" {
+		fmt.Fprintf(&b, "Summary: %s\n", s)
+	}
+	if s := strings.TrimSpace(doc.Context); s != "" {
+		fmt.Fprintf(&b, "Context: %s\n", s)
+	}
+	if len(doc.Assumptions) > 0 {
+		b.WriteString("Assumptions:\n")
+		for _, a := range doc.Assumptions {
+			if s := strings.TrimSpace(a); s != "" {
+				fmt.Fprintf(&b, "- %s\n", s)
+			}
+		}
+	}
+	if s := strings.TrimSpace(doc.Approach); s != "" && !strings.EqualFold(s, "tbd") && !strings.HasPrefix(strings.ToUpper(s), "TBD") {
+		fmt.Fprintf(&b, "Approach (preliminary): %s\n", s)
+	}
+	if len(doc.Stubs) > 0 {
+		b.WriteString("Stubs (files / line ranges to touch):\n")
+		for _, s := range doc.Stubs {
+			if v := strings.TrimSpace(s); v != "" {
+				fmt.Fprintf(&b, "- %s\n", v)
+			}
+		}
+	}
+	if len(doc.Risks) > 0 {
+		b.WriteString("Risks:\n")
+		for _, s := range doc.Risks {
+			if v := strings.TrimSpace(s); v != "" {
+				fmt.Fprintf(&b, "- %s\n", v)
+			}
+		}
+	}
+	return strings.TrimSpace(b.String())
 }

@@ -3,33 +3,50 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"forge/internal/tools"
 )
 
-// Per-turn cache for read_file results. The agent occasionally re-reads the
-// same file across consecutive steps (e.g. after a search to confirm context
-// before editing); serving the second read from cache saves a tool round-trip
-// and the prefill of its content into the next prompt.
+// Session-scoped cache for read_file results. The agent re-reads the same
+// file across steps (e.g. after a search to confirm context before editing)
+// AND across mode switches (explore→plan→build often touch the same files);
+// serving the second+ read from cache saves a tool round-trip and the
+// prefill of its content into the next prompt.
 //
-// Lifetime is bounded to a single turn: r.resetReadCache() is called at the
-// top of run() so cross-turn drift cannot serve stale bytes. Within a turn,
-// any tool that reports ChangedFiles invalidates the matching entries; a
-// successful run_command flushes the entire cache because we cannot tell what
-// arbitrary commands wrote.
+// Lifetime is bounded to the session: NewRuntime allocates the cache and
+// `run()` does NOT reset it between turns. Cross-mode handoffs preserve the
+// cache so build mode does not re-read what explore/plan already pulled.
+// Safety nets:
+//   - lookupReadCache stats the file on disk before serving and re-fetches
+//     if the disk mtime is newer than the entry's storedAtMtime — covers
+//     the user-edited-the-file-in-VS-Code-between-turns case.
+//   - Within a turn, any tool that reports ChangedFiles invalidates the
+//     matching entries.
+//   - A successful run_command flushes the entire cache because we cannot
+//     tell what arbitrary commands wrote.
 
 type readCacheEntry struct {
 	result      tools.Result
 	observation string
+	// storedAtMtime is the disk mtime of the source file at the moment we
+	// stored this entry. Compared to the live mtime in lookupReadCache so
+	// an external edit (user opens VS Code and saves between turns) is
+	// detected and triggers a refetch instead of serving stale bytes.
+	// Zero value means "no mtime captured" — in that case lookup behaves
+	// as it did pre-mtime (always serve from cache, rely on the explicit
+	// invalidation hooks).
+	storedAtMtime time.Time
 	// serveCount tracks how many times this entry was served from cache
 	// (excluding the original store). Cache lookups annotate the
 	// served result with this count so the model gets an explicit
-	// signal it just re-read a file it already saw this turn — small
-	// local models otherwise loop on read_file calls until they hit
-	// the consecutive-read-only guard.
+	// signal it just re-read a file it already saw — small local models
+	// otherwise loop on read_file calls until they hit the
+	// consecutive-read-only guard.
 	serveCount int
 }
 
@@ -91,6 +108,19 @@ func (r *Runtime) lookupReadCache(input json.RawMessage) (*tools.Result, string,
 	if !ok {
 		return nil, "", false
 	}
+	// External-edit safety net: if the file on disk has been modified
+	// since we cached it (e.g. the user saved it from VS Code between
+	// turns), drop the entry and tell the caller to refetch. Stat is
+	// microseconds — cheap relative to the saved disk read + prompt
+	// prefill the cache buys us.
+	if !entry.storedAtMtime.IsZero() {
+		if info, err := os.Stat(key); err == nil {
+			if info.ModTime().After(entry.storedAtMtime) {
+				delete(r.readCache.entries, key)
+				return nil, "", false
+			}
+		}
+	}
 	r.readCache.hits++
 	entry.serveCount++
 	// Annotate so the model sees an explicit "you already read this"
@@ -134,11 +164,22 @@ func (r *Runtime) storeReadCache(input json.RawMessage, result *tools.Result, ob
 	if key == "" {
 		return
 	}
+	// Capture the file's mtime so a future lookup can detect external
+	// edits. Stat failures are non-fatal — the entry is still cached,
+	// just without the safety net. Worst case: if mtime can't be read,
+	// the explicit invalidation hooks (invalidateReadCachePaths after
+	// edits, flushReadCache after run_command) still keep the cache
+	// honest within the agent's own actions.
+	var storedMtime time.Time
+	if info, err := os.Stat(key); err == nil {
+		storedMtime = info.ModTime()
+	}
 	r.readCache.mu.Lock()
 	defer r.readCache.mu.Unlock()
 	r.readCache.entries[key] = &readCacheEntry{
-		result:      *result,
-		observation: observation,
+		result:        *result,
+		observation:   observation,
+		storedAtMtime: storedMtime,
 	}
 }
 

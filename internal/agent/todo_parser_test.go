@@ -7,7 +7,7 @@ import (
 )
 
 func TestParseTodoWriteInputStringArray(t *testing.T) {
-	items, _, err := parseTodoWriteInput(json.RawMessage(`{"items":["alpha","[x] beta"]}`))
+	_, items, _, err := parseTodoWriteInput(json.RawMessage(`{"items":["alpha","[x] beta"]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -18,7 +18,7 @@ func TestParseTodoWriteInputStringArray(t *testing.T) {
 
 func TestParseTodoWriteInputObjectArray(t *testing.T) {
 	payload := `{"items":[{"id":"plan-1","status":"pending","title":"alpha"},{"title":"beta","status":"completed","notes":"verified"}]}`
-	items, _, err := parseTodoWriteInput(json.RawMessage(payload))
+	_, items, _, err := parseTodoWriteInput(json.RawMessage(payload))
 	if err != nil {
 		t.Fatalf("expected lenient parse, got %v", err)
 	}
@@ -37,7 +37,7 @@ func TestParseTodoWriteInputObjectArray(t *testing.T) {
 }
 
 func TestParseTodoWriteInputObjectWithoutTitleSkipped(t *testing.T) {
-	items, _, err := parseTodoWriteInput(json.RawMessage(`{"items":[{"status":"pending"},{"title":"keeper"}]}`))
+	_, items, _, err := parseTodoWriteInput(json.RawMessage(`{"items":[{"status":"pending"},{"title":"keeper"}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +47,7 @@ func TestParseTodoWriteInputObjectWithoutTitleSkipped(t *testing.T) {
 }
 
 func TestParseTodoWriteInputUnknownShapeIsPrescriptive(t *testing.T) {
-	_, _, err := parseTodoWriteInput(json.RawMessage(`{"items":[42, true]}`))
+	_, _, _, err := parseTodoWriteInput(json.RawMessage(`{"items":[42, true]}`))
 	if err == nil {
 		t.Fatal("expected error for non-string non-object items")
 	}

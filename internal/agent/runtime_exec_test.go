@@ -65,12 +65,9 @@ func TestReadFileCacheServesRepeatedReads(t *testing.T) {
 		t.Errorf("first read should not register a cache hit, got %d", hits)
 	}
 
-	// Mutate disk underneath; cache should still serve the original bytes
-	// because invalidation only fires through the agent's mutating tools.
-	if err := os.WriteFile(target, []byte("MUTATED\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
+	// Second read of the same path with no disk change MUST come from cache.
+	// (External-edit detection lives in TestReadCacheRefetchOnExternalEdit;
+	// agent-driven invalidation lives in the assertions below.)
 	second, _ := r.executeTool(context.Background(), ToolCall{Name: "read_file", Input: input}, nil)
 	if second == nil || !strings.Contains(second.Content[0].Text, "const v = 1") {
 		t.Fatalf("cache should serve original bytes, got: %#v", second)
@@ -79,8 +76,12 @@ func TestReadFileCacheServesRepeatedReads(t *testing.T) {
 		t.Errorf("expected exactly 1 cache hit after second read, got %d", hits)
 	}
 
-	// Simulating an edit_file via a synthetic ChangedFiles result must
-	// invalidate the cached entry for that path.
+	// Mutate disk to simulate an edit. invalidateReadCachePaths is what
+	// the runtime calls after edit_file/write_file/apply_patch reports
+	// ChangedFiles — confirm that the next read sees fresh bytes.
+	if err := os.WriteFile(target, []byte("MUTATED\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	r.invalidateReadCachePaths([]string{"game.js"})
 
 	third, _ := r.executeTool(context.Background(), ToolCall{Name: "read_file", Input: input}, nil)

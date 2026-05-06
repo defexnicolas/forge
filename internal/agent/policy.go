@@ -135,6 +135,14 @@ func NewExplorePolicy() SprintPolicy {
 		// the main explorer delegate parallel analysis doesn't violate
 		// the mode's safety envelope.
 		"spawn_subagent", "spawn_subagents",
+		// plan_write is the structured handoff to plan mode. Explore
+		// produces the findings document (context, assumptions, stubs,
+		// risks); plan mode picks it up via PendingExplorerContext on
+		// the next turn. plan_get is also allowed so the model can read
+		// any pre-existing plan to avoid clobbering. todo_write and the
+		// task_* tools are deliberately excluded — designing the
+		// checklist is plan mode's job, not explore's.
+		"plan_write", "plan_get",
 	} {
 		allowed[name] = true
 	}

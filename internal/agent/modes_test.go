@@ -96,13 +96,17 @@ func TestBuildModeAllowsEditsUnderApproval(t *testing.T) {
 
 func TestExploreModeDeniesEverythingExceptReads(t *testing.T) {
 	mode, _ := GetMode("explore")
-	for _, tool := range []string{"edit_file", "write_file", "run_command", "todo_write", "plan_get"} {
+	// Mutating tools and the executor checklist tools must stay denied.
+	// plan_write and plan_get are now allowed because explore produces a
+	// structured findings document (the auto-handoff to plan mode); see
+	// promoteExplorePlanToHandoff in runtime_exec.go.
+	for _, tool := range []string{"edit_file", "write_file", "run_command", "todo_write", "task_create", "task_update"} {
 		decision, _ := mode.Policy.Decision(tool)
 		if decision != ToolDeny {
 			t.Fatalf("explore mode should deny %s, got %s", tool, decision)
 		}
 	}
-	for _, tool := range []string{"read_file", "list_files", "search_text", "git_status", "spawn_subagent", "spawn_subagents"} {
+	for _, tool := range []string{"read_file", "list_files", "search_text", "git_status", "spawn_subagent", "spawn_subagents", "plan_write", "plan_get"} {
 		decision, _ := mode.Policy.Decision(tool)
 		if decision != ToolAllow {
 			t.Fatalf("explore mode should allow %s, got %s", tool, decision)

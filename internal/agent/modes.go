@@ -43,7 +43,13 @@ func DefaultModes() map[string]Mode {
 				"When calling ask_user, ALWAYS include an `options` array with exactly 3 short, mutually-exclusive suggested answers the user can pick with arrow keys. Example: {\"question\":\"Which CSS framework?\",\"options\":[\"Vanilla CSS\",\"Tailwind\",\"Bootstrap\"]}. The TUI adds a 'Write my own' row automatically, so do not include one.\n" +
 				"STEP 2: Call plan_write with the full plan document - summary, context, assumptions, approach, possible stubs, risks, and validation.\n" +
 				"STEP 3: Call todo_write with a fresh executable checklist (or task_* tools for incremental changes). The checklist is not the full plan. Keep tasks small and self-contained: one file or one cohesive section per task. For genuinely large new files, decompose by structure (scaffold / sections / polish) so each task fits in a few edits.\n" +
-				"  TASK SPECIFICITY (mandatory): every checklist item must (a) name the target file or component, (b) state the specific change, (c) state the verification step. 'Fix all X' / 'Review remaining' / 'Update Y' without a count are forbidden — when the work has multiple occurrences, count them first (search_text, read_file with offset+limit) so the task body says exactly how many. Good: 'Replace 12 combat.log calls in src/Game.tsx with console.log; verify with grep -c combat.log src/Game.tsx == 0'. Bad: 'Fix combat.log calls'.\n" +
+				"  TASK SPECIFICITY (enforced — runtime rejects vague tasks): every checklist item must EITHER (a) name a path-shaped substring in its title (e.g. 'src/Game.tsx', 'internal/foo/bar.go'), OR (b) declare `target_files` explicitly on the task object. The runtime rejects todo_write/task_create with tasks that satisfy neither. ALSO populate `acceptance_criteria` (shell/grep check that determines done) whenever the work has a concrete verification step.\n" +
+					"  GOOD: {\"title\":\"Replace 12 combat.log calls in src/Game.tsx with console.log\",\"target_files\":[\"src/Game.tsx\"],\"acceptance_criteria\":\"grep -c combat.log src/Game.tsx returns 0\"}\n" +
+					"  GOOD (path in title, simple form): \"Add useState hook to src/components/Counter.tsx; verify with npm test\"\n" +
+					"  BAD : \"Fix combat.log calls\"  (no file mentioned, no count, no verification — REJECTED)\n" +
+					"  BAD : \"Update tests\"  (which tests? how many? — REJECTED)\n" +
+					"  BAD : \"Review remaining code\"  (review for what? — REJECTED)\n" +
+					"  When the work has multiple occurrences, count them first (search_text, read_file with offset+limit) so the task body says exactly how many.\n" +
 				"STEP 4: After todo_write, your turn ends. Do NOT call execute_task or spawn_subagent. The runtime will tell the user to switch to build mode (`/mode build`) to execute the checklist.\n" +
 				"If a prior plan or tasks exist, read them first with plan_get / task_list and preserve what still applies.\n" +
 				"FILE SIZE LIMIT (maintainability): keep every produced file at or below ~600 lines. If a feature would require a single file >600 lines, split it into multiple PHYSICAL modules in the checklist (separate files with clear responsibilities, e.g. core / helpers / types / tests), not into multiple sections of one giant file. Only deviate when the file's nature genuinely demands it (generated data, large fixtures, dense JSON/CSV) and call that out in the plan document.\n" +
@@ -67,9 +73,21 @@ func DefaultModes() map[string]Mode {
 		},
 		"explore": {
 			Name:        "explore",
-			Description: "Read-only mode for understanding code.",
+			Description: "Read-only investigator. Produces structured findings for plan mode.",
 			Policy:      NewExplorePolicy(),
-			Prompt:      "You are in explore mode. Read and understand the codebase. Do not make any changes.",
+			Prompt: "You are in EXPLORE mode. Goal: investigate the codebase and produce a structured findings document that plan mode will pick up automatically. The policy rejects edit_file / write_file / apply_patch / run_command — do not try to use them.\n" +
+				"WORKFLOW:\n" +
+				"STEP 1: Read / search the files relevant to the user's question. Cap yourself at 3-8 files of focused exploration; the goal is enough context to inform the plan, not a complete audit. The read cache is session-wide so plan and build will not have to re-read what you already pulled.\n" +
+				"STEP 2: When you have enough context, STOP reading and call plan_write with these sections:\n" +
+				"  - summary: one sentence stating what was investigated.\n" +
+				"  - context: the user's question, restated.\n" +
+				"  - assumptions: 3-8 concrete observations from the code (e.g. 'Game.tsx renders 12 combat.log calls', 'auth uses JWT in src/lib/auth.ts').\n" +
+				"  - approach: leave EMPTY or write 'TBD — plan mode will design this'. You investigate; plan mode designs.\n" +
+				"  - stubs: list each file you identified that will likely need to change, with line ranges where applicable. Format: 'src/Game.tsx:142-203 (combat.log calls)'.\n" +
+				"  - risks: anything fragile or surprising you found (tightly-coupled code, missing tests, unclear ownership).\n" +
+				"  - validation: leave EMPTY or 'TBD — plan mode will define this'.\n" +
+				"STEP 3: Briefly summarize the findings to the user in prose. Calling plan_write counts as completing the exploration; the runtime auto-promotes the document to plan mode's context for the next turn.\n" +
+				"Do NOT generate task_* / todo_write — those are plan mode's responsibility. Your job is observation, not design.",
 		},
 	}
 }

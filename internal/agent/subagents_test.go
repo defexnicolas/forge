@@ -602,7 +602,7 @@ func TestRuntimeTodoWriteUpdatesPlan(t *testing.T) {
 	tools.RegisterBuiltins(registry)
 	runtime := newTestRuntime(t, cwd, cfg, registry, llm.NewRegistry())
 
-	input, _ := json.Marshal(map[string][]string{"items": {"read code", "write tests"}})
+	input, _ := json.Marshal(map[string][]string{"items": {"read code in src/main.go", "write tests in src/main_test.go"}})
 	result, _ := runtime.executeTodoWrite(input)
 	if result == nil || !strings.HasPrefix(result.Summary, "Updated checklist:") {
 		t.Fatalf("unexpected result %#v", result)
@@ -611,7 +611,7 @@ func TestRuntimeTodoWriteUpdatesPlan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(list) != 2 || list[0].Title != "read code" {
+	if len(list) != 2 || list[0].Title != "read code in src/main.go" {
 		t.Fatalf("unexpected plan %#v", list)
 	}
 }
@@ -621,7 +621,7 @@ func TestRuntimeTaskTools(t *testing.T) {
 	cfg := config.Defaults()
 	runtime := newTestRuntime(t, cwd, cfg, tools.NewRegistry(), llm.NewRegistry())
 
-	input, _ := json.Marshal(map[string]string{"title": "ship sprint", "notes": "subagents"})
+	input, _ := json.Marshal(map[string]string{"title": "ship sprint in cmd/forge/main.go", "notes": "subagents"})
 	result, err := runtime.runTaskTool("task_create", input)
 	if err != nil {
 		t.Fatal(err)

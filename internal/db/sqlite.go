@@ -111,4 +111,16 @@ var migrations = []string{
 		created_at TEXT NOT NULL,
 		updated_at TEXT NOT NULL
 	)`,
+	// v4: granular task fields for the build-mode executor. target_files
+	// names the files the task will touch; acceptance_criteria is the
+	// concrete check that determines "done"; depends_on enforces ordering
+	// across tasks. All three are optional (default empty JSON array / "")
+	// so plan-mode output predating this migration loads as zero-values
+	// and the existing pipeline keeps working. Each ALTER lives in its
+	// own migration slot so a partial failure leaves a clean recoverable
+	// state — SQLite's Exec only runs the first statement in a
+	// multi-statement string under most drivers.
+	`ALTER TABLE tasks ADD COLUMN target_files TEXT NOT NULL DEFAULT '[]'`,
+	`ALTER TABLE tasks ADD COLUMN acceptance_criteria TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE tasks ADD COLUMN depends_on TEXT NOT NULL DEFAULT '[]'`,
 }

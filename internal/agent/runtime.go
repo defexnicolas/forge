@@ -287,6 +287,7 @@ func NewRuntime(cwd string, cfg config.Config, registry *tools.Registry, provide
 		Tasks:     tasks.New(cwd),
 		Subagents: DefaultSubagents(),
 		Parsers:   DefaultParsers(),
+		readCache: newReadCache(),
 	}
 	runtime.seedLoadedModelsFromConfig()
 	runtime.RefreshGitSessionState()
@@ -1201,7 +1202,11 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 	r.turnStepsUsed.Store(0)
 	r.turnReadOnlySteps.Store(0)
 	r.turnMutatingSteps.Store(0)
-	r.resetReadCache()
+	// Note: read cache is intentionally NOT reset here. It's session-scoped
+	// so that build mode reuses reads explore/plan already pulled, instead
+	// of re-fetching the same files from disk and re-prefilling them into
+	// the prompt. lookupReadCache stats the file's mtime before serving so
+	// external edits (user saves in VS Code between turns) are detected.
 	defer func() {
 		r.mu.Lock()
 		r.activeEvents = nil
@@ -1553,6 +1558,22 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 					consecutiveToolFailures = 0
 				}
 
+				// In explore mode, stop after plan_write and auto-promote
+				// the saved plan to PendingExplorerContext so plan mode
+				// picks up the findings on the next turn without the user
+				// having to copy-paste anything.
+				if r.Mode == "explore" && agentCall.Name == "plan_write" {
+					promoted := r.promoteExplorePlanToHandoff()
+					msg := "Exploration complete. Findings saved."
+					if promoted {
+						msg += " Switch to /mode plan to design the change — your findings will be picked up automatically."
+					} else {
+						msg += " (Plan was empty; nothing to hand off.)"
+					}
+					events <- Event{Type: EventAssistantText, Text: msg}
+					events <- Event{Type: EventDone}
+					return
+				}
 				// In plan mode, stop after todo_write — plan mode never executes.
 				if r.Mode == "plan" && agentCall.Name == "todo_write" {
 					msg := "Plan saved."
@@ -1798,6 +1819,22 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 			consecutiveToolFailures = 0
 		}
 
+		// In explore mode, stop after plan_write and auto-promote the
+		// saved plan to PendingExplorerContext. Mirrors the native-path
+		// branch above so both response shapes (text-based <tool_call>
+		// and OpenAI-style native tool_calls) hand off identically.
+		if r.Mode == "explore" && parsed.Call.Name == "plan_write" {
+			promoted := r.promoteExplorePlanToHandoff()
+			msg := "Exploration complete. Findings saved."
+			if promoted {
+				msg += " Switch to /mode plan to design the change — your findings will be picked up automatically."
+			} else {
+				msg += " (Plan was empty; nothing to hand off.)"
+			}
+			events <- Event{Type: EventAssistantText, Text: msg}
+			events <- Event{Type: EventDone}
+			return
+		}
 		// In plan mode, stop after todo_write — plan mode never executes.
 		// Use a hardcoded handoff message (not another LLM call) so the
 		// planner cannot keep asking "execute this plan?" in a loop while
