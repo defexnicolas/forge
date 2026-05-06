@@ -271,6 +271,17 @@ func (m *model) appendAgentEvent(event agent.Event) {
 		if m.agentRuntime != nil && m.agentRuntime.Mode == "explore" {
 			exploreHandoff = buildExploreHandoff(m.turnUserInput, m.turnToolActivity, m.currentAssistant.String())
 		}
+		// /agent explorer (async slash dispatch): same handoff behavior
+		// the prior synchronous flow had — accumulate the streamed
+		// result text and offer to promote it to plan mode. Different
+		// trigger from explore-MODE handoff above (this path fires on
+		// the slash, that path on /mode explore turns), so they don't
+		// double-up.
+		subagentExplorerResult := ""
+		if m.pendingSubagentName == "explorer" && exploreHandoff == "" {
+			subagentExplorerResult = strings.TrimSpace(m.currentAssistant.String())
+		}
+		m.pendingSubagentName = ""
 		// Persist a clean Q&A transcript line for the session's chat.md.
 		if m.options.Session != nil {
 			_ = m.options.Session.AppendChatTurn(m.currentAssistant.String())
@@ -301,6 +312,11 @@ func (m *model) appendAgentEvent(event agent.Event) {
 		m.history = append(m.history, "")
 		if exploreHandoff != "" {
 			m.pendingExplorerHandoff = exploreHandoff
+			m.activeForm = formConfirmExplorerPlan
+			m.confirmExplorerPlan = newConfirmForm("Pass explorer findings to Plan mode?", m.theme)
+			m.history = append(m.history, t.Muted.Render("Explorer finished. Confirm to send these findings to Plan mode."))
+		} else if subagentExplorerResult != "" {
+			m.pendingExplorerHandoff = subagentExplorerResult
 			m.activeForm = formConfirmExplorerPlan
 			m.confirmExplorerPlan = newConfirmForm("Pass explorer findings to Plan mode?", m.theme)
 			m.history = append(m.history, t.Muted.Render("Explorer finished. Confirm to send these findings to Plan mode."))

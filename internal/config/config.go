@@ -189,7 +189,17 @@ type RuntimeConfig struct {
 	MaxNoProgressSteps     int  `toml:"max_no_progress_steps"`
 	MaxEmptyResponses      int  `toml:"max_empty_responses"`
 	MaxSameToolFailures    int  `toml:"max_same_tool_failures"`
-	MaxConsecutiveReadOnly int  `toml:"max_consecutive_read_only"`
+	// IntentClassifierEnabled gates the bug-hunt routing detector that
+	// fires a small LLM call at the top of explore/plan turns to suggest
+	// /mode debug when the user message looks like a bug report.
+	// Defaults to false because (a) it adds one provider request per
+	// user message, (b) on local backends with a single model, the
+	// extra request burns model-load slots, and (c) the routing hint
+	// is opt-in friendly: users who want it enable it explicitly. Set
+	// `runtime.intent_classifier_enabled = true` in .forge/config.toml
+	// to turn it on.
+	IntentClassifierEnabled bool `toml:"intent_classifier_enabled"`
+	MaxConsecutiveReadOnly  int  `toml:"max_consecutive_read_only"`
 	MaxPlannerSummarySteps int  `toml:"max_planner_summary_steps"`
 	MaxBuilderReadLoops    int  `toml:"max_builder_read_loops"`
 	// ReadBudgetGracePastNudge is the number of additional read-only steps

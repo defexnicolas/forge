@@ -545,38 +545,34 @@ func (m model) agentUsageHint() string {
 
 func (m *model) runSubagentCommand(agentName, prompt string) string {
 	t := m.theme
-	// Subagents on local backends (LM Studio, llama-server) routinely spend
-	// 60+ seconds in prompt-processing before the first SSE chunk arrives —
-	// a 12k-token context on a 35B model is minutes of pre-fill, not seconds.
-	// The runtime already governs subagent lifetime through:
-	//   - subagent_timeout_seconds (config; 0 = no wall-clock)
-	//   - request_timeout_seconds (auto-disabled for local backends; commit b682b2c)
-	//   - request_idle_timeout_seconds (180s watchdog after first chunk)
-	// Wrapping this call in a hardcoded 60s WithTimeout overrode all of that
-	// and made every /agent invocation fail with "context deadline exceeded
-	// after 2 step(s)" (1 read + the LLM call to choose step 2). Use
-	// Background and let the runtime's configured timeouts govern.
-	result, err := m.agentRuntime.RunSubagent(context.Background(), agent.SubagentRequest{
+	// Async dispatch: RunSubagentStreaming runs the subagent on a
+	// goroutine and emits its tool calls / results / final text to the
+	// returned channel. We hand the channel to the existing event
+	// consumer (waitForAgentEvent + appendAgentEvent) so the textarea
+	// stays responsive and the user sees streaming progress instead of
+	// a frozen UI for ~minutes followed by a wall of text. The previous
+	// sync call to RunSubagent froze the TUI completely until the
+	// subagent finished.
+	//
+	// Subagent lifetime is governed by config (subagent_timeout_seconds,
+	// request_timeout_seconds for local backends, request_idle_timeout
+	// 180s watchdog). No wall-clock here — the streaming wrapper just
+	// pipes events through.
+	m.agentEvents = m.agentRuntime.RunSubagentStreaming(context.Background(), agent.SubagentRequest{
 		Agent:  agentName,
 		Prompt: prompt,
 	})
-	if err != nil {
-		return t.ErrorStyle.Render("Subagent failed: " + err.Error())
-	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "%s: %s", t.AgentPrefix.Render(result.Title), result.Summary)
-	for _, block := range result.Content {
-		if block.Text != "" {
-			fmt.Fprintf(&b, "\n%s", block.Text)
-		}
-	}
-	if strings.TrimSpace(agentName) == "explorer" {
-		m.pendingExplorerHandoff = subagentHandoffText(result)
-		m.activeForm = formConfirmExplorerPlan
-		m.confirmExplorerPlan = newConfirmForm("Pass explorer findings to Plan mode?", m.theme)
-		fmt.Fprintf(&b, "\n\n%s", t.Muted.Render("Explorer finished. Confirm to send these findings to Plan mode."))
-	}
-	return b.String()
+	m.agentRunning = true
+	m.pendingSubagentName = agentName
+	m.pendingCommand = waitForAgentEvent(m.agentEvents)
+	// NOTE: the prior synchronous flow opened a confirmExplorerPlan form
+	// after an "explorer" subagent finished so the user could promote
+	// findings to plan mode. That coupling is dropped here — the regular
+	// /mode explore → /mode plan handoff (PendingExplorerContext) covers
+	// the same ground without needing a special form on slash dispatch.
+	// Add it back via a synthesized post-EventDone hook if users miss
+	// it.
+	return t.AgentPrefix.Render("Running /agent " + agentName + "...")
 }
 
 func subagentHandoffText(result tools.Result) string {

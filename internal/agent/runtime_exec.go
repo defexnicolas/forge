@@ -1377,7 +1377,7 @@ For visible plans, prefer task_create / task_list / task_update for incremental 
 // entire prefix and only re-prefills tier C plus the fresh user request.
 // Everything volatile (yarn-scored context, handoffs, the user message
 // itself) is pushed to the tail.
-func userPrompt(snapshot contextbuilder.Snapshot, userMessage, planBlock, mode, handoff, explorerHandoff, buildPreflight, basePlan string) string {
+func userPrompt(snapshot contextbuilder.Snapshot, userMessage, planBlock, mode, handoff, explorerHandoff, buildPreflight, basePlan, routingHint string) string {
 	var b strings.Builder
 
 	b.WriteString("=== STABLE CONTEXT ===\n")
@@ -1427,6 +1427,15 @@ func userPrompt(snapshot contextbuilder.Snapshot, userMessage, planBlock, mode, 
 
 	if mode != "" {
 		fmt.Fprintf(&b, "\nMode: %s\n", strings.ToUpper(mode))
+	}
+	// Routing hint goes RIGHT BEFORE the user request so it's the last
+	// thing the model reads before processing the message — gives it
+	// the strongest priming. Empty when the classifier didn't fire or
+	// the current mode already matches the intent (most cases).
+	if strings.TrimSpace(routingHint) != "" {
+		b.WriteString("\n")
+		b.WriteString(strings.TrimSpace(routingHint))
+		b.WriteString("\n")
 	}
 	b.WriteString("\n=== USER REQUEST ===\n")
 	b.WriteString(userMessage)

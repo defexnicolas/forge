@@ -11,7 +11,7 @@ import (
 )
 
 func TestAllModesExist(t *testing.T) {
-	for _, name := range []string{"chat", "plan", "build", "explore"} {
+	for _, name := range []string{"chat", "plan", "build", "explore", "debug"} {
 		mode, ok := GetMode(name)
 		if !ok {
 			t.Fatalf("mode %s should exist", name)
@@ -30,10 +30,10 @@ func TestAllModesExist(t *testing.T) {
 
 func TestModeNames(t *testing.T) {
 	names := ModeNames()
-	if len(names) != 4 {
-		t.Fatalf("expected 4 modes (chat + plan + build + explore), got %d: %v", len(names), names)
+	if len(names) != 5 {
+		t.Fatalf("expected 5 modes (chat + plan + build + explore + debug), got %d: %v", len(names), names)
 	}
-	expected := []string{"build", "chat", "explore", "plan"}
+	expected := []string{"build", "chat", "debug", "explore", "plan"}
 	for i, name := range expected {
 		if names[i] != name {
 			t.Fatalf("expected mode %d to be %s, got %s (full: %v)", i, name, names[i], names)

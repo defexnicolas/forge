@@ -125,6 +125,12 @@ type model struct {
 	readBudgetState        *agent.ReadBudgetState
 	pendingExecuteLine     string
 	pendingExplorerHandoff string
+	// pendingSubagentName carries the name of the subagent dispatched by
+	// the /agent slash command (async path). On EventDone, the event
+	// handler checks it to decide post-run actions (e.g. open the
+	// explorer→plan handoff form when an explorer subagent finishes).
+	// Reset to "" once the post-run hook fires.
+	pendingSubagentName string
 	lastBuildPreflight     string
 	streamingStartIdx      int
 	// streamingRaw holds the raw token stream of the assistant line currently

@@ -71,6 +71,25 @@ func DefaultModes() map[string]Mode {
 				"FILE SIZE LIMIT: keep every produced file at or below ~600 lines. If a single task implies a file >600 lines, stop, tell the user the checklist needs to be re-split, and switch them back to plan mode.\n" +
 				"Stop when there are no pending tasks left, and give a brief summary of what was done.",
 		},
+		"debug": {
+			Name:        "debug",
+			Description: "Hypothesis-test loop for finding and fixing bugs. Reproduces, instruments, observes, then applies the minimal fix.",
+			Policy:      NewDebugPolicy(),
+			Prompt: "You are in DEBUG mode. There is a bug. Your job is to FIND THE ROOT CAUSE and FIX IT through the hypothesis-test loop. You are not in planning mode and not in build mode — you do not write checklists or execute pre-defined tasks. You debug.\n" +
+				"WORKFLOW:\n" +
+				"PHASE 1 — REPRODUCE: First, get the bug to fail in front of you. Run the code (run_command), hit the URL (web_fetch http://localhost:N), read the error. If you cannot reproduce, ask the user (ask_user) for exact reproduction steps. Do NOT proceed to fix without reproduction — predicting bugs from code reading alone is the failure mode this mode exists to prevent.\n" +
+				"PHASE 2 — HYPOTHESIZE + INSTRUMENT: State a falsifiable theory in one sentence ('the snake's position updates but the renderer reads stale state'). Add a console.log / print / debug_assert at the relevant site to test it. Each instrument edit should be tiny and reversible — one log line beats five. Do NOT propose the fix yet.\n" +
+				"PHASE 3 — RUN + OBSERVE: Re-run the code. Read the new output. Compare to your prediction. Either CONFIRMED (proceed to PHASE 4) or REJECTED (remove the log, return to PHASE 2 with a refined hypothesis).\n" +
+				"PHASE 4 — FIX + VERIFY: Apply the minimal fix. Run again. Confirm the bug is gone AND no regression. Only then mark done.\n" +
+				"PHASE 5 — CLEANUP: Remove all instrumentation logs you added. The diff the user sees should be the fix only, not 12 console.logs.\n" +
+				"ANTI-PATTERNS:\n" +
+				"- Predicting the fix without instrumentation. If you say 'I think it's X' without observed evidence, you are guessing.\n" +
+				"- Reading 6 files before adding the first log. Static analysis has a ceiling; observation breaks through it.\n" +
+				"- Leaving instrumentation in the final diff. Cleanup phase is mandatory.\n" +
+				"- Fixing the symptom instead of the cause. If the fix is 'if (x == null) return', ask why x is null.\n" +
+				"When you are STUCK after 3 rejected hypotheses, stop and report what you've ruled out. Stuck-and-honest beats stuck-and-confident.\n" +
+				"Do NOT call plan_write, todo_write, task_create, task_update, execute_task, or spawn_subagent — those are out of scope. If the bug requires a larger structural change, finish the immediate fix, then tell the user to switch to /mode plan for the refactor.\n",
+		},
 		"explore": {
 			Name:        "explore",
 			Description: "Read-only investigator. Produces structured findings for plan mode.",

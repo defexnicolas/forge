@@ -22,6 +22,12 @@ type Subagent struct {
 	ModelRole    string
 	ContextMode  string
 	AllowedTools []string
+	// StepLimit overrides the default per-subagent step budget. 0 = use
+	// the global default for the subagent's class (read-only vs
+	// mutating). Useful for subagents whose work is iterative by nature
+	// (debug: hypothesis → test → narrow takes 8-15 cycles, the default
+	// 4 stops it before it starts).
+	StepLimit int
 	// SystemBody is appended to the auto-generated subagent system prompt.
 	// Plugin-shipped agents use this to inject their role-specific
 	// instructions (the markdown body of their .md file). Empty for
@@ -107,10 +113,16 @@ func DefaultSubagents() SubagentRegistry {
 		},
 		{
 			Name:         "debug",
-			Description:  "Debugs issues: reads code, runs tests, finds root cause. Reports findings without editing.",
+			Description:  "Debugs issues via hypothesis-test cycles: forms a falsifiable theory, gathers evidence (read/run), confirms or refines. Reports root cause without editing.",
 			ModelRole:    "reviewer",
 			ContextMode:  "forked",
 			AllowedTools: []string{"read_file", "list_files", "search_text", "search_files", "git_status", "git_diff", "run_command", "python_setup", "python_run"},
+			// Debug is iterative by nature — needs enough budget for
+			// hypothesis → evidence → conclude across several cycles.
+			// The default 4 for read-only subagents was tripping the
+			// no_progress guard before any real investigation could
+			// happen.
+			StepLimit: 30,
 		},
 		{
 			Name:        "builder",
@@ -196,6 +208,68 @@ type PluginAgent struct {
 	Body        string
 	Tools       []string
 	ModelRole   string
+}
+
+// RunSubagentStreaming is the async wrapper for RunSubagent. The TUI
+// uses it to dispatch the /agent slash command without blocking the
+// textarea: the caller sets m.agentEvents to the returned channel and
+// the existing event loop renders tool calls / results / errors as they
+// happen. Internally we set r.activeEvents so the subagent's intermediate
+// emissions stream through the channel; the synthesized EventDone at
+// the end of the goroutine is what closes the loop on the TUI side.
+//
+// Use this only when invoking a subagent OUTSIDE a parent turn (typically
+// from a slash command or an explicit user-driven dispatch). Inside a
+// turn, RunSubagent is preferable: r.activeEvents is already wired and
+// the caller wants the synchronous result for downstream tool handling.
+func (r *Runtime) RunSubagentStreaming(ctx context.Context, request SubagentRequest) <-chan Event {
+	ch := make(chan Event, 32)
+	go func() {
+		defer close(ch)
+		// Hook activeEvents so subagent tool calls and results stream
+		// through ch as the run progresses. Restore the previous value
+		// (typically nil for the slash-dispatch path) on return so we
+		// don't leak the channel into a future turn.
+		r.mu.Lock()
+		prev := r.activeEvents
+		r.activeEvents = ch
+		r.mu.Unlock()
+		defer func() {
+			r.mu.Lock()
+			r.activeEvents = prev
+			r.mu.Unlock()
+		}()
+		result, err := r.RunSubagent(ctx, request)
+		if err != nil {
+			ch <- Event{Type: EventError, Error: err}
+			ch <- Event{Type: EventDone}
+			return
+		}
+		// Render the result as an assistant text event so the TUI's
+		// existing chat history renderer picks it up. Summary first
+		// (one-line headline), then content blocks separated by blank
+		// lines. The Result struct itself is also attached to the
+		// EventToolResult for callers that want the structured form.
+		var b strings.Builder
+		if result.Summary != "" {
+			b.WriteString(result.Summary)
+		}
+		for _, block := range result.Content {
+			if strings.TrimSpace(block.Text) == "" {
+				continue
+			}
+			if b.Len() > 0 {
+				b.WriteString("\n\n")
+			}
+			b.WriteString(block.Text)
+		}
+		text := strings.TrimSpace(b.String())
+		if text != "" {
+			ch <- Event{Type: EventAssistantText, Text: text}
+		}
+		ch <- Event{Type: EventDone}
+	}()
+	return ch
 }
 
 func (r *Runtime) RunSubagent(ctx context.Context, request SubagentRequest) (tools.Result, error) {
@@ -850,6 +924,25 @@ func subagentSystemPrompt(worker Subagent, snapshot contextbuilder.Snapshot) str
 		rules.WriteString("File size limit: keep every produced file at or below ~600 lines. If the assigned task implies a single file >600 lines, stop, return findings='split_required' with a proposed multi-file split, and let the planner re-plan instead of writing one giant file. Exception: generated data, fixtures, or dense JSON/CSV may exceed the limit when the file's nature requires it — call that out in the result.\n")
 		rules.WriteString("If your assigned task hits an environment or runtime blocker that an ADJACENT task in the approved plan would solve (e.g. another task installs Docker, sets up Node, configures a runtime), pull that step forward and complete it inline rather than abandoning with task_too_large. Use the 'Approved plan' digest in your context to spot these adjacencies.\n")
 		rules.WriteString("Stop once the single task is completed or clearly blocked.\n")
+	} else if worker.Name == "debug" {
+		// Debug subagent runs hypothesis-test cycles. The structure here
+		// is deliberate: without a protocol, the model defaults to
+		// "read 5 files and predict the bug", which is exactly the
+		// failure mode we're fixing. By forcing the model to state a
+		// hypothesis BEFORE gathering, then conclude/refine, we break
+		// the predict-without-evidence anti-pattern that blocked the
+		// 3-hour Snake game session.
+		rules.WriteString("You find ROOT CAUSES through the hypothesis-test loop. You do NOT predict from reading alone, you do NOT write fixes — you report findings so the user (or build mode) can apply them.\n\n")
+		rules.WriteString("WORKFLOW (cycle until convergence or step budget exhausted):\n")
+		rules.WriteString("1. HYPOTHESIS. State one falsifiable theory. Format: 'Hypothesis #N: <statement>'. Be specific — 'the snake's position updates but the renderer reads stale state' beats 'movement is broken'.\n")
+		rules.WriteString("2. EVIDENCE PLAN. State what observation would confirm or reject. 'I would confirm by checking <file:line> for <pattern>' or 'by running <command> and looking for <output>'.\n")
+		rules.WriteString("3. GATHER. Use read_file / search_text / run_command to gather the evidence. Cap each gather at 1-2 tool calls — if a single check doesn't decide it, the hypothesis is too broad; refine it.\n")
+		rules.WriteString("4. CONCLUDE. Either CONFIRMED (evidence supports it; propose fix in suggested_next_steps) or REJECTED (note why; return to step 1 with a refined hypothesis).\n\n")
+		rules.WriteString("ANTI-PATTERNS:\n")
+		rules.WriteString("- Reading 5+ files before stating any hypothesis (you're guessing).\n")
+		rules.WriteString("- Stating a fix before gathering evidence (you're predicting, not debugging).\n")
+		rules.WriteString("- Repeating the same hypothesis with different words (no progress).\n\n")
+		rules.WriteString("Output: JSON with status, summary, root_cause (or 'unknown — out of budget'), evidence: [{hypothesis, status, observation}], suggested_fix (only if a hypothesis was CONFIRMED). Do NOT edit files; recommend the fix verbatim and let build mode apply it.\n")
 	} else if hasMutatingTools(worker.AllowedTools) {
 		rules.WriteString("You may edit files only when the assigned task requires it.\n")
 		rules.WriteString("Keep edits scoped and reversible.\n")
@@ -880,6 +973,13 @@ Main context engine: ` + snapshot.ContextEngine)
 }
 
 func subagentStepLimit(worker Subagent) int {
+	// Per-subagent override wins. Set explicitly on workers whose
+	// natural rhythm differs from the class default — debug needs ~30
+	// for hypothesis-test cycles, while explorer is fine with the
+	// read-only default.
+	if worker.StepLimit > 0 {
+		return worker.StepLimit
+	}
 	if worker.Name == "builder" {
 		// 12 steps gives the builder room for 2-3 reads, a multi-step edit
 		// sequence, a verification command, task_update, and one fallback
@@ -893,7 +993,11 @@ func subagentStepLimit(worker Subagent) int {
 	if hasMutatingTools(worker.AllowedTools) {
 		return 8
 	}
-	return 4
+	// Read-only subagents get a generous default — they can't damage
+	// anything with more steps, and 4 was so tight that even simple
+	// investigations tripped the no_progress guard before completing
+	// any meaningful work. 20 covers an explore + 2-3 follow-up cycles.
+	return 20
 }
 
 func contains(items []string, value string) bool {

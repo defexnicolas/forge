@@ -73,12 +73,19 @@ func TestExplorerHandoffConfirmationStartsPlanMode(t *testing.T) {
 	}}
 	m := newExplorerHandoffTestModel(t, provider)
 
-	output := m.runSubagentCommand("explorer", "inspect game portal")
-	if !strings.Contains(output, "found portal structure") {
-		t.Fatalf("expected explorer output, got:\n%s", output)
+	immediate := m.runSubagentCommand("explorer", "inspect game portal")
+	if !strings.Contains(immediate, "Running") {
+		t.Fatalf("immediate /agent return should be a 'Running...' header in async mode, got:\n%s", immediate)
 	}
+	// Drain the streaming subagent events: result text arrives via the
+	// agent events channel, EventDone triggers the explorer handoff
+	// form. This mirrors what the bubbletea event loop does at runtime.
+	m = drainAgentEvents(t, m, m.pendingCommand)
 	if m.activeForm != formConfirmExplorerPlan {
 		t.Fatalf("activeForm = %v, want formConfirmExplorerPlan", m.activeForm)
+	}
+	if !strings.Contains(m.pendingExplorerHandoff, "found portal structure") {
+		t.Fatalf("pending handoff missing summary: %q", m.pendingExplorerHandoff)
 	}
 	if !strings.Contains(m.pendingExplorerHandoff, "Snake.js is missing") {
 		t.Fatalf("pending handoff missing finding: %q", m.pendingExplorerHandoff)
@@ -117,6 +124,8 @@ func TestExplorerHandoffCanBeCanceled(t *testing.T) {
 	}}
 	m := newExplorerHandoffTestModel(t, provider)
 	_ = m.runSubagentCommand("explorer", "inspect")
+	// Drain the streaming subagent events so the handoff form opens.
+	m = drainAgentEvents(t, m, m.pendingCommand)
 	m.confirmExplorerPlan.selected = 1
 
 	result, cmd, handled := m.handleFormUpdate(tea.KeyMsg{Type: tea.KeyEnter})

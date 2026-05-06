@@ -305,6 +305,10 @@ type Runtime struct {
 	// threshold has been crossed. The TUI wires this to *session.Store.
 	// nil disables auto-compact entirely.
 	AutoCompactor AutoCompactor
+	// intentCache memoizes the intent classifier output by sha256 of
+	// the user message. Lives for the session — a re-fired turn (parse
+	// retry, etc.) doesn't pay the classifier round-trip twice.
+	intentCache map[string]string
 	// activeBuilderTask carries the currently executing builder task metadata
 	// so mutation approval can enforce per-task file strategies.
 	activeBuilderTask *builderTaskGuard
@@ -593,7 +597,7 @@ func (r *Runtime) PreviewPrompt(userMessage string) (PromptPreview, error) {
 	snapshot := r.buildSnapshot(userMessage, roleConfig)
 	return PromptPreview{
 		System:           r.cachedSystemPrompt(supportsTools),
-		User:             userPrompt(snapshot, userMessage, r.planContextBlock(userMessage, ""), r.Mode, "", "", "", ""),
+		User:             userPrompt(snapshot, userMessage, r.planContextBlock(userMessage, ""), r.Mode, "", "", "", "", ""),
 		SupportsTools:    supportsTools,
 		ArtifactStrategy: inferDefaultFileStrategy(userMessage, ""),
 		Snapshot:         snapshot,
@@ -1330,6 +1334,42 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 		preview = preview[:200] + "..."
 	}
 	events <- Event{Type: EventTurnStart, TurnID: turnID, Text: preview}
+	// Intent classifier: fire async at the top of the turn for modes
+	// that benefit from routing hints (explore/plan/build). Skip for
+	// modes where the routing decision is already made (debug/chat) or
+	// when the user is already in a productive flow that wouldn't
+	// benefit from a "switch to /mode debug" suggestion:
+	//   - plan with active plan/tasks (refine variant) — already
+	//     designing on top of prior decisions
+	//   - plan after explore→plan handoff (from_explore variant) —
+	//     fresh findings just landed, the user intent is to design from
+	//     them, not to debug
+	// The result is joined with a short deadline before building the
+	// prompt — if the classifier hasn't returned by then we proceed
+	// without the hint (best-effort, never blocks the turn).
+	// Intent classifier (config-gated, off by default). Fires only for
+	// modes where a "switch to /mode debug" routing hint would be
+	// useful and the user is in a fresh-request state:
+	//   - explore: any turn (the entry mode for many bug hunts)
+	//   - plan/cold: no active plan or tasks, no explorer findings
+	// Skipped for build (executor — checklist already committed),
+	// debug/chat (target mode is the right one), and non-cold plan
+	// variants (refine/from_explore are productive flows). Skipped
+	// always when the config flag is false to avoid burning provider
+	// requests in tests and minimal setups.
+	var intentChan <-chan string
+	if r.Config.Runtime.IntentClassifierEnabled {
+		fire := false
+		switch r.Mode {
+		case "explore":
+			fire = true
+		case "plan":
+			fire = r.detectPlanVariant() == PlanVariantCold
+		}
+		if fire {
+			intentChan = r.classifyUserIntentAsync(ctx, userMessage)
+		}
+	}
 	// Auto-compact: if the session history is approaching the budget,
 	// dispatch the summarizer subagent to replace older events with a
 	// single bullet-list summary BEFORE we build the next prompt. Runs
@@ -1487,9 +1527,18 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 			basePlan = renderPlanForHandoff(doc)
 		}
 	}
+	// Join the intent classifier result with a short deadline. The
+	// suggestion is purely a hint — if it isn't ready in 2 seconds, the
+	// turn proceeds without it. Cached results return effectively-instant
+	// on retries.
+	routingHint := ""
+	if intentChan != nil {
+		intent := classifyUserIntentJoinDeadline(intentChan, 2*time.Second)
+		routingHint = suggestModeForIntent(r.Mode, intent)
+	}
 	messages := []llm.Message{
 		{Role: "system", Content: r.cachedSystemPrompt(supportsTools)},
-		{Role: "user", Content: userPrompt(snapshot, userMessage, planBlock, r.Mode, handoff, explorerHandoff, buildPreflight, basePlan)},
+		{Role: "user", Content: userPrompt(snapshot, userMessage, planBlock, r.Mode, handoff, explorerHandoff, buildPreflight, basePlan, routingHint)},
 	}
 
 	// Track real token usage from actual messages.
@@ -1509,7 +1558,11 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 	// task runs read → analyze → edit → verify, and a feature with N
 	// tasks easily multiplies that. MaxStepsBuild lets the user lift
 	// the cap just for build without making plan-mode interviews wander.
-	if r.Mode == "build" && r.Config.Runtime.MaxStepsBuild > maxSteps {
+	// Debug mode shares the same elevated cap — hypothesis-test cycles
+	// (reproduce → instrument → run → observe → narrow) are even more
+	// step-hungry than build, and the read budget is intentionally
+	// loose because reading IS the investigation.
+	if (r.Mode == "build" || r.Mode == "debug") && r.Config.Runtime.MaxStepsBuild > maxSteps {
 		maxSteps = r.Config.Runtime.MaxStepsBuild
 	}
 	r.LastModelUsed = model
