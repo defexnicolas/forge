@@ -12,6 +12,7 @@ import (
 	"forge/internal/agent"
 	"forge/internal/config"
 	"forge/internal/globalconfig"
+	"forge/internal/llm"
 	"forge/internal/permissions"
 	"forge/internal/plans"
 	"forge/internal/session"
@@ -112,6 +113,54 @@ func (m model) listModels() string {
 
 func (m model) describeModels() string {
 	return m.handleModelCommand([]string{"/model"})
+}
+
+// handleRefreshConfigCommand re-reads the workspace + global config from
+// disk and rebuilds the provider registry with fresh OpenAICompatible
+// instances. Recovers from the "I edited global.toml externally and the
+// in-memory state is stale" case without needing a Forge restart. Mirrors
+// what app.NewWorkspace does at startup, just for the config + providers
+// (tools, MCPs, claw, git state are left alone — they don't depend on
+// provider URLs and rebuilding them mid-session would be disruptive).
+func (m *model) handleRefreshConfigCommand() string {
+	t := m.theme
+	cfg, err := config.LoadWithGlobal(m.options.CWD)
+	if err != nil {
+		// LoadWithGlobal still hands back the workspace-only config when the
+		// global file is malformed; surface the error but apply what we got
+		// so the user isn't locked out by a typo.
+		m.history = append(m.history, t.Warning.Render("global config: "+err.Error()))
+	}
+	config.InheritChatModelDefaults(&cfg)
+	providers := llm.NewRegistry()
+	providers.Register(llm.NewOpenAICompatible("openai_compatible", cfg.Providers.OpenAICompatible))
+	providers.Register(llm.NewOpenAICompatible("lmstudio", cfg.Providers.LMStudio))
+	m.options.Config = cfg
+	m.options.Providers = providers
+	m.syncRuntimeConfig()
+	m.agentRuntime.Providers = providers
+	// Push fresh role models into the runtime so SetRoleModel state matches
+	// the reloaded config — without this, ResolveProvider sees the new URL
+	// but Models[role] could still hold stale values from the prior session.
+	for role, modelID := range cfg.Models {
+		modelID = strings.TrimSpace(modelID)
+		if modelID == "" {
+			continue
+		}
+		m.agentRuntime.SetRoleModel(role, modelID)
+	}
+	m.refreshProviderState()
+	providerName := strings.TrimSpace(cfg.Providers.Default.Name)
+	if providerName == "" {
+		providerName = "(none)"
+	}
+	url := strings.TrimSpace(cfg.Providers.LMStudio.BaseURL)
+	if cfg.Providers.Default.Name == "openai_compatible" {
+		url = strings.TrimSpace(cfg.Providers.OpenAICompatible.BaseURL)
+	}
+	return t.Success.Render("Config reloaded.") +
+		"\n" + t.Muted.Render(fmt.Sprintf("provider=%s url=%s", providerName, url)) +
+		"\n" + t.Muted.Render("Backend will re-classify on the next probe (~5s).")
 }
 
 func currentModelName(m model) string {

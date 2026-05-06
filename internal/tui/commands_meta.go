@@ -64,6 +64,7 @@ var tuiCommands = []commandDescriptor{
 	{Name: "/remote-control", Usage: "/remote-control [start|stop|status] [port]", Description: "serve session over LAN for web/device access", Subcommands: []string{"start", "stop", "status"}},
 	{Name: "/code", Usage: "/code", Description: "open the workspace in VS Code"},
 	{Name: "/update", Usage: "/update", Description: "git pull + rebuild the running forge binary"},
+	{Name: "/refresh-config", Usage: "/refresh-config", Description: "re-read global+workspace config and rebuild provider registry"},
 	{Name: "/quit", Usage: "/quit", Description: "exit forge and save history"},
 }
 

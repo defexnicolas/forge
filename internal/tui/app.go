@@ -1148,6 +1148,8 @@ func (m *model) handleCommand(line string) string {
 		return m.theme.Muted.Render("Goodbye.")
 	case "/update":
 		return m.handleUpdateCommand()
+	case "/refresh-config":
+		return m.handleRefreshConfigCommand()
 	case "/dir":
 		return m.theme.Accent.Render("  CWD: ") + m.options.CWD
 	case "/theme":
