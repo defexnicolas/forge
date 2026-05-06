@@ -71,11 +71,51 @@ type executeTaskFailureMeta struct {
 }
 
 func (r *Runtime) requestTimeout() time.Duration {
+	// Local backends (LM Studio, llama-server) routinely take 60+ seconds
+	// just to PROCESS a long prompt before emitting the first token —
+	// 96k tokens of context on a 35B model on commodity hardware is
+	// minutes of pre-fill, not seconds. The default 45s wall-clock
+	// timeout was tuned for cloud APIs and turns long-context local
+	// turns into "context deadline exceeded" failures. Disable the
+	// wall-clock for local backends and rely on the idle-timeout
+	// watchdog (which only arms after the first SSE chunk) to catch
+	// genuinely-hung requests.
+	if r.isLocalBackend() {
+		return 0
+	}
 	secs := r.Config.Runtime.RequestTimeoutSeconds
 	if secs <= 0 {
 		return 0
 	}
 	return time.Duration(secs) * time.Second
+}
+
+// isLocalBackend reports whether the active provider talks to a local model
+// server (LM Studio or llama-server). The check uses BackendNamer so it
+// stays accurate even when the registry slot is named "lmstudio" but the
+// resolved backend is actually llama-server, or vice versa.
+func (r *Runtime) isLocalBackend() bool {
+	if r == nil || r.Providers == nil {
+		return false
+	}
+	name := strings.TrimSpace(r.Config.Providers.Default.Name)
+	if name == "" {
+		return false
+	}
+	provider, ok := r.Providers.Get(name)
+	if !ok {
+		return false
+	}
+	bn, ok := provider.(llm.BackendNamer)
+	if !ok {
+		return false
+	}
+	switch bn.BackendName() {
+	case "lmstudio", "llama-server":
+		return true
+	default:
+		return false
+	}
 }
 
 func (r *Runtime) requestIdleTimeout() time.Duration {
