@@ -98,6 +98,18 @@ func (p *OpenAICompatible) resolveBackend(ctx context.Context) Backend {
 	if err != nil || len(models) == 0 {
 		return BackendUnknown
 	}
+	return p.classifyAndCache(models)
+}
+
+// classifyAndCache classifies the backend from an already-fetched models slice
+// and stores the result. Lets ProbeModel reuse the rows it just retrieved
+// instead of forcing a second /v1/models roundtrip via resolveBackend, and
+// lets it skip the LMStudio-only /api/v0/models 404 when the rows already
+// reveal the backend is something else.
+func (p *OpenAICompatible) classifyAndCache(models []ModelInfo) Backend {
+	if len(models) == 0 {
+		return BackendUnknown
+	}
 	kind := BackendLlamaServer
 	for _, m := range models {
 		if strings.TrimSpace(m.State) != "" || m.LoadedContextLength > 0 || m.MaxContextLength > 0 {
@@ -523,15 +535,20 @@ func (p *OpenAICompatible) ProbeModel(ctx context.Context, modelID string) (*Mod
 	if err != nil {
 		return nil, err
 	}
-	if !modelsHaveContextMetadata(models) {
+	// Classify the backend from the rows we already fetched so the next
+	// step can skip the LMStudio-only /api/v0/models call when it's
+	// guaranteed to 404 (llama-server, generic OpenAI). The first probe
+	// previously left the cache Unknown until probeLlamaServerCtx ran,
+	// which meant every fresh process logged a one-time 404 in the
+	// llama-server console.
+	if p.BackendKind() == BackendUnknown {
+		p.classifyAndCache(models)
+	}
+	if !modelsHaveContextMetadata(models) && p.BackendKind() == BackendLMStudio {
 		// Older LM Studio builds only expose the enhanced fields on the
-		// native /api/v0/models endpoint. Skip the call when the backend is
-		// known to be llama-server / generic OpenAI — the request is a
-		// guaranteed 404 and the cached backend already classified it.
-		if kind := p.BackendKind(); kind == BackendUnknown || kind == BackendLMStudio {
-			if enhanced, eerr := p.listModelsEnhanced(ctx); eerr == nil && len(enhanced) > 0 {
-				models = enhanced
-			}
+		// native /api/v0/models endpoint.
+		if enhanced, eerr := p.listModelsEnhanced(ctx); eerr == nil && len(enhanced) > 0 {
+			models = enhanced
 		}
 	}
 	if len(models) == 0 {
