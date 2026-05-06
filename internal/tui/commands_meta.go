@@ -65,6 +65,7 @@ var tuiCommands = []commandDescriptor{
 	{Name: "/code", Usage: "/code", Description: "open the workspace in VS Code"},
 	{Name: "/update", Usage: "/update", Description: "git pull + rebuild the running forge binary"},
 	{Name: "/refresh-config", Usage: "/refresh-config", Description: "re-read global+workspace config and rebuild provider registry"},
+	{Name: "/reads", Usage: "/reads [extend [N]|reset|off]", Description: "manage the read-only budget for this session", Subcommands: []string{"extend", "reset", "off"}},
 	{Name: "/quit", Usage: "/quit", Description: "exit forge and save history"},
 }
 

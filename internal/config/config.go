@@ -178,8 +178,17 @@ type RuntimeConfig struct {
 	MaxConsecutiveReadOnly int  `toml:"max_consecutive_read_only"`
 	MaxPlannerSummarySteps int  `toml:"max_planner_summary_steps"`
 	MaxBuilderReadLoops    int  `toml:"max_builder_read_loops"`
-	RetryOnProviderTimeout bool `toml:"retry_on_provider_timeout"`
-	InlineBuilder          bool `toml:"inline_builder"`
+	// ReadBudgetGracePastNudge is the number of additional read-only steps
+	// the model gets after the soft nudge fires before the hard stop kicks
+	// in. The first cross of MaxBuilderReadLoops / MaxConsecutiveReadOnly
+	// no longer terminates the turn outright — instead the runtime injects a
+	// mode-specific nudge into the next observation. Only after the model
+	// makes this many MORE consecutive read-only calls does the turn end.
+	// 0 = use the built-in default (3). Negative = disable the grace and
+	// hard-stop on the first cross (legacy behavior).
+	ReadBudgetGracePastNudge int  `toml:"read_budget_grace_past_nudge"`
+	RetryOnProviderTimeout   bool `toml:"retry_on_provider_timeout"`
+	InlineBuilder            bool `toml:"inline_builder"`
 }
 
 type ClawConfig struct {

@@ -122,6 +122,7 @@ type model struct {
 	profileForm            profileForm
 	currentAssistant       *strings.Builder
 	modelProgress          *agent.ModelProgress
+	readBudgetState        *agent.ReadBudgetState
 	pendingExecuteLine     string
 	pendingExplorerHandoff string
 	lastBuildPreflight     string
@@ -846,9 +847,46 @@ func (m model) statusLineView() string {
 		profileLabel + sep +
 		gitInfo + sep +
 		status + sep +
-		contextInfo + sep +
-		t.Muted.Render(cwd)
+		contextInfo
+	if rb := m.renderReadBudgetIndicator(); rb != "" {
+		bar += sep + rb
+	}
+	bar += sep + t.Muted.Render(cwd)
 	return t.StatusBar.Render(bar)
+}
+
+// renderReadBudgetIndicator returns the "reads: N/M" status-bar chip when the
+// guard is active and the model has burned at least half of the budget for
+// the current turn. Returns "" so the chip is hidden when there's nothing
+// useful to show — under 50% just adds noise. In explore mode (Threshold=0)
+// we render a plain "reads: N" so the user sees the investigation depth
+// without an enforced cap.
+func (m model) renderReadBudgetIndicator() string {
+	t := m.theme
+	rb := m.readBudgetState
+	if rb == nil || rb.Consumed <= 0 {
+		return ""
+	}
+	if rb.Threshold <= 0 {
+		// Explore / disabled — show count only, in muted styling.
+		return t.Muted.Render(fmt.Sprintf("reads:%d", rb.Consumed))
+	}
+	label := fmt.Sprintf("reads:%d/%d", rb.Consumed, rb.Threshold)
+	switch {
+	case rb.Consumed >= rb.Threshold:
+		// At or past the threshold — soft nudge fired (or about to). Use
+		// the warning style; ErrorStyle would be too alarming since the
+		// turn is still alive.
+		return t.Warning.Render(label)
+	case rb.Consumed*5 >= rb.Threshold*4:
+		// >= 80% — caution.
+		return t.Warning.Render(label)
+	case rb.Consumed*2 >= rb.Threshold:
+		// >= 50% — show but muted.
+		return t.Muted.Render(label)
+	default:
+		return ""
+	}
 }
 
 func (m model) activeModelRole() string {
@@ -1082,6 +1120,7 @@ func (m *model) handleLine(line string) tea.Cmd {
 	m.history = append(m.history, t.IndicatorAgent.Render("* ")+t.AgentPrefix.Render("forge"))
 	m.history = append(m.history, "")
 	m.modelProgress = nil
+	m.readBudgetState = nil
 	// Reset per-turn capture buffers so the explore→plan handoff reflects
 	// this turn's activity only.
 	m.turnToolActivity = nil
@@ -1150,6 +1189,8 @@ func (m *model) handleCommand(line string) string {
 		return m.handleUpdateCommand()
 	case "/refresh-config":
 		return m.handleRefreshConfigCommand()
+	case "/reads":
+		return m.handleReadsCommand(fields)
 	case "/dir":
 		return m.theme.Accent.Render("  CWD: ") + m.options.CWD
 	case "/theme":

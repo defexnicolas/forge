@@ -135,6 +135,14 @@ func (m *model) appendAgentEvent(event agent.Event) {
 		m.prefixDirty = true
 	case agent.EventSubagentProgress:
 		m.handleSubagentProgress(event.SubagentProgress)
+	case agent.EventReadBudget:
+		// Snapshot for the status-bar indicator. The runtime emits this on
+		// every read-only call (with a Threshold of 0 in explore mode). We
+		// just cache the latest — the renderer decides whether to draw.
+		if event.ReadBudget != nil {
+			snap := *event.ReadBudget
+			m.readBudgetState = &snap
+		}
 	case agent.EventToolCall:
 		m.streaming = false
 		m.streamingStartIdx = -1

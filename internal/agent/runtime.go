@@ -32,9 +32,21 @@ const (
 	EventApproval         = "approval_required"
 	EventAskUser          = "ask_user"
 	EventSubagentProgress = "subagent_progress"
+	EventReadBudget       = "read_budget"
 	EventError            = "error"
 	EventDone             = "done"
 )
+
+// ReadBudgetState reports the running count of consecutive read-only tool
+// calls vs. the active threshold. Emitted on every read-only call so the TUI
+// can render a live "reads: N/M" indicator. Threshold is 0 when the guard is
+// disabled (e.g. explore mode) — TUI hides the indicator in that case.
+type ReadBudgetState struct {
+	Consumed  int
+	Threshold int
+	Mode      string
+	Nudged    bool
+}
 
 // SubagentProgress reports the lifecycle of one task within a spawn_subagents
 // batch. The TUI keys on (BatchID, Index) to update the corresponding lane
@@ -63,6 +75,7 @@ type Event struct {
 	AskUser          *AskUserRequest
 	Progress         *ModelProgress
 	SubagentProgress *SubagentProgress
+	ReadBudget       *ReadBudgetState
 	Error            error
 	// Side marks events emitted by a parallel `/btw` call. TUI renders these
 	// muted with a [btw] prefix and they do not participate in the tool loop.
@@ -229,6 +242,17 @@ type Runtime struct {
 	// so mutation approval can enforce per-task file strategies.
 	activeBuilderTask *builderTaskGuard
 	gitState          gitops.SessionState
+	// readBudgetOverride, when set, replaces the threshold returned by
+	// activeReadBudget() for the current session. Set by the /reads extend
+	// slash command so the user can keep working past the configured limit
+	// without editing .forge/config.toml and reloading. Zero = no override.
+	// Negative = explicit opt-out (treated as no guard, like the config flag).
+	readBudgetOverride int
+	// lastReadBudget* are the most recent values emitted via EventReadBudget.
+	// Read by /reads (with no args) so the user can see the current state of
+	// the guard between turns. Updated under r.mu.
+	lastReadBudgetConsumed  int
+	lastReadBudgetThreshold int
 }
 
 type preflightCacheEntry struct {
@@ -1345,6 +1369,7 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 	lastFailedTool := ""
 	consecutiveToolFailures := 0
 	consecutiveReadOnly := 0
+	readBudgetNudged := false
 	lastBuildReadKey := ""
 	sameBuildReadCount := 0
 	planModeReprompts := 0
@@ -1714,18 +1739,50 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 		// doesn't help latency at the cost of burning the read budget.
 		if isMutatingToolCall(parsed.Call.Name) || parsed.Call.Name == "execute_task" {
 			consecutiveReadOnly = 0
+			readBudgetNudged = false
 			noProgressSteps = 0
 		} else if isReadOnlyExploration(parsed.Call.Name) && !cacheHit {
 			consecutiveReadOnly++
-			if r.Mode == "build" && consecutiveReadOnly >= r.maxBuilderReadLoops() {
-				events <- Event{Type: EventError, Error: fmt.Errorf("stopped: %d consecutive read-only tool calls in build mode with no edits yet — choose the next task action or ask for refinement instead of continuing to read", consecutiveReadOnly)}
-				events <- Event{Type: EventDone}
-				return
-			}
-			if consecutiveReadOnly >= r.maxConsecutiveReadOnly() {
-				events <- Event{Type: EventError, Error: fmt.Errorf("stopped: %d consecutive read-only tool calls with no edits — dispatch execute_task, call plan_write / todo_write, or answer the user directly", consecutiveReadOnly)}
-				events <- Event{Type: EventDone}
-				return
+			// Explore mode is read-only by design — there is no edit tool the
+			// model could call to "make progress". The repeated-same-file
+			// guard (above) and max_steps still cap genuine loops; this
+			// budget would only fire spuriously mid-investigation.
+			if r.Mode != "explore" {
+				threshold := r.activeReadBudget()
+				r.recordReadBudgetSnapshot(consecutiveReadOnly, threshold)
+				events <- Event{Type: EventReadBudget, ReadBudget: &ReadBudgetState{
+					Consumed:  consecutiveReadOnly,
+					Threshold: threshold,
+					Mode:      r.Mode,
+					Nudged:    readBudgetNudged,
+				}}
+				if threshold > 0 && consecutiveReadOnly >= threshold {
+					if !readBudgetNudged {
+						// Soft nudge: tell the model it's burning the read
+						// budget. The nudge is appended to the next user
+						// observation below (after the standard messages
+						// append) so the model sees it before choosing the
+						// next tool call. Don't hard-stop yet — give it a
+						// few steps to self-correct.
+						readBudgetNudged = true
+						observation = observation + "\n\n[system] " + readBudgetNudgeForMode(r.Mode, consecutiveReadOnly, threshold)
+					} else if consecutiveReadOnly >= threshold+r.readBudgetGracePastNudge() {
+						events <- Event{Type: EventError, Error: fmt.Errorf("stopped: %d consecutive read-only tool calls — %s", consecutiveReadOnly, readBudgetHardStopForMode(r.Mode))}
+						events <- Event{Type: EventDone}
+						return
+					}
+				}
+			} else {
+				// Still emit a budget event for the TUI so it can render the
+				// "exploration in progress" indicator, even though there is
+				// no enforced threshold in explore mode.
+				r.recordReadBudgetSnapshot(consecutiveReadOnly, 0)
+				events <- Event{Type: EventReadBudget, ReadBudget: &ReadBudgetState{
+					Consumed:  consecutiveReadOnly,
+					Threshold: 0,
+					Mode:      r.Mode,
+					Nudged:    false,
+				}}
 			}
 		}
 

@@ -250,6 +250,135 @@ func (r *Runtime) maxBuilderReadLoops() int {
 	return 12
 }
 
+// activeReadBudget returns the threshold of consecutive read-only tool calls
+// that fires the soft-nudge / hard-stop guard for the CURRENT mode. Build
+// mode uses maxBuilderReadLoops (default 12); plan / chat / others use
+// maxConsecutiveReadOnly (default 6, config 10). Explore mode is exempt and
+// the caller short-circuits before reaching here. Returns 0 to mean "guard
+// disabled" — used when the per-session override is negative.
+func (r *Runtime) activeReadBudget() int {
+	if r == nil {
+		return 0
+	}
+	if r.readBudgetOverride < 0 {
+		return 0
+	}
+	if r.readBudgetOverride > 0 {
+		return r.readBudgetOverride
+	}
+	if r.Mode == "build" {
+		return r.maxBuilderReadLoops()
+	}
+	return r.maxConsecutiveReadOnly()
+}
+
+// SetReadBudgetOverride installs a per-session override for the read-only
+// budget guard. Used by the /reads slash command so the user can extend the
+// budget without editing .forge/config.toml. Pass 0 to clear (fall back to
+// config), a positive value to set the threshold, or a negative value to
+// disable the guard for the session.
+func (r *Runtime) SetReadBudgetOverride(v int) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.readBudgetOverride = v
+}
+
+// ExtendReadBudget bumps the read-only budget by delta for this session and
+// returns the new effective threshold. If there's no override yet, it starts
+// from the current configured value for the active mode (build vs other).
+func (r *Runtime) ExtendReadBudget(delta int) int {
+	if r == nil {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	base := r.readBudgetOverride
+	if base <= 0 {
+		// No override yet — start from the active config value so the bump
+		// is relative to what the user is actually living with.
+		if r.Mode == "build" {
+			base = r.maxBuilderReadLoops()
+		} else {
+			base = r.maxConsecutiveReadOnly()
+		}
+	}
+	r.readBudgetOverride = base + delta
+	return r.readBudgetOverride
+}
+
+// recordReadBudgetSnapshot caches the most recent (consumed, threshold) pair
+// so the /reads slash command can display it between turns. Called from the
+// main turn loop right before each EventReadBudget emission.
+func (r *Runtime) recordReadBudgetSnapshot(consumed, threshold int) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.lastReadBudgetConsumed = consumed
+	r.lastReadBudgetThreshold = threshold
+	r.mu.Unlock()
+}
+
+// LastReadBudgetSnapshot returns the most recent (consumed, threshold) pair
+// observed by the runtime. Used by the /reads status command to show the
+// current state without having to peek at the active turn.
+func (r *Runtime) LastReadBudgetSnapshot() (int, int) {
+	if r == nil {
+		return 0, 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.lastReadBudgetConsumed, r.lastReadBudgetThreshold
+}
+
+// readBudgetGracePastNudge is the number of additional read-only steps the
+// model is allowed AFTER the soft nudge before the hard stop fires. Gives
+// the model a fair window to self-correct (write the edit, dispatch
+// execute_task, answer in prose) without being killed mid-thought.
+func (r *Runtime) readBudgetGracePastNudge() int {
+	if v := r.Config.Runtime.ReadBudgetGracePastNudge; v > 0 {
+		return v
+	}
+	return 3
+}
+
+// readBudgetNudgeForMode returns the per-mode soft-nudge text injected into
+// the next observation when the model crosses the read threshold for the
+// first time in a turn. The message is mode-specific so the model gets a
+// concrete next action — telling a chat-mode response to "dispatch
+// execute_task" only confuses it.
+func readBudgetNudgeForMode(mode string, consumed, threshold int) string {
+	switch mode {
+	case "build":
+		return fmt.Sprintf("You have made %d consecutive read-only tool calls (budget=%d) without editing. Decide now: dispatch execute_task on the next checklist task, or call edit_file / write_file / apply_patch with the change you already have in mind. If you genuinely need more reading, the next tool call must be a CONCRETE read with a clear hypothesis (not an open-ended scan) — otherwise the next read will hard-stop the turn.", consumed, threshold)
+	case "plan":
+		return fmt.Sprintf("You have made %d consecutive read-only tool calls (budget=%d). It is time to commit the design — call plan_write to save the plan, then todo_write to write the executable checklist. If you need more information from the user, call ask_user. Do not read another file unless it is the single specific file the plan requires.", consumed, threshold)
+	case "chat":
+		return fmt.Sprintf("You have made %d consecutive read-only tool calls (budget=%d) without making progress. Answer the user directly with what you have now. If you cannot answer, say so explicitly — do not keep reading.", consumed, threshold)
+	default:
+		return fmt.Sprintf("You have made %d consecutive read-only tool calls (budget=%d) without making progress. Stop reading and produce a final answer or a concrete mutating action.", consumed, threshold)
+	}
+}
+
+// readBudgetHardStopForMode returns the trailing text appended to the final
+// EventError message when the model exhausts the post-nudge grace window.
+// Mirrors readBudgetNudgeForMode but in past-tense "you ignored the nudge".
+func readBudgetHardStopForMode(mode string) string {
+	switch mode {
+	case "build":
+		return "you ignored the soft nudge and kept reading. End the turn and choose the next task action (execute_task / edit_file / write_file) before continuing."
+	case "plan":
+		return "you ignored the soft nudge and kept reading. End the turn by calling plan_write + todo_write or by asking the user a focused question with ask_user."
+	case "chat":
+		return "you ignored the soft nudge and kept reading. Answer the user directly with what you have now."
+	default:
+		return "you ignored the soft nudge and kept reading. Stop and produce a final answer."
+	}
+}
+
 func (r *Runtime) retryOnProviderTimeout() bool {
 	return r.Config.Runtime.RetryOnProviderTimeout
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -161,6 +162,63 @@ func (m *model) handleRefreshConfigCommand() string {
 	return t.Success.Render("Config reloaded.") +
 		"\n" + t.Muted.Render(fmt.Sprintf("provider=%s url=%s", providerName, url)) +
 		"\n" + t.Muted.Render("Backend will re-classify on the next probe (~5s).")
+}
+
+// handleReadsCommand exposes the read-only budget guard to the user so they
+// can inspect the current state and bump the threshold for this session
+// without having to edit .forge/config.toml + /refresh-config. The override
+// lives on the Runtime instance and is reset when the user runs /reads
+// reset (or restarts Forge).
+//
+// Subcommands:
+//   /reads             — show consumed/threshold for the current mode
+//   /reads extend [N]  — bump threshold by +N (default +10) for this session
+//   /reads reset       — clear the session override, fall back to config
+//   /reads off         — disable the guard entirely for this session
+func (m *model) handleReadsCommand(fields []string) string {
+	t := m.theme
+	if m.agentRuntime == nil {
+		return t.ErrorStyle.Render("Runtime not initialized.")
+	}
+	mode := m.agentRuntime.Mode
+	if len(fields) >= 2 {
+		switch fields[1] {
+		case "extend":
+			delta := 10
+			if len(fields) >= 3 {
+				if n, err := strconv.Atoi(fields[2]); err == nil && n > 0 {
+					delta = n
+				} else {
+					return t.ErrorStyle.Render("Usage: /reads extend [N>0]")
+				}
+			}
+			newBudget := m.agentRuntime.ExtendReadBudget(delta)
+			return t.Success.Render(fmt.Sprintf("Read budget extended → %d (mode=%s).", newBudget, mode)) +
+				"\n" + t.Muted.Render("This session only; restart or /reads reset to revert.")
+		case "reset":
+			m.agentRuntime.SetReadBudgetOverride(0)
+			return t.Success.Render("Read budget override cleared.") +
+				"\n" + t.Muted.Render(fmt.Sprintf("Falls back to config: max_consecutive_read_only=%d, max_builder_read_loops=%d.", m.options.Config.Runtime.MaxConsecutiveReadOnly, m.options.Config.Runtime.MaxBuilderReadLoops))
+		case "off":
+			m.agentRuntime.SetReadBudgetOverride(-1)
+			return t.Warning.Render("Read budget guard DISABLED for this session.") +
+				"\n" + t.Muted.Render("max_steps still applies. Use /reads reset to restore the guard.")
+		default:
+			return t.ErrorStyle.Render("Usage: /reads [extend [N]|reset|off]")
+		}
+	}
+	consumed, threshold := m.agentRuntime.LastReadBudgetSnapshot()
+	body := fmt.Sprintf("Read budget — mode=%s consumed=%d", mode, consumed)
+	switch {
+	case mode == "explore":
+		body += " threshold=disabled (explore mode is read-only by design)"
+	case threshold == 0:
+		body += " threshold=disabled (override=off)"
+	default:
+		body += fmt.Sprintf(" threshold=%d", threshold)
+	}
+	return t.Success.Render(body) +
+		"\n" + t.Muted.Render("Subcommands: extend [N]  reset  off")
 }
 
 func currentModelName(m model) string {
@@ -487,9 +545,18 @@ func (m model) agentUsageHint() string {
 
 func (m *model) runSubagentCommand(agentName, prompt string) string {
 	t := m.theme
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	result, err := m.agentRuntime.RunSubagent(ctx, agent.SubagentRequest{
+	// Subagents on local backends (LM Studio, llama-server) routinely spend
+	// 60+ seconds in prompt-processing before the first SSE chunk arrives —
+	// a 12k-token context on a 35B model is minutes of pre-fill, not seconds.
+	// The runtime already governs subagent lifetime through:
+	//   - subagent_timeout_seconds (config; 0 = no wall-clock)
+	//   - request_timeout_seconds (auto-disabled for local backends; commit b682b2c)
+	//   - request_idle_timeout_seconds (180s watchdog after first chunk)
+	// Wrapping this call in a hardcoded 60s WithTimeout overrode all of that
+	// and made every /agent invocation fail with "context deadline exceeded
+	// after 2 step(s)" (1 read + the LLM call to choose step 2). Use
+	// Background and let the runtime's configured timeouts govern.
+	result, err := m.agentRuntime.RunSubagent(context.Background(), agent.SubagentRequest{
 		Agent:  agentName,
 		Prompt: prompt,
 	})
