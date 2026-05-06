@@ -1254,10 +1254,17 @@ func compactPromptText(text string, limit int) string {
 	return text[:head] + marker + text[len(text)-tail:]
 }
 
-func systemPrompt(nativeToolCalling bool, modeName string, policy SprintPolicy) string {
+func systemPrompt(nativeToolCalling bool, modeName, variant string, policy SprintPolicy) string {
 	modePrefix := ""
 	if mode, ok := GetMode(modeName); ok {
-		modePrefix = mode.Prompt + "\n\n"
+		// Plan mode is context-aware via variant. Other modes use the
+		// static Mode.Prompt; passing variant="" keeps PlanPromptForVariant
+		// out of the picture for them.
+		if modeName == "plan" {
+			modePrefix = PlanPromptForVariant(variant) + "\n\n"
+		} else {
+			modePrefix = mode.Prompt + "\n\n"
+		}
 	}
 	allowedTool := func(name string) bool {
 		ok, _ := policy.Allowed(name)
@@ -1370,7 +1377,7 @@ For visible plans, prefer task_create / task_list / task_update for incremental 
 // entire prefix and only re-prefills tier C plus the fresh user request.
 // Everything volatile (yarn-scored context, handoffs, the user message
 // itself) is pushed to the tail.
-func userPrompt(snapshot contextbuilder.Snapshot, userMessage, planBlock, mode, handoff, explorerHandoff, buildPreflight string) string {
+func userPrompt(snapshot contextbuilder.Snapshot, userMessage, planBlock, mode, handoff, explorerHandoff, buildPreflight, basePlan string) string {
 	var b strings.Builder
 
 	b.WriteString("=== STABLE CONTEXT ===\n")
@@ -1396,6 +1403,15 @@ func userPrompt(snapshot contextbuilder.Snapshot, userMessage, planBlock, mode, 
 	if strings.TrimSpace(handoff) != "" {
 		b.WriteString("\n")
 		b.WriteString(strings.TrimSpace(handoff))
+		b.WriteString("\n")
+	}
+	// BASE PLAN renders before EXPLORER FINDINGS because the plan
+	// represents committed decisions; new findings (if any) are
+	// secondary input the model integrates into the existing plan.
+	// Only populated when plan-mode variant=refine.
+	if strings.TrimSpace(basePlan) != "" {
+		b.WriteString("\nBASE PLAN (preserve when calling plan_write — only edit sections that genuinely changed):\n")
+		b.WriteString(strings.TrimSpace(basePlan))
 		b.WriteString("\n")
 	}
 	if strings.TrimSpace(explorerHandoff) != "" {

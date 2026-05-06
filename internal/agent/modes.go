@@ -92,6 +92,64 @@ func DefaultModes() map[string]Mode {
 	}
 }
 
+// Plan-mode prompt variants. Plan mode is context-aware: the system
+// prompt changes based on what just happened upstream so the model
+// doesn't waste a turn re-deriving information that explore already
+// gathered, or clobber a plan that build came back to refine.
+//
+// Variants:
+//   "from_explore" — explore mode just promoted findings via plan_write.
+//                    Skip the interview, use findings as base, design
+//                    approach + validation + checklist.
+//   "refine"       — an active plan already exists. Update, do not
+//                    rewrite. Preserve sections that still apply.
+//   "cold" / ""    — fresh plan from scratch. Interview + plan_write +
+//                    todo_write (current default behavior).
+const (
+	PlanVariantFromExplore = "from_explore"
+	PlanVariantRefine      = "refine"
+	PlanVariantCold        = "cold"
+)
+
+// PlanPromptForVariant returns the plan-mode system prompt prefix for the
+// given variant. Empty / unknown variants fall back to the cold prompt
+// stored on the Mode so callers don't have to special-case the default.
+func PlanPromptForVariant(variant string) string {
+	switch variant {
+	case PlanVariantFromExplore:
+		return planPromptFromExplore()
+	case PlanVariantRefine:
+		return planPromptRefine()
+	default:
+		// Cold = the original Mode.Prompt; pull it from DefaultModes()
+		// instead of duplicating to keep one source of truth.
+		if m, ok := DefaultModes()["plan"]; ok {
+			return m.Prompt
+		}
+		return ""
+	}
+}
+
+func planPromptFromExplore() string {
+	return "You are in PLAN mode and an EXPLORE turn just produced FINDINGS for you (see EXPLORER FINDINGS in the user prompt). Your job is DESIGN, not investigation — explore already did the reading. The session-wide read cache will serve any file explore already pulled, so do not re-read them.\n" +
+		"STEP 1: Skip ask_user UNLESS a critical decision is genuinely undefined in the findings (scope ambiguity, conflicting constraints). Most turns from explore should NOT ask_user — the findings already capture context, assumptions, stubs, and risks.\n" +
+		"STEP 2: Call plan_write. PRESERVE the explorer's context/assumptions/stubs/risks verbatim where they apply (copy them into the plan_write payload). ADD `approach` (concrete implementation strategy) and `validation` (how to verify — test commands, grep assertions). If a stub from the explorer is wrong or incomplete, replace it with the correction.\n" +
+		"STEP 3: Call todo_write with the executable checklist. Each item MUST EITHER name a path-shaped substring (`src/Game.tsx`) in its title OR populate `target_files` — the runtime rejects vague tasks. Reference the explorer's stubs to populate target_files; the builder will reuse the read cache and not re-fetch.\n" +
+		"  GOOD: {\"title\":\"Replace 12 combat.log calls in src/Game.tsx with console.log\",\"target_files\":[\"src/Game.tsx\"],\"acceptance_criteria\":\"grep -c combat.log src/Game.tsx returns 0\"}\n" +
+		"  BAD : \"Fix combat.log calls\"  (no file, no count, no verification — REJECTED)\n" +
+		"STEP 4: After plan_write and todo_write are both done in the same turn, give a one-sentence summary and stop. Do NOT call execute_task or spawn_subagent. The runtime hands off to build mode.\n" +
+		"FILE SIZE LIMIT: keep every produced file at or below ~600 lines. If a feature would require a single file >600 lines, split it into multiple physical modules in the checklist.\n"
+}
+
+func planPromptRefine() string {
+	return "You are in PLAN mode and an APPROVED PLAN already exists (see BASE PLAN in the user prompt). The user came back to plan — likely build hit something the plan didn't cover, or they want to refine before kickoff. Your job is to UPDATE the plan, NOT rewrite it from scratch.\n" +
+		"STEP 1: First, read the BASE PLAN section in the user prompt. Identify exactly which section needs to change (a bad assumption? a missing stub? an updated risk?). If unclear, ask_user 1-2 focused questions. Do NOT ask the standard interview questions — most context is already in the BASE PLAN.\n" +
+		"STEP 2: Call plan_write with the FULL updated plan. PRESERVE every section from the BASE PLAN that still applies — context, assumptions paragraph, approach paragraphs that haven't changed, stubs that are still valid, risks, validation. Only EDIT the parts that genuinely need to change. Dropping all of context/assumptions in your plan_write is a destructive bug — the BASE PLAN represents prior work that must survive.\n" +
+		"STEP 3: Call todo_write with the updated checklist. PRESERVE completed tasks (status=completed) — they represent finished work. ADD new tasks for what changed. UPDATE pending tasks only if their target_files or acceptance_criteria need adjustment. Each item must declare target_files OR have a path-shaped title.\n" +
+		"STEP 4: After plan_write and todo_write are done, give a one-sentence summary of WHAT CHANGED in this refinement and stop. Do NOT call execute_task. The runtime hands off to build mode.\n" +
+		"PRESERVATION RULE: if your plan_write summary contradicts the BASE PLAN summary in tone or scope, you've drifted — re-read the BASE PLAN and align. Refinement is surgical, not redesign.\n"
+}
+
 // GetMode returns a mode by name.
 func GetMode(name string) (Mode, bool) {
 	m, ok := DefaultModes()[name]

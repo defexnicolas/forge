@@ -593,7 +593,7 @@ func (r *Runtime) PreviewPrompt(userMessage string) (PromptPreview, error) {
 	snapshot := r.buildSnapshot(userMessage, roleConfig)
 	return PromptPreview{
 		System:           r.cachedSystemPrompt(supportsTools),
-		User:             userPrompt(snapshot, userMessage, r.planContextBlock(userMessage, ""), r.Mode, "", "", ""),
+		User:             userPrompt(snapshot, userMessage, r.planContextBlock(userMessage, ""), r.Mode, "", "", "", ""),
 		SupportsTools:    supportsTools,
 		ArtifactStrategy: inferDefaultFileStrategy(userMessage, ""),
 		Snapshot:         snapshot,
@@ -861,15 +861,22 @@ func (r *Runtime) invalidateSystemPromptCache() {
 }
 
 // cachedSystemPrompt returns the system prompt for the current (mode, policy,
-// nativeTools) signature, computing and memoizing on first hit. Callers must
-// not mutate the returned string. The output style appendix (if any) is
-// folded into the cached value so a config change requires reset (which
-// SetMode already does).
+// variant, nativeTools) signature, computing and memoizing on first hit.
+// Callers must not mutate the returned string. The output style appendix
+// (if any) is folded into the cached value so a config change requires
+// reset (which SetMode already does).
+//
+// "Variant" is plan-mode-only context: from_explore (PendingExplorerContext
+// just promoted), refine (active plan + tasks already exist), or cold
+// (fresh plan). Other modes ignore the variant. Including it in the cache
+// key prevents serving a stale variant prompt when the caller just
+// transitioned states between turns.
 func (r *Runtime) cachedSystemPrompt(nativeToolCalling bool) string {
 	if r == nil {
 		return ""
 	}
-	key := systemPromptCacheKey(nativeToolCalling, r.Mode, r.Policy)
+	variant := r.detectPlanVariant()
+	key := systemPromptCacheKey(nativeToolCalling, r.Mode, variant, r.Policy)
 	r.mu.Lock()
 	if r.systemPromptCache != nil {
 		if cached, ok := r.systemPromptCache[key]; ok {
@@ -878,7 +885,7 @@ func (r *Runtime) cachedSystemPrompt(nativeToolCalling bool) string {
 		}
 	}
 	r.mu.Unlock()
-	rendered := systemPrompt(nativeToolCalling, r.Mode, r.Policy)
+	rendered := systemPrompt(nativeToolCalling, r.Mode, variant, r.Policy)
 	if appendix := r.outputStyleAppendix(); appendix != "" {
 		rendered = rendered + "\n\n" + appendix
 	}
@@ -889,6 +896,41 @@ func (r *Runtime) cachedSystemPrompt(nativeToolCalling bool) string {
 	r.systemPromptCache[key] = rendered
 	r.mu.Unlock()
 	return rendered
+}
+
+// detectPlanVariant returns the plan-mode variant for the upcoming turn.
+// Empty string when not in plan mode — callers can safely include it in
+// cache keys regardless. Priority order matters: refine wins over
+// from_explore when both signals are present, because the active plan
+// represents committed decisions we don't want to discard just because
+// fresh findings arrived.
+func (r *Runtime) detectPlanVariant() string {
+	if r == nil || r.Mode != "plan" {
+		return ""
+	}
+	// Refine: there's an active plan with at least one task that isn't
+	// already completed. Tasks completed across the board mean the prior
+	// plan finished — this is closer to "cold" for the new request.
+	if r.Plans != nil && r.Tasks != nil {
+		if _, hasPlan, _ := r.Plans.Current(); hasPlan {
+			if list, err := r.Tasks.List(); err == nil {
+				for _, t := range list {
+					if !strings.EqualFold(t.Status, "completed") &&
+						!strings.EqualFold(t.Status, "cancelled") {
+						return PlanVariantRefine
+					}
+				}
+			}
+		}
+	}
+	// From-explore: explore mode just promoted findings to
+	// PendingExplorerContext. The handoff plumbing in run() consumes the
+	// field on the next plan turn — we read it here BEFORE that
+	// consumption so the variant is set correctly.
+	if strings.TrimSpace(r.PendingExplorerContext) != "" {
+		return PlanVariantFromExplore
+	}
+	return PlanVariantCold
 }
 
 // outputStyleAppendix loads the configured output-style markdown and wraps
@@ -962,7 +1004,7 @@ func preflightCacheKey(mode, line string) string {
 	return mode + "|" + strings.TrimSpace(line)
 }
 
-func systemPromptCacheKey(nativeTools bool, mode string, policy SprintPolicy) string {
+func systemPromptCacheKey(nativeTools bool, mode, variant string, policy SprintPolicy) string {
 	var b strings.Builder
 	if nativeTools {
 		b.WriteString("native|")
@@ -970,6 +1012,10 @@ func systemPromptCacheKey(nativeTools bool, mode string, policy SprintPolicy) st
 		b.WriteString("text|")
 	}
 	b.WriteString(mode)
+	if variant != "" {
+		b.WriteString("/")
+		b.WriteString(variant)
+	}
 	b.WriteString("|allow:")
 	b.WriteString(strings.Join(policy.AllowedNames(), ","))
 	b.WriteString("|ask:")
@@ -1431,9 +1477,19 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 		r.PendingExplorePreflight = ""
 	}
 
+	// Refine variant: surface the active plan as BASE PLAN so the model
+	// preserves it when calling plan_write. The variant detector already
+	// established refine — we just render here. detectPlanVariant returns
+	// "" outside plan mode, so this branch only fires when relevant.
+	basePlan := ""
+	if r.detectPlanVariant() == PlanVariantRefine && r.Plans != nil {
+		if doc, ok, err := r.Plans.Current(); err == nil && ok {
+			basePlan = renderPlanForHandoff(doc)
+		}
+	}
 	messages := []llm.Message{
 		{Role: "system", Content: r.cachedSystemPrompt(supportsTools)},
-		{Role: "user", Content: userPrompt(snapshot, userMessage, planBlock, r.Mode, handoff, explorerHandoff, buildPreflight)},
+		{Role: "user", Content: userPrompt(snapshot, userMessage, planBlock, r.Mode, handoff, explorerHandoff, buildPreflight, basePlan)},
 	}
 
 	// Track real token usage from actual messages.
