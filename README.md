@@ -195,3 +195,7 @@ gofmt -w ./cmd ./internal
 
 - Architecture deep-dive: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - Agent guidelines: [`AGENTS.md`](AGENTS.md)
+
+## License
+
+Licensed under Apache 2.0. See [`LICENSE`](LICENSE).
