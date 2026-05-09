@@ -89,7 +89,7 @@ func TestDefaultsUseRecommendedYarnProfile(t *testing.T) {
 		cfg.Runtime.MaxSameToolFailures != 2 ||
 		cfg.Runtime.MaxConsecutiveReadOnly != 10 ||
 		cfg.Runtime.MaxPlannerSummarySteps != 2 ||
-		cfg.Runtime.MaxBuilderReadLoops != 12 ||
+		cfg.Runtime.MaxBuilderReadLoops != 20 ||
 		cfg.Runtime.RetryOnProviderTimeout {
 		t.Fatalf("unexpected runtime defaults: %#v", cfg.Runtime)
 	}
@@ -122,7 +122,7 @@ func TestNormalizeBackfillsMultiModelDefaults(t *testing.T) {
 	// RequestTimeoutSeconds is no longer backfilled by Normalize — 0 is a
 	// valid "no deadline" setting. Only the safety-net knobs that must have
 	// a positive value are still normalized.
-	if cfg.Runtime.MaxBuilderReadLoops != 12 {
+	if cfg.Runtime.MaxBuilderReadLoops != 20 {
 		t.Fatalf("expected runtime defaults, got %#v", cfg.Runtime)
 	}
 	if cfg.Git.BaselineCommitMessage == "" || cfg.Git.SnapshotCommitMessage == "" {

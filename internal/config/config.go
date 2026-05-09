@@ -203,7 +203,7 @@ type RuntimeConfig struct {
 	MaxPlannerSummarySteps int  `toml:"max_planner_summary_steps"`
 	MaxBuilderReadLoops    int  `toml:"max_builder_read_loops"`
 	// MaxDebugReadLoops caps consecutive read-only tool calls in debug
-	// mode. Default 25 (vs 12 for build, 10 for plan/chat) because the
+	// mode. Default 25 (vs 20 for build, 10 for plan/chat) because the
 	// hypothesis-test loop legitimately interleaves read → instrument
 	// → run → read across many cycles. Set to a negative value to
 	// disable the guard entirely in debug mode (rely on max_steps).
@@ -857,8 +857,12 @@ func Defaults() Config {
 			MaxConsecutiveReadOnly: 10,
 			MaxPlannerSummarySteps: 2,
 			// Build-mode reads (read → analyze → edit → verify per task)
-			// also need more headroom than the original 8.
-			MaxBuilderReadLoops: 12,
+			// need plenty of headroom: scaffolding a new file from
+			// scratch on a local model often pulls 6-10 adjacent files
+			// (types, patterns, similar imports) before the first edit.
+			// 12 was tripping mid-investigation; 20 + grace=5 = 25
+			// effective stop, which matches debug's 25 + grace=5 = 30.
+			MaxBuilderReadLoops: 20,
 		},
 		Claw: ClawConfig{
 			Enabled:                  false,

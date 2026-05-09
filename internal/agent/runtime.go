@@ -2240,21 +2240,29 @@ func isReadOnlyExploration(name string) bool {
 //
 // All three may be zero values for a single call. The caller is expected to
 // check them in order (budget event → hardStop → nudge) and act accordingly.
-// debugBudgetFooter renders a one-line "[debug: N/M reads, K left]"
+// debugBudgetFooter renders a one-line "[mode: N/M reads, K left]"
 // banner so the model can see how close it is to the read-budget hard
-// stop. Empty string outside debug mode (the footer would be noise) and
-// when the budget guard is disabled (threshold == 0). Intentionally
-// short (< 30 chars) and rendered AFTER the read cache returns so
-// per-call budget changes do not invalidate the cached observation.
+// stop. Active in modes where the budget guard does meaningful work
+// (debug + build); skipped in chat/plan/explore where the budget either
+// isn't enforced or is too small to be worth annotating per-call.
+// Returns empty string when the budget snapshot is missing or the
+// threshold is disabled. Intentionally short (< 30 chars) and rendered
+// AFTER the read cache returns so per-call budget changes do not
+// invalidate the cached observation.
 func (r *Runtime) debugBudgetFooter(budget *ReadBudgetState) string {
-	if r.Mode != "debug" || budget == nil || budget.Threshold <= 0 {
+	if budget == nil || budget.Threshold <= 0 {
+		return ""
+	}
+	switch r.Mode {
+	case "debug", "build":
+	default:
 		return ""
 	}
 	left := budget.Threshold - budget.Consumed
 	if left < 0 {
 		left = 0
 	}
-	return fmt.Sprintf("[debug: %d/%d reads, %d left]", budget.Consumed, budget.Threshold, left)
+	return fmt.Sprintf("[%s: %d/%d reads, %d left]", r.Mode, budget.Consumed, budget.Threshold, left)
 }
 
 // debugEarlyNudgeFraction is the share of the debug read budget at which

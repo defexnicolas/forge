@@ -247,12 +247,21 @@ func (r *Runtime) maxBuilderReadLoops() int {
 		}
 		return v
 	}
-	return 12
+	// Default 20 (was 12). Local models scaffolding a new file from
+	// scratch legitimately need to read several adjacent files (types,
+	// patterns, similar imports) before producing the first edit; the
+	// previous 12+3 grace = 15 hard-stop was too aggressive for that
+	// flow. Combined with the broadened budget footer (now visible in
+	// build mode too), the agent has both more budget AND clearer
+	// visibility into how much it has left.
+	return 20
 }
 
 // activeReadBudget returns the threshold of consecutive read-only tool calls
 // that fires the soft-nudge / hard-stop guard for the CURRENT mode.
-//   - build:  maxBuilderReadLoops (default 12) — multi-task workflow
+//   - build:  maxBuilderReadLoops (default 20) — multi-task workflow,
+//             local models scaffolding new files often need 6-10 reads
+//             before the first edit
 //   - debug:  maxDebugReadLoops (default 25) — hypothesis-test cycles are
 //             read-heavy by design (read → instrument → read → run);
 //             the regular 10 cap was tripping mid-investigation
@@ -412,11 +421,17 @@ func (r *Runtime) LastReadBudgetSnapshot() (int, int) {
 // model is allowed AFTER the soft nudge before the hard stop fires. Gives
 // the model a fair window to self-correct (write the edit, dispatch
 // execute_task, answer in prose) without being killed mid-thought.
+//
+// Default 5 (was 3): local models often need an extra read or two after
+// the nudge to confirm the spot they're about to edit, especially when
+// the nudge interrupts a half-formed plan. The footer keeps the model
+// aware of how close to the wall it is, so widening the grace doesn't
+// hide the constraint.
 func (r *Runtime) readBudgetGracePastNudge() int {
 	if v := r.Config.Runtime.ReadBudgetGracePastNudge; v > 0 {
 		return v
 	}
-	return 3
+	return 5
 }
 
 // readBudgetEarlyNudgeForDebug fires at ~60% of the debug read budget.

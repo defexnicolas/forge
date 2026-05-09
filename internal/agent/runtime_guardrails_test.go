@@ -150,7 +150,7 @@ func TestApplyReadBudgetGuardEarlyNudgeIsDebugOnly(t *testing.T) {
 }
 
 func TestActiveReadBudget(t *testing.T) {
-	// Build mode uses the higher max_builder_read_loops (default 12); other
+	// Build mode uses the higher max_builder_read_loops (default 20); other
 	// modes fall back to max_consecutive_read_only (default 6). The
 	// per-session override (set by /reads extend) wins over both.
 	cases := []struct {
@@ -160,7 +160,7 @@ func TestActiveReadBudget(t *testing.T) {
 		cfg      config.RuntimeConfig
 		want     int
 	}{
-		{name: "build default", mode: "build", want: 12},
+		{name: "build default", mode: "build", want: 20},
 		{name: "chat default", mode: "chat", want: 6},
 		{name: "plan default", mode: "plan", want: 6},
 		{name: "debug default (higher than build)", mode: "debug", want: 25},
