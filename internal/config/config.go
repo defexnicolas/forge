@@ -217,6 +217,15 @@ type RuntimeConfig struct {
 	// 100k+ tokens without ever calling a tool. Default 6000 (~4500
 	// words). Set to a negative value to disable the guard.
 	MaxReasoningTokens int `toml:"max_reasoning_tokens"`
+	// MaxReasoningTokensDebug, when > 0, overrides MaxReasoningTokens
+	// while the runtime is in debug mode. Tighter cap (default 3500)
+	// because the hypothesis-test loop should produce a one-sentence
+	// theory and an instrument edit, not multi-paragraph speculation.
+	// Combined with the carry-forward of files-already-read on abort, a
+	// shorter thinking budget pushes the model to ACT instead of
+	// re-deriving. 0 = use MaxReasoningTokens. Negative = disable the
+	// guard for debug mode entirely.
+	MaxReasoningTokensDebug int `toml:"max_reasoning_tokens_debug"`
 	// ReadBudgetGracePastNudge is the number of additional read-only steps
 	// the model gets after the soft nudge fires before the hard stop kicks
 	// in. The first cross of MaxBuilderReadLoops / MaxConsecutiveReadOnly

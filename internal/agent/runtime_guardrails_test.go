@@ -85,6 +85,70 @@ func TestReadBudgetNudgeForMode(t *testing.T) {
 	}
 }
 
+// TestApplyReadBudgetGuardEarlyNudgeDebug verifies the debug-only early
+// soft nudge fires at ~60% of the threshold (15 of 25 by default), once
+// per turn, BEFORE the existing late nudge at the threshold itself.
+// Other modes must NOT see the early nudge — they're tuned for a single
+// late nudge and adding a second would just generate noise.
+func TestApplyReadBudgetGuardEarlyNudgeDebug(t *testing.T) {
+	r := &Runtime{Mode: "debug"}
+
+	consumed := 0
+	noProgress := 0
+	nudged := false
+	nudgedEarly := false
+
+	// Walk reads up to and past the early threshold (15 of 25). Capture
+	// nudge text per step.
+	var earlyNudges, lateNudges int
+	var earlyText string
+	for i := 0; i < 27; i++ {
+		nudge, _, hardStop := r.applyReadBudgetGuard("read_file", false, &consumed, &noProgress, &nudged, &nudgedEarly)
+		if hardStop != nil {
+			break
+		}
+		if nudge == "" {
+			continue
+		}
+		if strings.Contains(nudge, "% of the debug budget") {
+			earlyNudges++
+			earlyText = nudge
+		} else {
+			lateNudges++
+		}
+	}
+	if earlyNudges != 1 {
+		t.Fatalf("expected exactly 1 early debug nudge, got %d (%q)", earlyNudges, earlyText)
+	}
+	if !strings.Contains(earlyText, "spawn_subagent") {
+		t.Errorf("early nudge should suggest delegating to explorer, got: %s", earlyText)
+	}
+	if lateNudges != 1 {
+		t.Errorf("expected exactly 1 late nudge after early one, got %d", lateNudges)
+	}
+}
+
+// TestApplyReadBudgetGuardEarlyNudgeIsDebugOnly pins that the early nudge
+// does NOT fire in build/plan/chat — the existing late nudge is sufficient
+// for those modes and a second signal would just confuse the model.
+func TestApplyReadBudgetGuardEarlyNudgeIsDebugOnly(t *testing.T) {
+	for _, mode := range []string{"build", "plan", "chat"} {
+		t.Run(mode, func(t *testing.T) {
+			r := &Runtime{Mode: mode}
+			consumed := 0
+			noProgress := 0
+			nudged := false
+			nudgedEarly := false
+			for i := 0; i < 5; i++ {
+				nudge, _, _ := r.applyReadBudgetGuard("read_file", false, &consumed, &noProgress, &nudged, &nudgedEarly)
+				if nudge != "" && strings.Contains(nudge, "% of the debug budget") {
+					t.Errorf("mode %s leaked debug-only early nudge: %s", mode, nudge)
+				}
+			}
+		})
+	}
+}
+
 func TestActiveReadBudget(t *testing.T) {
 	// Build mode uses the higher max_builder_read_loops (default 12); other
 	// modes fall back to max_consecutive_read_only (default 6). The
@@ -124,21 +188,28 @@ func TestActiveReadBudget(t *testing.T) {
 func TestMaxReasoningTokens(t *testing.T) {
 	// The thinking-budget guard caps reasoning_content tokens before any
 	// text or tool_call is emitted. Default 6000 (≈4500 words). Negative
-	// = disabled. Positive overrides.
+	// = disabled. Positive overrides. Debug mode has its own tighter
+	// default (3500) and a dedicated config knob (MaxReasoningTokensDebug).
 	cases := []struct {
 		name string
+		mode string
 		cfg  config.RuntimeConfig
 		want int
 	}{
-		{name: "default", want: 6000},
-		{name: "positive override", cfg: config.RuntimeConfig{MaxReasoningTokens: 10000}, want: 10000},
-		{name: "negative disables (returns 0)", cfg: config.RuntimeConfig{MaxReasoningTokens: -1}, want: 0},
+		{name: "default non-debug", mode: "build", want: 6000},
+		{name: "default debug is 3500", mode: "debug", want: 3500},
+		{name: "positive global override applies to all modes", mode: "build", cfg: config.RuntimeConfig{MaxReasoningTokens: 10000}, want: 10000},
+		{name: "positive global override applies to debug too when no debug-specific", mode: "debug", cfg: config.RuntimeConfig{MaxReasoningTokens: 10000}, want: 10000},
+		{name: "negative global disables", mode: "build", cfg: config.RuntimeConfig{MaxReasoningTokens: -1}, want: 0},
+		{name: "debug-specific wins over global in debug mode", mode: "debug", cfg: config.RuntimeConfig{MaxReasoningTokens: 10000, MaxReasoningTokensDebug: 2000}, want: 2000},
+		{name: "debug-specific does NOT affect non-debug mode", mode: "build", cfg: config.RuntimeConfig{MaxReasoningTokensDebug: 2000}, want: 6000},
+		{name: "debug-specific negative disables guard in debug only", mode: "debug", cfg: config.RuntimeConfig{MaxReasoningTokensDebug: -1}, want: 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			r := &Runtime{Config: config.Config{Runtime: tc.cfg}}
+			r := &Runtime{Mode: tc.mode, Config: config.Config{Runtime: tc.cfg}}
 			if got := r.maxReasoningTokens(); got != tc.want {
-				t.Errorf("maxReasoningTokens(cfg=%+v) = %d, want %d", tc.cfg, got, tc.want)
+				t.Errorf("maxReasoningTokens(mode=%s, cfg=%+v) = %d, want %d", tc.mode, tc.cfg, got, tc.want)
 			}
 		})
 	}

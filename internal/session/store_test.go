@@ -225,6 +225,127 @@ func TestContextDropsAbortedTurns(t *testing.T) {
 	}
 }
 
+// TestContextCarriesForwardBudgetAbortedTurns pins the carry-forward
+// behavior: when a debug turn aborts because the read budget or thinking
+// budget was exhausted, the next prompt sees a synthesized summary of
+// what was already read so it doesn't restart cold and re-explore the
+// same files. Narration-loop / parse-retry aborts still get filtered
+// cleanly (covered by TestContextDropsAbortedTurns).
+func TestContextCarriesForwardBudgetAbortedTurns(t *testing.T) {
+	cwd := t.TempDir()
+	store, err := New(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	turnID := "t-budget"
+	if err := store.LogAgentEvent(agent.Event{Type: agent.EventTurnStart, TurnID: turnID}); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"internal/agent/runtime.go", "internal/agent/modes.go", "internal/session/store.go"} {
+		if err := store.LogAgentEvent(agent.Event{
+			Type:     agent.EventToolCall,
+			ToolName: "read_file",
+			TurnID:   turnID,
+			Input:    fmt.Appendf(nil, `{"path":%q}`, path),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.LogAgentEvent(agent.Event{
+		Type:     agent.EventToolCall,
+		ToolName: "search_text",
+		TurnID:   turnID,
+		Input:    []byte(`{"query":"NewDebugPolicy"}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LogAgentEvent(agent.Event{
+		Type:    agent.EventAssistantText,
+		TurnID:  turnID,
+		Text:    "I think the bug is in how the policy decides ToolAsk vs ToolAllow",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LogAgentEvent(agent.Event{
+		Type:   agent.EventError,
+		TurnID: turnID,
+		Error:  errors.New("stopped: 28 consecutive read-only tool calls — switch to instrumentation or escalate"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LogAgentEvent(agent.Event{Type: agent.EventTurnEnd, TurnID: turnID, TurnOutcome: OutcomeAborted}); err != nil {
+		t.Fatal(err)
+	}
+
+	text := store.ContextText(20)
+
+	// Carry-forward block must appear.
+	if !strings.Contains(text, "PRIOR DEBUG ATTEMPT") {
+		t.Fatalf("expected carry-forward header in context, got:\n%s", text)
+	}
+	for _, want := range []string{
+		"internal/agent/runtime.go",
+		"internal/agent/modes.go",
+		"internal/session/store.go",
+		"NewDebugPolicy",
+		"I think the bug is in how the policy",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("carry-forward missing %q in:\n%s", want, text)
+		}
+	}
+	// The original tool_call records and assistant_text must NOT leak in
+	// addition — only the synthesized summary survives.
+	if strings.Count(text, "internal/agent/runtime.go") > 1 {
+		t.Errorf("file path appears more than once — original tool_call leaked alongside carry-forward:\n%s", text)
+	}
+}
+
+// TestContextDoesNotCarryForwardNarrationLoopAborts confirms that
+// non-budget aborts (narration loops, parse retries, max-step caps) are
+// still filtered cleanly without a carry-forward block — that pollution
+// is what TestContextDropsAbortedTurns guards against, and the new
+// carry-forward path must NOT regress it.
+func TestContextDoesNotCarryForwardNarrationLoopAborts(t *testing.T) {
+	cwd := t.TempDir()
+	store, err := New(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	turnID := "t-narration"
+	if err := store.LogAgentEvent(agent.Event{Type: agent.EventTurnStart, TurnID: turnID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LogAgentEvent(agent.Event{
+		Type:     agent.EventToolCall,
+		ToolName: "read_file",
+		TurnID:   turnID,
+		Input:    []byte(`{"path":"foo.go"}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LogAgentEvent(agent.Event{
+		Type:   agent.EventError,
+		TurnID: turnID,
+		Error:  errors.New(`narration loop detected (line "let me think" repeated 3 times)`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LogAgentEvent(agent.Event{Type: agent.EventTurnEnd, TurnID: turnID, TurnOutcome: OutcomeAborted}); err != nil {
+		t.Fatal(err)
+	}
+
+	text := store.ContextText(20)
+	if strings.Contains(text, "PRIOR DEBUG ATTEMPT") {
+		t.Errorf("narration-loop abort should NOT produce a carry-forward block, got:\n%s", text)
+	}
+	if strings.Contains(text, "foo.go") {
+		t.Errorf("narration-loop abort leaked file path into context:\n%s", text)
+	}
+}
+
 // TestClassifyTurnOutcomeRecognizesPatterns pins the heuristics that
 // decide whether a turn was aborted vs failed vs completed. If any of
 // these patterns drift in the runtime's error messages, this test fails

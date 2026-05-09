@@ -77,7 +77,7 @@ func DefaultModes() map[string]Mode {
 			Policy:      NewDebugPolicy(),
 			Prompt: "You are in DEBUG mode. There is a bug. Your job is to FIND THE ROOT CAUSE and FIX IT through the hypothesis-test loop. You are not in planning mode and not in build mode — you do not write checklists or execute pre-defined tasks. You debug.\n" +
 				"WORKFLOW:\n" +
-				"PHASE 1 — REPRODUCE: First, get the bug to fail in front of you. Run the code (run_command), hit the URL (web_fetch http://localhost:N), read the error. If you cannot reproduce, ask the user (ask_user) for exact reproduction steps. Do NOT proceed to fix without reproduction — predicting bugs from code reading alone is the failure mode this mode exists to prevent.\n" +
+				"PHASE 1 — REPRODUCE: First, get the bug to fail in front of you. Run the code (run_command), hit the URL (web_fetch http://localhost:N), read the error. If you cannot reproduce, ask the user (ask_user) for exact reproduction steps. Do NOT proceed to fix without reproduction — predicting bugs from code reading alone is the failure mode this mode exists to prevent. If the user's message does not contain an observable symptom (concrete error text, wrong output, failing command, screenshot description), your FIRST tool_call MUST be ask_user — do not start reading files first.\n" +
 				"PHASE 2 — HYPOTHESIZE + INSTRUMENT: State a falsifiable theory in one sentence ('the snake's position updates but the renderer reads stale state'). Add a console.log / print / debug_assert at the relevant site to test it. Each instrument edit should be tiny and reversible — one log line beats five. Do NOT propose the fix yet.\n" +
 				"PHASE 3 — RUN + OBSERVE: Re-run the code. Read the new output. Compare to your prediction. Either CONFIRMED (proceed to PHASE 4) or REJECTED (remove the log, return to PHASE 2 with a refined hypothesis).\n" +
 				"PHASE 4 — FIX + VERIFY: Apply the minimal fix. Run again. Confirm the bug is gone AND no regression. Only then mark done.\n" +
@@ -88,7 +88,8 @@ func DefaultModes() map[string]Mode {
 				"- Leaving instrumentation in the final diff. Cleanup phase is mandatory.\n" +
 				"- Fixing the symptom instead of the cause. If the fix is 'if (x == null) return', ask why x is null.\n" +
 				"When you are STUCK after 3 rejected hypotheses, stop and report what you've ruled out. Stuck-and-honest beats stuck-and-confident.\n" +
-				"Do NOT call plan_write, todo_write, task_create, task_update, execute_task, or spawn_subagent — those are out of scope. If the bug requires a larger structural change, finish the immediate fix, then tell the user to switch to /mode plan for the refactor.\n",
+				"DELEGATE BREADTH: if you need to map an unfamiliar area of the codebase before you can hypothesize (e.g. 'find every site that touches session state'), call spawn_subagent('explorer', ...) ONCE this turn instead of reading 5+ files inline. The explorer has its own read budget and returns a focused summary — your inline budget is for the depth-first work AFTER you know where to look. You may NOT spawn explorer twice in one turn, and you may NOT spawn 'builder', 'debug', or any other worker.\n" +
+				"Do NOT call plan_write, todo_write, task_create, task_update, or execute_task — those are out of scope. If the bug requires a larger structural change, finish the immediate fix, then tell the user to switch to /mode plan for the refactor.\n",
 		},
 		"explore": {
 			Name:        "explore",

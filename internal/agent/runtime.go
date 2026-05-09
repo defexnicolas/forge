@@ -234,6 +234,13 @@ type Runtime struct {
 	// reprompt that names the offending line instead of the generic
 	// "no tool call" prompt.
 	lastNarrationCancel string
+	// debugExplorerSpawnsThisTurn counts how many times the debug-mode
+	// agent has called spawn_subagent('explorer', ...) during the current
+	// turn. Reset at the top of run(). Capped to 1 in executeSubagent so
+	// the debug loop can offload one breadth-first investigation but
+	// cannot turn into a fan-out coordinator (that's plan/explore mode's
+	// job).
+	debugExplorerSpawnsThisTurn int
 	// ActiveParserName is the parser selected at model-load time (via
 	// SetChatModel). Cached so the TUI can display it without re-running
 	// ForModel every frame. The per-turn LastParserUsed still tracks which
@@ -1600,6 +1607,8 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 	consecutiveToolFailures := 0
 	consecutiveReadOnly := 0
 	readBudgetNudged := false
+	readBudgetNudgedEarly := false
+	r.debugExplorerSpawnsThisTurn = 0
 	lastBuildReadKey := ""
 	sameBuildReadCount := 0
 	planModeReprompts := 0
@@ -1745,7 +1754,7 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 				// Cache-served reads did no real work — applyReadBudgetGuard
 				// short-circuits on cacheHit so the cache helps the agent
 				// rather than using up its exploration budget twice as fast.
-				nudge, budget, hardStop := r.applyReadBudgetGuard(agentCall.Name, cacheHit, &consecutiveReadOnly, &noProgressSteps, &readBudgetNudged)
+				nudge, budget, hardStop := r.applyReadBudgetGuard(agentCall.Name, cacheHit, &consecutiveReadOnly, &noProgressSteps, &readBudgetNudged, &readBudgetNudgedEarly)
 				if budget != nil {
 					events <- Event{Type: EventReadBudget, ReadBudget: budget}
 				}
@@ -1756,6 +1765,9 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 				}
 				if nudge != "" {
 					observation = observation + "\n\n[system] " + nudge
+				}
+				if footer := r.debugBudgetFooter(budget); footer != "" {
+					observation = observation + "\n" + footer
 				}
 
 				// Track consecutive failures.
@@ -1993,7 +2005,7 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 		// Shared with the native tool-call path above via applyReadBudgetGuard
 		// so both paths stop with the same mode-aware messaging instead of
 		// the legacy "dispatch execute_task" string in non-build modes.
-		nudge, budget, hardStop := r.applyReadBudgetGuard(parsed.Call.Name, cacheHit, &consecutiveReadOnly, &noProgressSteps, &readBudgetNudged)
+		nudge, budget, hardStop := r.applyReadBudgetGuard(parsed.Call.Name, cacheHit, &consecutiveReadOnly, &noProgressSteps, &readBudgetNudged, &readBudgetNudgedEarly)
 		if budget != nil {
 			events <- Event{Type: EventReadBudget, ReadBudget: budget}
 		}
@@ -2004,6 +2016,9 @@ func (r *Runtime) run(ctx context.Context, userMessage string, events chan<- Eve
 		}
 		if nudge != "" {
 			observation = observation + "\n\n[system] " + nudge
+		}
+		if footer := r.debugBudgetFooter(budget); footer != "" {
+			observation = observation + "\n" + footer
 		}
 
 		if parsed.Call.Name == "execute_task" && result != nil {
@@ -2210,11 +2225,36 @@ func isReadOnlyExploration(name string) bool {
 //
 // All three may be zero values for a single call. The caller is expected to
 // check them in order (budget event → hardStop → nudge) and act accordingly.
-func (r *Runtime) applyReadBudgetGuard(name string, cacheHit bool, consecutiveReadOnly, noProgressSteps *int, readBudgetNudged *bool) (nudge string, budget *ReadBudgetState, hardStop error) {
+// debugBudgetFooter renders a one-line "[debug: N/M reads, K left]"
+// banner so the model can see how close it is to the read-budget hard
+// stop. Empty string outside debug mode (the footer would be noise) and
+// when the budget guard is disabled (threshold == 0). Intentionally
+// short (< 30 chars) and rendered AFTER the read cache returns so
+// per-call budget changes do not invalidate the cached observation.
+func (r *Runtime) debugBudgetFooter(budget *ReadBudgetState) string {
+	if r.Mode != "debug" || budget == nil || budget.Threshold <= 0 {
+		return ""
+	}
+	left := budget.Threshold - budget.Consumed
+	if left < 0 {
+		left = 0
+	}
+	return fmt.Sprintf("[debug: %d/%d reads, %d left]", budget.Consumed, budget.Threshold, left)
+}
+
+// debugEarlyNudgeFraction is the share of the debug read budget at which
+// the early soft nudge fires (60% of threshold). Tuned to give the model
+// a chance to pivot to instrumentation BEFORE it spends its remaining
+// budget on more reads. Debug-only — other modes have a single late
+// nudge at the threshold and the existing behavior is fine for them.
+const debugEarlyNudgeFraction = 0.6
+
+func (r *Runtime) applyReadBudgetGuard(name string, cacheHit bool, consecutiveReadOnly, noProgressSteps *int, readBudgetNudged, readBudgetNudgedEarly *bool) (nudge string, budget *ReadBudgetState, hardStop error) {
 	if isMutatingToolCall(name) || name == "execute_task" {
 		*consecutiveReadOnly = 0
 		*noProgressSteps = 0
 		*readBudgetNudged = false
+		*readBudgetNudgedEarly = false
 		return "", nil, nil
 	}
 	if !isReadOnlyExploration(name) || cacheHit {
@@ -2248,6 +2288,19 @@ func (r *Runtime) applyReadBudgetGuard(name string, cacheHit bool, consecutiveRe
 		}
 		if *consecutiveReadOnly >= threshold+r.readBudgetGracePastNudge() {
 			return "", snap, fmt.Errorf("stopped: %d consecutive read-only tool calls — %s", *consecutiveReadOnly, readBudgetHardStopForMode(r.Mode))
+		}
+	}
+	// Debug-only early nudge at ~60% of the threshold. Fires once per turn,
+	// before the late nudge at the threshold itself, so the model has time
+	// to pivot to instrumentation while it still has budget for the run.
+	if r.Mode == "debug" && threshold > 0 && !*readBudgetNudgedEarly && !*readBudgetNudged {
+		earlyAt := int(float64(threshold) * debugEarlyNudgeFraction)
+		if earlyAt < 1 {
+			earlyAt = 1
+		}
+		if *consecutiveReadOnly >= earlyAt {
+			*readBudgetNudgedEarly = true
+			return readBudgetEarlyNudgeForDebug(*consecutiveReadOnly, threshold), snap, nil
 		}
 	}
 	return "", snap, nil

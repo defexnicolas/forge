@@ -166,11 +166,17 @@ func NewExplorePolicy() SprintPolicy {
 //   - ask_user (can request reproduction steps when the bug isn't clear)
 //
 // Explicitly denied: plan_write, todo_write, task_create, task_update,
-// execute_task, spawn_subagent. Debug mode does not design solutions or
-// dispatch work — its single job is finding the root cause and
-// applying the minimal fix in-place. Once the fix is verified the user
-// can switch to plan/build for follow-up work if the change implies a
-// larger refactor.
+// execute_task. Debug mode does not design solutions or dispatch work —
+// its single job is finding the root cause and applying the minimal fix
+// in-place. Once the fix is verified the user can switch to plan/build
+// for follow-up work if the change implies a larger refactor.
+//
+// spawn_subagent is allowed at the policy layer but the runtime gates it
+// to a single explorer call per turn (see executeSubagent). The intent
+// is to let debug delegate breadth-first reading to a worker that has
+// its own read budget and returns a focused summary, instead of burning
+// inline reads. spawn_subagents (the parallel batch tool) stays denied —
+// debug investigation is sequential by nature.
 func NewDebugPolicy() SprintPolicy {
 	allowed := map[string]bool{}
 	for _, name := range []string{
@@ -179,6 +185,7 @@ func NewDebugPolicy() SprintPolicy {
 		"plan_get", "task_list", "task_get",
 		"ask_user",
 		"web_fetch",
+		"spawn_subagent",
 	} {
 		allowed[name] = true
 	}

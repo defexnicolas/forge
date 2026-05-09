@@ -134,6 +134,26 @@ func (r *Runtime) executeSubagent(ctx context.Context, input json.RawMessage) (*
 		result := tools.Result{Title: "spawn_subagent", Summary: err.Error()}
 		return &result, "Tool result for spawn_subagent: error: " + err.Error()
 	}
+	// Debug mode is allowed to spawn a single explorer subagent per turn:
+	// the goal is to delegate breadth-first reading to a worker that has
+	// its own read budget and returns a focused summary, not to turn
+	// debug into a coordinator. Anything else (debug→builder, debug→debug,
+	// or a second explorer in the same turn) is rejected with a message
+	// the model can act on instead of a generic policy denial.
+	if r.Mode == "debug" {
+		name := strings.TrimSpace(req.Agent)
+		if name != "explorer" {
+			msg := fmt.Sprintf("debug mode can only spawn the 'explorer' subagent (requested %q). Read or instrument inline, or finish the current hypothesis first.", req.Agent)
+			result := tools.Result{Title: "spawn_subagent", Summary: msg}
+			return &result, "Tool result for spawn_subagent: error: " + msg
+		}
+		if r.debugExplorerSpawnsThisTurn >= 1 {
+			msg := "debug mode allows at most one spawn_subagent('explorer') per turn — use the previous explorer's findings, instrument something, or end the turn so the next one can delegate again."
+			result := tools.Result{Title: "spawn_subagent", Summary: msg}
+			return &result, "Tool result for spawn_subagent: error: " + msg
+		}
+		r.debugExplorerSpawnsThisTurn++
+	}
 	result, err := r.RunSubagent(ctx, req)
 	if err != nil {
 		result := tools.Result{Title: "spawn_subagent", Summary: err.Error()}

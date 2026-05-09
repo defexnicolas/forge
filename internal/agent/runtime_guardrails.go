@@ -289,7 +289,34 @@ func (r *Runtime) activeReadBudget() int {
 // Returns 0 to mean "guard disabled" — used when the config value is
 // negative. Default 6000 ≈ 4500 words ≈ 6 dense paragraphs of thought,
 // enough for one focused chain but not for endless speculation.
+//
+// Debug mode honors MaxReasoningTokensDebug (default 3500) when set:
+// the hypothesis-test loop should produce a one-sentence theory and an
+// instrument edit, not multi-paragraph speculation. The carry-forward
+// synthesizer (see internal/session.contextEvents) keeps the next turn
+// from re-deriving what the aborted turn already discovered, so a
+// tighter cap is a net win rather than just doubling the abort rate.
 func (r *Runtime) maxReasoningTokens() int {
+	if r.Mode == "debug" {
+		if v := r.Config.Runtime.MaxReasoningTokensDebug; v != 0 {
+			if v < 0 {
+				return 0
+			}
+			return v
+		}
+		// Fall through to MaxReasoningTokens if debug-specific not set,
+		// using a debug default of 3500 instead of the global 6000.
+		v := r.Config.Runtime.MaxReasoningTokens
+		if v < 0 {
+			return 0
+		}
+		if v > 0 {
+			// Honor an explicit positive global override even in debug —
+			// the user intentionally set it, respect their choice.
+			return v
+		}
+		return 3500
+	}
 	v := r.Config.Runtime.MaxReasoningTokens
 	if v < 0 {
 		return 0
@@ -397,6 +424,16 @@ func (r *Runtime) readBudgetGracePastNudge() int {
 		return v
 	}
 	return 3
+}
+
+// readBudgetEarlyNudgeForDebug fires at ~60% of the debug read budget.
+// Goal: give the model a clear signal to switch from reading to
+// instrumenting BEFORE it spends its remaining reads, instead of getting
+// the only nudge once it's already at the threshold. Debug-only — other
+// modes don't have a hypothesis-test cycle and a 60% pre-warning would
+// just add noise to plan/build/chat.
+func readBudgetEarlyNudgeForDebug(consumed, threshold int) string {
+	return fmt.Sprintf("You are at %d/%d reads — about %.0f%% of the debug budget. Stop reading and instrument now: add a print/log at the suspected site and call run_command. If you genuinely need more reading first, delegate the breadth-first part to spawn_subagent('explorer', ...) instead of burning your inline budget.", consumed, threshold, debugEarlyNudgeFraction*100)
 }
 
 // readBudgetNudgeForMode returns the per-mode soft-nudge text injected into

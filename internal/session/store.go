@@ -561,7 +561,10 @@ func FormatTail(events []Event) string {
 //  1. Drop the entire contents of any turn whose EventTurnEnd has
 //     Outcome="aborted" — narration loops, parse-failures-exhausted, and
 //     max-step caps are recovery noise that confuses the next turn into
-//     "I was just stuck, better tread carefully" loops.
+//     "I was just stuck, better tread carefully" loops. EXCEPTION:
+//     budget-exhausted aborts (read budget or thinking budget) get a
+//     deterministic carry-forward block synthesized in their place so the
+//     next turn doesn't restart cold and re-read the same files.
 //  2. Drop individual Transient events even from completed turns —
 //     parse retries and soft-nudge stops happen, the model recovers,
 //     but their messages would still pollute the prompt if rendered.
@@ -584,16 +587,47 @@ func contextEvents(events []Event) []Event {
 	if lastCompactIdx >= 0 {
 		events = events[lastCompactIdx:]
 	}
-	// First pass: build TurnID -> Outcome map.
+	// First pass: build TurnID -> Outcome map and bucket events by turn so
+	// we can synthesize carry-forward blocks for budget-exhausted aborts.
 	outcomes := map[string]string{}
+	turnEvents := map[string][]Event{}
 	for _, e := range events {
 		if e.Type == agent.EventTurnEnd && e.TurnID != "" {
 			outcomes[e.TurnID] = e.Outcome
 		}
+		if e.TurnID != "" {
+			turnEvents[e.TurnID] = append(turnEvents[e.TurnID], e)
+		}
 	}
+	// Pre-synthesize carry-forward events for aborted turns whose abort
+	// reason is budget-related. Keyed by the turn's TurnEnd index so we can
+	// inject the synthetic event at the correct position in the output.
+	carryForward := map[string]Event{}
+	for turnID, outcome := range outcomes {
+		if outcome != OutcomeAborted {
+			continue
+		}
+		if !turnAbortedByBudget(turnEvents[turnID]) {
+			continue
+		}
+		if cf, ok := synthesizeAbortedTurnSummary(turnEvents[turnID]); ok {
+			carryForward[turnID] = cf
+		}
+	}
+	emittedCarry := map[string]bool{}
 	out := make([]Event, 0, len(events))
 	for _, event := range events {
 		if event.TurnID != "" && outcomes[event.TurnID] == OutcomeAborted {
+			// On reaching the end-of-turn marker, emit the synthesized
+			// carry-forward block (if any) once, in place of the dropped
+			// turn. This puts the summary at the chronological position
+			// where the failed turn would have ended.
+			if event.Type == agent.EventTurnEnd && !emittedCarry[event.TurnID] {
+				if cf, ok := carryForward[event.TurnID]; ok {
+					out = append(out, cf)
+					emittedCarry[event.TurnID] = true
+				}
+			}
 			continue
 		}
 		if event.Transient {
@@ -607,6 +641,163 @@ func contextEvents(events []Event) []Event {
 		out = append(out, compactPlanningEvent(event))
 	}
 	return out
+}
+
+// turnAbortedByBudget reports whether the most recent EventError in a
+// turn's events matches the read-budget or thinking-budget exhaustion
+// signature. Used by contextEvents to decide whether to synthesize a
+// carry-forward summary instead of dropping the turn entirely.
+func turnAbortedByBudget(turnEvents []Event) bool {
+	var last string
+	for _, e := range turnEvents {
+		if e.Type == agent.EventError && e.Error != "" {
+			last = e.Error
+		}
+	}
+	if last == "" {
+		return false
+	}
+	low := strings.ToLower(last)
+	return strings.Contains(low, "consecutive read-only tool calls") ||
+		strings.Contains(low, "thinking budget exhausted")
+}
+
+// synthesizeAbortedTurnSummary builds a single Event that summarizes a
+// turn that aborted due to budget exhaustion. It lists the files the
+// model already read, the searches it ran, and surfaces its last visible
+// thought so the next turn picks up from there instead of redoing the
+// same exploration. Deterministic and in-process — no LLM call, so it
+// stays cheap on slow local backends. Returns (Event, false) when the
+// turn produced nothing worth carrying forward.
+func synthesizeAbortedTurnSummary(turnEvents []Event) (Event, bool) {
+	var (
+		readPaths []string
+		seenPath  = map[string]bool{}
+		searches  []string
+		seenQuery = map[string]bool{}
+		lastText  string
+		lastError string
+		toolCount int
+	)
+	for _, e := range turnEvents {
+		switch e.Type {
+		case agent.EventToolCall:
+			toolCount++
+			switch e.ToolName {
+			case "read_file":
+				if p := readFilePathFromInputJSON(e.Input); p != "" && !seenPath[p] {
+					seenPath[p] = true
+					readPaths = append(readPaths, p)
+				}
+			case "read_files":
+				for _, p := range readFilesPathsFromInputJSON(e.Input) {
+					if p == "" || seenPath[p] {
+						continue
+					}
+					seenPath[p] = true
+					readPaths = append(readPaths, p)
+				}
+			case "search_text", "search_files":
+				if q := searchQueryFromInputJSON(e.Input); q != "" && !seenQuery[q] {
+					seenQuery[q] = true
+					searches = append(searches, q)
+				}
+			}
+		case agent.EventAssistantText:
+			if t := strings.TrimSpace(e.Text); t != "" {
+				lastText = t
+			}
+		case agent.EventError:
+			if e.Error != "" {
+				lastError = e.Error
+			}
+		}
+	}
+	if len(readPaths) == 0 && len(searches) == 0 && lastText == "" {
+		return Event{}, false
+	}
+	var b strings.Builder
+	b.WriteString("=== PRIOR DEBUG ATTEMPT (aborted, carried forward) ===\n")
+	if lastError != "" {
+		b.WriteString("Stopped because: ")
+		b.WriteString(truncateForCarry(lastError, 200))
+		b.WriteString("\n")
+	}
+	if toolCount > 0 {
+		fmt.Fprintf(&b, "Tool calls used in the failed turn: %d\n", toolCount)
+	}
+	if len(readPaths) > 0 {
+		fmt.Fprintf(&b, "Files already read (%d — do NOT re-read unless you need a different range):\n", len(readPaths))
+		for _, p := range readPaths {
+			b.WriteString("  - ")
+			b.WriteString(p)
+			b.WriteString("\n")
+		}
+	}
+	if len(searches) > 0 {
+		b.WriteString("Searches already run:\n")
+		for _, q := range searches {
+			b.WriteString("  - ")
+			b.WriteString(truncateForCarry(q, 80))
+			b.WriteString("\n")
+		}
+	}
+	if lastText != "" {
+		b.WriteString("Last thought before stop:\n  ")
+		b.WriteString(truncateForCarry(lastText, 400))
+		b.WriteString("\n")
+	}
+	b.WriteString("Pick up from here. Form a new hypothesis or instrument something — do NOT redo this exploration.\n")
+	return Event{
+		Time: time.Now().UTC(),
+		Type: "carry_forward",
+		Text: b.String(),
+	}, true
+}
+
+func readFilePathFromInputJSON(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var req struct {
+		Path string `json:"path"`
+	}
+	_ = json.Unmarshal(raw, &req)
+	return req.Path
+}
+
+func readFilesPathsFromInputJSON(raw json.RawMessage) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var req struct {
+		Paths []string `json:"paths"`
+	}
+	_ = json.Unmarshal(raw, &req)
+	return req.Paths
+}
+
+func searchQueryFromInputJSON(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var req struct {
+		Query   string `json:"query"`
+		Pattern string `json:"pattern"`
+	}
+	_ = json.Unmarshal(raw, &req)
+	if req.Query != "" {
+		return req.Query
+	}
+	return req.Pattern
+}
+
+func truncateForCarry(s string, max int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
 }
 
 // AutoCompact implements agent.AutoCompactor. Called by the runtime at
