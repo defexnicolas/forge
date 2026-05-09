@@ -198,10 +198,12 @@ func TestMaxReasoningTokens(t *testing.T) {
 	}{
 		{name: "default non-debug", mode: "build", want: 6000},
 		{name: "default debug is 3500", mode: "debug", want: 3500},
-		{name: "positive global override applies to all modes", mode: "build", cfg: config.RuntimeConfig{MaxReasoningTokens: 10000}, want: 10000},
-		{name: "positive global override applies to debug too when no debug-specific", mode: "debug", cfg: config.RuntimeConfig{MaxReasoningTokens: 10000}, want: 10000},
-		{name: "negative global disables", mode: "build", cfg: config.RuntimeConfig{MaxReasoningTokens: -1}, want: 0},
-		{name: "debug-specific wins over global in debug mode", mode: "debug", cfg: config.RuntimeConfig{MaxReasoningTokens: 10000, MaxReasoningTokensDebug: 2000}, want: 2000},
+		{name: "positive global override applies to non-debug modes", mode: "build", cfg: config.RuntimeConfig{MaxReasoningTokens: 10000}, want: 10000},
+		{name: "global is IGNORED in debug — debug uses its own default", mode: "debug", cfg: config.RuntimeConfig{MaxReasoningTokens: 10000}, want: 3500},
+		{name: "global IGNORED in debug even when smaller", mode: "debug", cfg: config.RuntimeConfig{MaxReasoningTokens: 6000}, want: 3500},
+		{name: "negative global disables in non-debug", mode: "build", cfg: config.RuntimeConfig{MaxReasoningTokens: -1}, want: 0},
+		{name: "negative global is IGNORED in debug — debug stays at its default", mode: "debug", cfg: config.RuntimeConfig{MaxReasoningTokens: -1}, want: 3500},
+		{name: "debug-specific override wins in debug mode", mode: "debug", cfg: config.RuntimeConfig{MaxReasoningTokens: 10000, MaxReasoningTokensDebug: 2000}, want: 2000},
 		{name: "debug-specific does NOT affect non-debug mode", mode: "build", cfg: config.RuntimeConfig{MaxReasoningTokensDebug: 2000}, want: 6000},
 		{name: "debug-specific negative disables guard in debug only", mode: "debug", cfg: config.RuntimeConfig{MaxReasoningTokensDebug: -1}, want: 0},
 	}

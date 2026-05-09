@@ -302,6 +302,56 @@ func TestContextCarriesForwardBudgetAbortedTurns(t *testing.T) {
 	}
 }
 
+// TestContextCarriesForwardReasoningTailOnThinkingBudgetAbort verifies
+// that when the thinking-budget guard cancels mid-stream BEFORE any
+// tool_call, the captured reasoning tail (emitted as
+// EventReasoningTail) survives into the carry-forward block. Without
+// this, an early thinking-budget abort would leave the next turn no
+// breadcrumbs at all and the model would re-derive the same chain.
+func TestContextCarriesForwardReasoningTailOnThinkingBudgetAbort(t *testing.T) {
+	cwd := t.TempDir()
+	store, err := New(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	turnID := "t-think"
+	if err := store.LogAgentEvent(agent.Event{Type: agent.EventTurnStart, TurnID: turnID}); err != nil {
+		t.Fatal(err)
+	}
+	// No tool_calls happened — model only reasoned. Capture the tail.
+	if err := store.LogAgentEvent(agent.Event{
+		Type:      agent.EventReasoningTail,
+		TurnID:    turnID,
+		Text:      "The bug seems to be in how the snake position updates after eating food. Let me read Game.tsx to confirm.",
+		Transient: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LogAgentEvent(agent.Event{
+		Type:      agent.EventError,
+		TurnID:    turnID,
+		Error:     errors.New("thinking budget exhausted: model emitted 14000 chars of reasoning without taking an action"),
+		Transient: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LogAgentEvent(agent.Event{Type: agent.EventTurnEnd, TurnID: turnID, TurnOutcome: OutcomeAborted}); err != nil {
+		t.Fatal(err)
+	}
+
+	text := store.ContextText(20)
+	if !strings.Contains(text, "PRIOR DEBUG ATTEMPT") {
+		t.Fatalf("expected carry-forward header, got:\n%s", text)
+	}
+	if !strings.Contains(text, "snake position updates after eating food") {
+		t.Errorf("reasoning tail did not survive into carry-forward, got:\n%s", text)
+	}
+	if !strings.Contains(text, "Reasoning chunk before cancel") {
+		t.Errorf("expected explicit reasoning-chunk label in carry-forward, got:\n%s", text)
+	}
+}
+
 // TestContextDoesNotCarryForwardNarrationLoopAborts confirms that
 // non-budget aborts (narration loops, parse retries, max-step caps) are
 // still filtered cleanly without a carry-forward block — that pollution

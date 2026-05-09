@@ -290,29 +290,22 @@ func (r *Runtime) activeReadBudget() int {
 // negative. Default 6000 ≈ 4500 words ≈ 6 dense paragraphs of thought,
 // enough for one focused chain but not for endless speculation.
 //
-// Debug mode honors MaxReasoningTokensDebug (default 3500) when set:
-// the hypothesis-test loop should produce a one-sentence theory and an
-// instrument edit, not multi-paragraph speculation. The carry-forward
-// synthesizer (see internal/session.contextEvents) keeps the next turn
-// from re-deriving what the aborted turn already discovered, so a
-// tighter cap is a net win rather than just doubling the abort rate.
+// Debug mode is hard-walled to MaxReasoningTokensDebug (default 3500)
+// regardless of the global MaxReasoningTokens. Reasoning: the
+// hypothesis-test loop should produce a one-sentence theory and an
+// instrument edit, not multi-paragraph speculation, and the
+// carry-forward synthesizer (see internal/session.contextEvents) keeps
+// the next turn from re-deriving what the aborted turn already
+// discovered. The global cap (commonly tuned for build/plan where the
+// model legitimately needs to plan a refactor) does NOT override the
+// debug cap — set MaxReasoningTokensDebug explicitly to opt out.
 func (r *Runtime) maxReasoningTokens() int {
 	if r.Mode == "debug" {
-		if v := r.Config.Runtime.MaxReasoningTokensDebug; v != 0 {
-			if v < 0 {
-				return 0
-			}
-			return v
-		}
-		// Fall through to MaxReasoningTokens if debug-specific not set,
-		// using a debug default of 3500 instead of the global 6000.
-		v := r.Config.Runtime.MaxReasoningTokens
+		v := r.Config.Runtime.MaxReasoningTokensDebug
 		if v < 0 {
 			return 0
 		}
 		if v > 0 {
-			// Honor an explicit positive global override even in debug —
-			// the user intentionally set it, respect their choice.
 			return v
 		}
 		return 3500

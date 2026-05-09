@@ -35,6 +35,15 @@ const (
 	EventReadBudget       = "read_budget"
 	EventError            = "error"
 	EventDone             = "done"
+	// EventReasoningTail captures the last chunk of reasoning_content
+	// when the thinking-budget guard cancels the stream. The TUI does
+	// not render this event (the user already saw the live reasoning
+	// stream), but the session store persists it so the carry-forward
+	// synthesizer can include it in the next turn's "PRIOR DEBUG
+	// ATTEMPT" block. Without this, an abort that fires before any
+	// tool_call leaves the next turn no breadcrumbs at all and the
+	// model re-derives the same chain from scratch.
+	EventReasoningTail = "reasoning_tail"
 	// EventTurnStart and EventTurnEnd bracket each agent turn so the
 	// session store can attribute every emitted event to the turn that
 	// produced it and the next turn's prompt can drop whole aborted
@@ -2743,6 +2752,20 @@ func (r *Runtime) streamResponseWithInput(ctx context.Context, provider llm.Prov
 				if loopReasoningBuf.Len()/4 >= maxThink {
 					cancel()
 					for range stream {
+					}
+					// Capture the reasoning tail so the carry-forward
+					// synthesizer can surface "what the model was about
+					// to say" in the next turn's PRIOR DEBUG ATTEMPT
+					// block. Without this, an abort that fires before
+					// any tool_call leaves the next turn no breadcrumbs
+					// at all and the model re-derives the same chain.
+					const reasoningTailMaxChars = 800
+					tail := loopReasoningBuf.String()
+					if len(tail) > reasoningTailMaxChars {
+						tail = "..." + tail[len(tail)-reasoningTailMaxChars:]
+					}
+					if strings.TrimSpace(tail) != "" {
+						events <- Event{Type: EventReasoningTail, Text: tail, Transient: true}
 					}
 					events <- Event{Type: EventClearStreaming}
 					events <- Event{Type: EventError, Error: fmt.Errorf("thinking budget exhausted: model emitted %d chars of reasoning without taking an action; cancelled stream and re-prompting for a tool_call", loopReasoningBuf.Len()), Transient: true}

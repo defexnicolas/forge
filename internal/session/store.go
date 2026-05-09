@@ -671,13 +671,14 @@ func turnAbortedByBudget(turnEvents []Event) bool {
 // turn produced nothing worth carrying forward.
 func synthesizeAbortedTurnSummary(turnEvents []Event) (Event, bool) {
 	var (
-		readPaths []string
-		seenPath  = map[string]bool{}
-		searches  []string
-		seenQuery = map[string]bool{}
-		lastText  string
-		lastError string
-		toolCount int
+		readPaths     []string
+		seenPath      = map[string]bool{}
+		searches      []string
+		seenQuery     = map[string]bool{}
+		lastText      string
+		lastError     string
+		reasoningTail string
+		toolCount     int
 	)
 	for _, e := range turnEvents {
 		switch e.Type {
@@ -707,13 +708,17 @@ func synthesizeAbortedTurnSummary(turnEvents []Event) (Event, bool) {
 			if t := strings.TrimSpace(e.Text); t != "" {
 				lastText = t
 			}
+		case agent.EventReasoningTail:
+			if t := strings.TrimSpace(e.Text); t != "" {
+				reasoningTail = t
+			}
 		case agent.EventError:
 			if e.Error != "" {
 				lastError = e.Error
 			}
 		}
 	}
-	if len(readPaths) == 0 && len(searches) == 0 && lastText == "" {
+	if len(readPaths) == 0 && len(searches) == 0 && lastText == "" && reasoningTail == "" {
 		return Event{}, false
 	}
 	var b strings.Builder
@@ -745,6 +750,15 @@ func synthesizeAbortedTurnSummary(turnEvents []Event) (Event, bool) {
 	if lastText != "" {
 		b.WriteString("Last thought before stop:\n  ")
 		b.WriteString(truncateForCarry(lastText, 400))
+		b.WriteString("\n")
+	}
+	if reasoningTail != "" {
+		// Surface the model's own reasoning chunk verbatim. When the
+		// thinking-budget guard fires before any tool_call, this is the
+		// ONLY breadcrumb the next turn has — without it the model
+		// re-derives the exact same chain of speculation.
+		b.WriteString("Reasoning chunk before cancel (verbatim, take it as the starting point):\n  ")
+		b.WriteString(truncateForCarry(reasoningTail, 800))
 		b.WriteString("\n")
 	}
 	b.WriteString("Pick up from here. Form a new hypothesis or instrument something — do NOT redo this exploration.\n")
