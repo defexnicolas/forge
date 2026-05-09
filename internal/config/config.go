@@ -846,7 +846,14 @@ func Defaults() Config {
 			SubagentTimeoutSeconds:    90,
 			TaskTimeoutSeconds:        180,
 			MaxSteps:                  40,
-			MaxStepsBuild:             80,
+			// MaxStepsBuild is the per-turn step cap when in build/debug
+			// mode. A complete scaffold task (~5-7 files × 4-5 steps
+			// each + verification + retries on a local model) easily
+			// reaches 60-90 steps of legitimate work, so 80 was getting
+			// tripped mid-task. 150 gives ~2x headroom and the user can
+			// still tighten it via runtime.max_steps_build if they want
+			// the previous behavior.
+			MaxStepsBuild:             150,
 			MaxNoProgressSteps:        3,
 			MaxEmptyResponses:         2,
 			MaxSameToolFailures:       2,

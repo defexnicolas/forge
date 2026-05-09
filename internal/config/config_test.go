@@ -83,7 +83,7 @@ func TestDefaultsUseRecommendedYarnProfile(t *testing.T) {
 		cfg.Runtime.SubagentTimeoutSeconds != 90 ||
 		cfg.Runtime.TaskTimeoutSeconds != 180 ||
 		cfg.Runtime.MaxSteps != 40 ||
-		cfg.Runtime.MaxStepsBuild != 80 ||
+		cfg.Runtime.MaxStepsBuild != 150 ||
 		cfg.Runtime.MaxNoProgressSteps != 3 ||
 		cfg.Runtime.MaxEmptyResponses != 2 ||
 		cfg.Runtime.MaxSameToolFailures != 2 ||
