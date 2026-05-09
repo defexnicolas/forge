@@ -543,7 +543,13 @@ func (r *Runtime) modelRoleForMode() string {
 	switch r.Mode {
 	case "plan":
 		return "planner"
-	case "build":
+	case "build", "debug":
+		// Debug shares the editor role with build: both edit files and
+		// run commands, so the same model is the right fit. Falling back
+		// to "chat" (the previous default) was loading a small/fast
+		// model with a tiny context window — debug needs the same
+		// headroom build does, otherwise the carry-forward + delegation
+		// upgrades hit the model window before they can pay off.
 		return "editor"
 	case "explore":
 		return "explorer"

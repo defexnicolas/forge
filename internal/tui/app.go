@@ -961,7 +961,7 @@ func (m model) activeModelRole() string {
 	switch m.agentRuntime.Mode {
 	case "plan":
 		return "planner"
-	case "build":
+	case "build", "debug":
 		return "editor"
 	case "explore":
 		return "explorer"
